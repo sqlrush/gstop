@@ -1,0 +1,16 @@
+_reference/
+/gstop
+/dist/
+*.log
+logs/
+logs_emergency/
+.claude/
+
+# Local analysis and migration notes. These may contain environment-specific
+# connection details and are not part of the distributable Go project.
+DESIGN.md
+EMERGENCY_PLAN.md
+FEATURE_LIST.md
+findings.md
+progress.md
+task_plan.md
