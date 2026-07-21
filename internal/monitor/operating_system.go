@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -266,8 +267,12 @@ func diskstatsCommand(devices []string) string {
 // Refresh runs the base probes, updates the /proc diffs, recomputes every cell,
 // and reports any threshold breaches.
 func (m *OSMonitor) Refresh() {
+	m.RefreshContext(context.Background())
+}
+
+func (m *OSMonitor) RefreshContext(ctx context.Context) {
 	now := time.Now()
-	m.runCommands()
+	m.runCommands(ctx)
 	m.buildDiskstats()
 	m.buildCPUInfo()
 
@@ -296,14 +301,14 @@ func (m *OSMonitor) Refresh() {
 
 // runCommands executes each base probe, recording its trimmed output and success
 // flag. An empty command (no devices discovered) is treated as a failed probe.
-func (m *OSMonitor) runCommands() {
+func (m *OSMonitor) runCommands(ctx context.Context) {
 	for i, cmd := range m.osCmd {
 		if cmd == "" {
 			m.osValues[i] = ""
 			m.osOK[i] = false
 			continue
 		}
-		out, ok := m.deps.OS.Run(cmd, true)
+		out, ok := m.deps.OS.RunContext(ctx, cmd, true)
 		m.osValues[i] = out
 		m.osOK[i] = ok
 	}
@@ -384,7 +389,7 @@ func (m *OSMonitor) computeValue(i int, now time.Time) string {
 // computeIO derives one IO rate from the diskstats diff over the refresh interval.
 func (m *OSMonitor) computeIO(i int, now time.Time) string {
 	if !m.osOK[0] || !m.hasDiskTime {
-		return "0"
+		return ""
 	}
 	interval := now.Sub(m.lastDiskTime).Seconds()
 	return pyFloat(round2(m.ioStat(m.items[i], interval)))
@@ -394,8 +399,7 @@ func (m *OSMonitor) computeIO(i int, now time.Time) string {
 // the dynamic-memory throttle. Returns "0" until two samples exist.
 func (m *OSMonitor) computeCPU() string {
 	if !m.osOK[1] || !m.hasCPUTime {
-		m.deps.Health.UpdateCPUUsage(0)
-		return "0"
+		return ""
 	}
 	var total, busy int64
 	for j := 0; j < cpuFields; j++ {
@@ -416,7 +420,7 @@ func (m *OSMonitor) computeCPU() string {
 // computeScalar formats a probe whose stdout is already a percentage/load number.
 func (m *OSMonitor) computeScalar(idx int) string {
 	if !m.osOK[idx] {
-		return "0"
+		return ""
 	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(m.osValues[idx]), 64)
 	if err != nil {

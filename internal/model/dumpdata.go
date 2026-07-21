@@ -69,15 +69,17 @@ func (d DumpData) Text() string {
 				maxX = x
 			}
 		}
-		line := make([]rune, maxX+1)
+		var line strings.Builder
 		for x := 0; x <= maxX; x++ {
 			if r, ok := row[x]; ok {
-				line[x] = r
+				if r != 0 { // zero marks the continuation column of a wide rune.
+					line.WriteRune(r)
+				}
 			} else {
-				line[x] = ' '
+				line.WriteByte(' ')
 			}
 		}
-		b.WriteString(strings.TrimRight(string(line), " "))
+		b.WriteString(strings.TrimRight(line.String(), " "))
 		b.WriteByte('\n')
 	}
 	return b.String()

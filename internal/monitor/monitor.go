@@ -6,6 +6,8 @@
 package monitor
 
 import (
+	"context"
+
 	"github.com/gdamore/tcell/v2"
 
 	"gstop/internal/alarm"
@@ -40,4 +42,10 @@ type Monitor interface {
 	Draw(screen tcell.Screen)
 	DumpData() model.DumpData
 	SetVisible(v bool)
+}
+
+// ContextMonitor lets Refresher give a whole module one shared deadline across
+// all of its sequential SQL and command probes.
+type ContextMonitor interface {
+	RefreshContext(context.Context)
 }

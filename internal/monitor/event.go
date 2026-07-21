@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -119,19 +120,29 @@ func (m *EventMonitor) parseConfig() error {
 // Refresh snapshots the mode flag (so the header and data stay in step for this
 // cycle) and re-samples the wait events.
 func (m *EventMonitor) Refresh() {
+	m.RefreshContext(context.Background())
+}
+
+func (m *EventMonitor) RefreshContext(ctx context.Context) {
 	m.mu.Lock()
 	curr := m.immediate
 	m.currImmediate = curr
 	m.mu.Unlock()
 
-	m.refreshEvent(curr)
+	m.refreshEvent(ctx, curr)
 }
 
 // refreshEvent runs the query, computes the DB CPU row and per-event rows for the
 // active mode, sorts by PCT, and publishes the result. On any early return the
 // previously published rows are left in place, exactly as the original did.
-func (m *EventMonitor) refreshEvent(realtime bool) {
-	rows := m.deps.DB.Query(eventQuery)
+func (m *EventMonitor) refreshEvent(ctx context.Context, realtime bool) {
+	published := false
+	defer func() {
+		if !published {
+			m.clearFailedRound()
+		}
+	}()
+	rows := m.deps.DB.QueryContext(ctx, eventQuery)
 	if rows == nil {
 		m.deps.Logger.Error("Exec query failed.")
 		return
@@ -178,10 +189,17 @@ func (m *EventMonitor) refreshEvent(realtime bool) {
 	m.mu.Lock()
 	m.lines = lines
 	m.mu.Unlock()
+	published = true
 
 	// Cache this sample for the next realtime diff (both modes update it, as the
 	// original saved last_event_result unconditionally).
 	m.lastEvents = snapshotEvents(rows)
+}
+
+func (m *EventMonitor) clearFailedRound() {
+	m.mu.Lock()
+	m.lines = nil
+	m.mu.Unlock()
 }
 
 // computeDiffs returns (cpu_time_diff, total_time_diff) for the active mode.
