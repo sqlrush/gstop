@@ -211,8 +211,12 @@ func buildSessionRow(row dbconn.Row, memDict map[string]float64, stmtDict map[in
 		case 5: // SQL: first line only
 			mvpl = append(mvpl, sFirstLine(cv))
 		case 7: // BLOCKER
-			blocker = cv
-			mvpl = append(mvpl, cv)
+			if blockerID, ok := sInt64(cv); ok {
+				blocker = blockerID
+				mvpl = append(mvpl, blockerID)
+			} else {
+				mvpl = append(mvpl, "")
+			}
 		case 8: // E/T: microseconds -> milliseconds
 			mvpl = append(mvpl, elapsedMS(cv))
 		case 11: // EVENT, then the derived SParse, BLK, session id
