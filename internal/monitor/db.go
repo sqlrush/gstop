@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -104,6 +105,10 @@ func (m *DBMonitor) parseConfig() error {
 // Refresh recomputes every cell using the three-phase (SQL, shell, post-process)
 // pipeline from the original.
 func (m *DBMonitor) Refresh() {
+	m.RefreshContext(context.Background())
+}
+
+func (m *DBMonitor) RefreshContext(ctx context.Context) {
 	m.counter++
 	tmp := make([]string, len(m.items))
 	for i := range tmp {
@@ -114,9 +119,16 @@ func (m *DBMonitor) Refresh() {
 		if m.shortCircuit(i, item, tmp) {
 			continue
 		}
-		processData := m.phaseQuery(i, item)
-		m.phaseCommand(i, processData, tmp)
-		m.phasePost(i, item, tmp)
+		processData, ok := m.phaseQuery(ctx, i, item)
+		if !ok {
+			tmp[i] = ""
+			continue
+		}
+		if !m.phaseCommand(ctx, i, processData, tmp) {
+			tmp[i] = ""
+			continue
+		}
+		m.phasePost(ctx, i, item, tmp)
 	}
 
 	m.mu.Lock()
@@ -160,55 +172,58 @@ func (m *DBMonitor) shortCircuit(i int, item string, tmp []string) bool {
 
 // phaseQuery runs the cell's SQL (if any) and returns the scalar text to feed the
 // shell phase. For db% it caches the (cpu,db,ts) sample instead.
-func (m *DBMonitor) phaseQuery(i int, item string) string {
+func (m *DBMonitor) phaseQuery(ctx context.Context, i int, item string) (string, bool) {
 	if m.methods[i] == "" {
-		return ""
+		return "", true
 	}
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.deps.DB.QueryContext(ctx, m.methods[i])
 	if rows == nil {
-		return ""
+		return "", false
 	}
 	if item == "db%" {
 		if len(rows) > 0 {
 			m.busy = parseBusy(rows[0])
 		}
-		return ""
+		return "", true
 	}
 	var processData string
 	for _, row := range rows {
 		processData = row.Str(0)
 	}
-	return processData
+	return processData, true
 }
 
 // phaseCommand runs the cell's shell command (if any), optionally piping the SQL
 // scalar into it, and stores the raw output.
-func (m *DBMonitor) phaseCommand(i int, processData string, tmp []string) {
+func (m *DBMonitor) phaseCommand(ctx context.Context, i int, processData string, tmp []string) bool {
 	osMethod := m.osMethods[i]
 	if processData != "" {
 		if osMethod != "" {
-			if out, ok := m.deps.OS.Run(fmt.Sprintf("echo \"%s\" | %s", processData, osMethod), true); ok {
+			if out, ok := m.deps.OS.RunContext(ctx, fmt.Sprintf("echo \"%s\" | %s", processData, osMethod), true); ok {
 				tmp[i] = out
 			} else {
 				tmp[i] = ""
+				return false
 			}
 		} else {
 			tmp[i] = processData
 		}
-		return
+		return true
 	}
 	if osMethod != "" {
-		if out, ok := m.deps.OS.Run(osMethod, true); ok {
+		if out, ok := m.deps.OS.RunContext(ctx, osMethod, true); ok {
 			tmp[i] = out
 		} else {
 			tmp[i] = ""
+			return false
 		}
 	}
+	return true
 }
 
 // phasePost applies the per-cell Python post-processing: memory formatting,
 // primary-node role detection, version/user caching, and the db%/WTR% deltas.
-func (m *DBMonitor) phasePost(i int, item string, tmp []string) {
+func (m *DBMonitor) phasePost(ctx context.Context, i int, item string, tmp []string) {
 	switch {
 	case item == "MB dyn":
 		tmp[i] = formatMB(tmp[i])
@@ -218,7 +233,7 @@ func (m *DBMonitor) phasePost(i int, item string, tmp []string) {
 	case item == "PRI":
 		m.primaryNode = tmp[i]
 		if m.dbInfo != nil {
-			if m.isPrimary(m.primaryNode) {
+			if m.isPrimary(ctx, m.primaryNode) {
 				m.dbInfo.SetRole("primary")
 			} else {
 				m.dbInfo.SetRole("standby")
@@ -262,11 +277,11 @@ func (m *DBMonitor) busyPercent(i int, item, current string) string {
 }
 
 // isPrimary reports whether this host owns the primary node's address.
-func (m *DBMonitor) isPrimary(node string) bool {
+func (m *DBMonitor) isPrimary(ctx context.Context, node string) bool {
 	if node == "" {
 		return false
 	}
-	out, ok := m.deps.OS.Run("ifconfig | grep -w "+node, true)
+	out, ok := m.deps.OS.RunContext(ctx, "ifconfig | grep -w "+node, true)
 	return ok && strings.TrimSpace(out) != ""
 }
 

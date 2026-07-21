@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -20,6 +21,9 @@ type Screen struct {
 	scr    tcell.Screen
 	events chan tcell.Event
 	done   chan struct{}
+
+	quitMu       sync.RWMutex
+	onGlobalQuit func()
 }
 
 // NewScreen initialises the terminal: raw input, hidden cursor, and a background
@@ -52,11 +56,35 @@ func (s *Screen) pump() {
 		if ev == nil {
 			return
 		}
+		if key, ok := ev.(*tcell.EventKey); ok {
+			s.notifyQuit(mapKey(key))
+		}
 		select {
 		case s.events <- ev:
 		case <-s.done:
 			return
 		}
+	}
+}
+
+// SetQuitHandler registers a process-wide q callback. The event-pump goroutine
+// invokes it before forwarding the key to the current view, so q can cancel a
+// synchronous database call even while the UI goroutine is inside that call.
+func (s *Screen) SetQuitHandler(fn func()) {
+	s.quitMu.Lock()
+	s.onGlobalQuit = fn
+	s.quitMu.Unlock()
+}
+
+func (s *Screen) notifyQuit(key Key) {
+	if !key.IsRune('q') {
+		return
+	}
+	s.quitMu.RLock()
+	fn := s.onGlobalQuit
+	s.quitMu.RUnlock()
+	if fn != nil {
+		fn()
 	}
 }
 

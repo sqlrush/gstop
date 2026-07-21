@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"sort"
 	"strings"
 
@@ -103,28 +104,42 @@ func (m *SessionMonitor) SetCursor(y int) { m.cursorY = y }
 
 // Refresh runs the memory, soft-parse, and session queries and rebuilds the rows.
 func (m *SessionMonitor) Refresh() {
+	m.RefreshContext(context.Background())
+}
+
+func (m *SessionMonitor) RefreshContext(ctx context.Context) {
 	var memResult []dbconn.Row
 	if m.deps.Cfg.GetBool("main.dynamic_mem_enable", false) {
-		memResult = m.deps.DB.Query(sessionMemQuery)
+		memResult = m.deps.DB.QueryContext(ctx, sessionMemQuery)
 		if memResult == nil {
 			m.deps.Logger.Error("Exec session memory query failed.")
+			m.clearFailedRound()
 			return
 		}
 	}
 
-	statementResult := m.deps.DB.Query(sessionStatementQuery)
+	statementResult := m.deps.DB.QueryContext(ctx, sessionStatementQuery)
 	if statementResult == nil {
 		m.deps.Logger.Error("Exec session statement query failed.")
+		m.clearFailedRound()
 		return
 	}
 
-	sessResult := m.deps.DB.Query(sessionQueryFor(m.deps.DB.Kind()))
+	sessResult := m.deps.DB.QueryContext(ctx, sessionQueryFor(m.deps.DB.Kind()))
 	if sessResult == nil {
 		m.deps.Logger.Error("Exec session query failed.")
+		m.clearFailedRound()
 		return
 	}
 
 	m.handleSQLResult(memResult, statementResult, sessResult)
+}
+
+func (m *SessionMonitor) clearFailedRound() {
+	m.mu.Lock()
+	m.values = nil
+	m.currSessResult = nil
+	m.mu.Unlock()
 }
 
 // handleSQLResult assembles the 24-element rows, runs block analysis, and sorts.

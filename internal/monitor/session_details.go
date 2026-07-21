@@ -205,7 +205,7 @@ func (m *SessionMonitor) printExecutePlan(screen *tui.Screen, sessionPID any, sq
 	m.appendRuntimePlan(w, sessionPID)
 	w.line("[THE STATEMENT HISTORY PLAN]", model.Normal)
 	if sqlID != 0 {
-		q := fmt.Sprintf("SELECT query_plan FROM dbe_perf.statement_history WHERE unique_query_id = '%d' ORDER BY start_time DESC LIMIT 1;", sqlID)
+		q := fmt.Sprintf("SELECT query_plan FROM dbe_perf.statement_history WHERE start_time >= current_timestamp - interval '10 minutes' AND unique_query_id = '%d' ORDER BY start_time DESC LIMIT 1;", sqlID)
 		m.appendPlan(w, q, "No recorded query plan in dbe_perf.statement_history.")
 	}
 

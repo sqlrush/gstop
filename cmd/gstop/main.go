@@ -41,7 +41,7 @@ func main() {
 	// can enable session termination through configuration alone.
 
 	logger := logging.New("gstop", "gstop_app.log")
-	runner := oscmd.New(logger, commandSlowThreshold(cfg))
+	runner := oscmd.New(logger, commandSlowThreshold(cfg), collectTimeout(cfg))
 
 	if !withinUserLimit(cfg, runner) {
 		fmt.Println("The user limit has been reached, exit.")
@@ -185,4 +185,12 @@ func readPasswordIfNeeded(cfg *config.Config) (string, bool) {
 
 func commandSlowThreshold(cfg *config.Config) time.Duration {
 	return time.Duration(cfg.GetFloat("main.sql_command_time_thresh", 3) * float64(time.Second))
+}
+
+func collectTimeout(cfg *config.Config) time.Duration {
+	seconds := cfg.GetFloat("main.collect_timeout", 5)
+	if seconds <= 0 {
+		seconds = 5
+	}
+	return time.Duration(seconds * float64(time.Second))
 }

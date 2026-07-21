@@ -13,13 +13,23 @@ func (a *App) runMemoryKeys() {
 	screenW, screenH := a.screen.Size()
 
 	for {
+		if a.exitRequested.Load() {
+			return
+		}
 		key, ok := a.screen.GetKey(tui.BlockForever)
 		if !ok {
 			continue
 		}
+		if a.exitRequested.Load() || key.IsRune('q') {
+			a.requestExit()
+			return
+		}
 		a.screen.FlushInput()
 
 		if a.handleMemoryKey(key, &cursorY, &cursorX, screenH, screenW) {
+			return
+		}
+		if a.exitRequested.Load() {
 			return
 		}
 		a.memory.SetCursor(cursorY)

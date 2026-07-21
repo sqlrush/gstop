@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os/exec"
@@ -64,6 +65,14 @@ type InstanceMonitor struct {
 	ioRecord string
 }
 
+type instanceSampleState struct {
+	lastTime time.Time
+	interval float64
+	prevTPS  int64
+	prevQPS  int64
+	prevXlog uint64
+}
+
 // NewInstanceMonitor builds the instance panel.
 func NewInstanceMonitor(deps Deps) *InstanceMonitor {
 	return &InstanceMonitor{base: newBase(instanceName, instanceHeight, deps)}
@@ -124,6 +133,11 @@ func (m *InstanceMonitor) initMaxConnections() {
 // Refresh recomputes every cell for the current cycle. A failed query aborts the
 // whole cycle (as in the Python refresh), leaving the previous snapshot intact.
 func (m *InstanceMonitor) Refresh() {
+	m.RefreshContext(context.Background())
+}
+
+func (m *InstanceMonitor) RefreshContext(ctx context.Context) {
+	saved := m.captureSampleState()
 	values := make([]string, len(m.items))
 	for i := range values {
 		values[i] = "0"
@@ -131,7 +145,8 @@ func (m *InstanceMonitor) Refresh() {
 
 	var sessionRow dbconn.Row
 	for i, item := range m.items {
-		if !m.refreshCell(i, item, values, &sessionRow) {
+		if !m.refreshCell(ctx, i, item, values, &sessionRow) {
+			m.failRefresh(saved)
 			return
 		}
 	}
@@ -143,14 +158,35 @@ func (m *InstanceMonitor) Refresh() {
 	m.checkAndReportAlarm(m.items, values)
 }
 
+func (m *InstanceMonitor) captureSampleState() instanceSampleState {
+	return instanceSampleState{
+		lastTime: m.lastTime,
+		interval: m.interval,
+		prevTPS:  m.prevTPS,
+		prevQPS:  m.prevQPS,
+		prevXlog: m.prevXlog,
+	}
+}
+
+func (m *InstanceMonitor) failRefresh(saved instanceSampleState) {
+	m.lastTime = saved.lastTime
+	m.interval = saved.interval
+	m.prevTPS = saved.prevTPS
+	m.prevQPS = saved.prevQPS
+	m.prevXlog = saved.prevXlog
+	m.mu.Lock()
+	m.values = make([]string, len(m.items))
+	m.mu.Unlock()
+}
+
 // refreshCell resolves one cell, returning false when a query failed and the whole
 // refresh must be abandoned.
-func (m *InstanceMonitor) refreshCell(i int, item string, values []string, sessionRow *dbconn.Row) bool {
+func (m *InstanceMonitor) refreshCell(ctx context.Context, i int, item string, values []string, sessionRow *dbconn.Row) bool {
 	switch item {
 	case "time":
-		return m.refreshTime(i)
+		return m.refreshTime(ctx, i)
 	case "SN":
-		return m.refreshSession(i, values, sessionRow)
+		return m.refreshSession(ctx, i, values, sessionRow)
 	case "AN", "ASC", "ASI", "IDL":
 		values[i] = sessionRow.Str(sessionIndex(item))
 		return true
@@ -158,16 +194,16 @@ func (m *InstanceMonitor) refreshCell(i int, item string, values []string, sessi
 		values[i] = m.readIORecord()
 		return true
 	case "TPS", "QPS":
-		return m.refreshCounter(i, item, values)
+		return m.refreshCounter(ctx, i, item, values)
 	case "P80(ms)", "P95(ms)":
-		return m.refreshPercentile(i, values)
+		return m.refreshPercentile(ctx, i, values)
 	case "XLOG(kB/s)":
-		return m.refreshXlog(i, values)
+		return m.refreshXlog(ctx, i, values)
 	case "CONNECTION(c/m)":
 		m.setConnection(i, values)
 		return true
 	case "THREADPOOL":
-		return m.refreshThreadpool(i, values)
+		return m.refreshThreadpool(ctx, i, values)
 	default:
 		return true
 	}
@@ -175,8 +211,8 @@ func (m *InstanceMonitor) refreshCell(i int, item string, values []string, sessi
 
 // refreshTime updates the sampling interval from consecutive current_timestamp(3)
 // readings. The time cell itself carries no display value.
-func (m *InstanceMonitor) refreshTime(i int) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+func (m *InstanceMonitor) refreshTime(ctx context.Context, i int) bool {
+	rows := m.deps.DB.QueryContext(ctx, m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -197,8 +233,8 @@ func (m *InstanceMonitor) refreshTime(i int) bool {
 
 // refreshSession runs the combined session-count query and fills the SN cell; the
 // AN/ASC/ASI/IDL cells later read the same row.
-func (m *InstanceMonitor) refreshSession(i int, values []string, sessionRow *dbconn.Row) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+func (m *InstanceMonitor) refreshSession(ctx context.Context, i int, values []string, sessionRow *dbconn.Row) bool {
+	rows := m.deps.DB.QueryContext(ctx, m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -213,8 +249,8 @@ func (m *InstanceMonitor) refreshSession(i int, values []string, sessionRow *dbc
 }
 
 // refreshCounter turns a cumulative counter (TPS or QPS) into a per-second rate.
-func (m *InstanceMonitor) refreshCounter(i int, item string, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+func (m *InstanceMonitor) refreshCounter(ctx context.Context, i int, item string, values []string) bool {
+	rows := m.deps.DB.QueryContext(ctx, m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -241,8 +277,8 @@ func (m *InstanceMonitor) refreshCounter(i int, item string, values []string) bo
 
 // refreshPercentile renders a response-time percentile in milliseconds with five
 // significant figures.
-func (m *InstanceMonitor) refreshPercentile(i int, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+func (m *InstanceMonitor) refreshPercentile(ctx context.Context, i int, values []string) bool {
+	rows := m.deps.DB.QueryContext(ctx, m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -256,8 +292,8 @@ func (m *InstanceMonitor) refreshPercentile(i int, values []string) bool {
 }
 
 // refreshXlog turns the current xlog insert LSN into a kB/s throughput.
-func (m *InstanceMonitor) refreshXlog(i int, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+func (m *InstanceMonitor) refreshXlog(ctx context.Context, i int, values []string) bool {
+	rows := m.deps.DB.QueryContext(ctx, m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -294,8 +330,8 @@ func (m *InstanceMonitor) setConnection(i int, values []string) {
 
 // refreshThreadpool aggregates every worker group's actual/idle counts into a busy
 // percentage, or "None" when no group reports.
-func (m *InstanceMonitor) refreshThreadpool(i int, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+func (m *InstanceMonitor) refreshThreadpool(ctx context.Context, i int, values []string) bool {
+	rows := m.deps.DB.QueryContext(ctx, m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false

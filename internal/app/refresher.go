@@ -4,6 +4,7 @@
 package app
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,7 @@ type Refresher struct {
 	// dispatched asynchronously so a slow scenario cannot stall monitor refreshes.
 	afterRefresh  func()
 	emergencyBusy atomic.Bool
+	afterWG       sync.WaitGroup
 }
 
 // NewRefresher builds a Refresher over the given monitors.
@@ -80,10 +82,15 @@ func (r *Refresher) runAfterRefreshAsync() {
 	if r.afterRefresh == nil {
 		return
 	}
-	if !r.emergencyBusy.CompareAndSwap(false, true) {
+	r.mu.Lock()
+	if r.stopped || !r.emergencyBusy.CompareAndSwap(false, true) {
+		r.mu.Unlock()
 		return
 	}
+	r.afterWG.Add(1)
+	r.mu.Unlock()
 	go func() {
+		defer r.afterWG.Done()
 		defer r.emergencyBusy.Store(false)
 		r.afterRefresh()
 	}()
@@ -101,7 +108,17 @@ func (r *Refresher) refreshAll() {
 		go func(mon monitor.Monitor) {
 			defer wg.Done()
 			thresh := time.Duration(r.cfg.GetFloat("main.refresh_analyze_time_thresh", 3) * float64(time.Second))
-			timing.RefreshAnalyze(r.logger, mon.Name(), thresh, mon.Refresh)
+			collectTimeout := time.Duration(r.cfg.GetFloat("main.collect_timeout", 5) * float64(time.Second))
+			if collectTimeout <= 0 {
+				collectTimeout = 5 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
+			defer cancel()
+			refresh := mon.Refresh
+			if contextMonitor, ok := mon.(monitor.ContextMonitor); ok {
+				refresh = func() { contextMonitor.RefreshContext(ctx) }
+			}
+			timing.RefreshAnalyze(r.logger, mon.Name(), thresh, refresh)
 		}(m)
 	}
 	wg.Wait()
@@ -122,10 +139,17 @@ func (r *Refresher) Resume() {
 	r.mu.Unlock()
 }
 
-// Stop ends the loop and wakes it if paused.
-func (r *Refresher) Stop() {
+// RequestStop prevents another refresh cycle without waiting for work already
+// in flight. The global q path uses it before canceling data sources.
+func (r *Refresher) RequestStop() {
 	r.mu.Lock()
 	r.stopped = true
 	r.cond.Signal()
 	r.mu.Unlock()
+}
+
+// Stop ends the loop and waits for the asynchronous after-refresh hook.
+func (r *Refresher) Stop() {
+	r.RequestStop()
+	r.afterWG.Wait()
 }

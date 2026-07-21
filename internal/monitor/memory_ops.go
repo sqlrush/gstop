@@ -55,7 +55,6 @@ func (m *MemoryMonitor) refreshSummaryInfo() memPanel {
 	rows := m.deps.DB.Query(memSummaryQuery)
 	if rows == nil {
 		m.deps.Logger.Error("Exec query failed.")
-		p.value = [][]any{zeroRow}
 		return p
 	}
 
@@ -101,9 +100,7 @@ func (m *MemoryMonitor) refreshDynamicInfo() memPanel {
 	rows := m.deps.DB.Query(memDynamicQuery)
 	if rows == nil {
 		m.deps.Logger.Error("Exec query failed.")
-		memAddColumn(&p, 10, []any{"", "TOTAL", "FREE"})
-		memAddColumn(&p, 10, []any{"SUM", 0, 0})
-		return p
+		return memPanel{title: memPanel1Title}
 	}
 
 	delta := m.calcDelta(20, memRowNames(rows, 0))
