@@ -67,102 +67,101 @@ gsbench run 301,304,702
 
 ### 3.1 完整场景目录（90 项）
 
-适用环境缩写：`OG` 为 openGauss，`CG` 为集中式 GaussDB，`DG` 为分布式
-GaussDB，`PS` 表示必须存在主备复制，`CAP` 表示必须通过对应能力探测。风险等级
-沿用第 17 节定义；`A/B` 表示普通模式为 A，但启用管理型变体时提升为 B。
+“故障场景描述”说明要制造的异常状态或可观测症状；“制造方式摘要”说明触发该
+异常的主要负载、SQL 或系统操作。产品和拓扑适用性由第 4 节能力模型定义。
 
-| 编号 | 正式名称 | 类别 | 适用环境 | 风险等级 | 制造方式摘要 | 核心数据表/对象 |
-|---|---|---|---|---|---|---|
-| 101 | `tp_cpu` | CPU | OG/CG/DG | A | 并发点查、更新、插入和短事务提交 | `accounts`、`orders` |
-| 102 | `ap_cpu` | CPU | OG/CG/DG | A | 大表扫描、Hash Join、聚合和排序 | `fact_sales`、`dim_product` |
-| 103 | `mixed_cpu` | CPU | OG/CG/DG | A | 按比例同时运行 TP 与 AP worker | 101、102 的公共对象 |
-| 201 | `memory_workmem_sort` | 内存 | OG/CG/DG | A | 提高 session `work_mem` 并执行大排序 | `sort_data`、`fact_sales` |
-| 202 | `memory_workmem_hash` | 内存 | OG/CG/DG | A | 大 Hash Join 和 Hash Aggregate | `fact_sales` |
-| 203 | `memory_sharedbuffer_churn` | 内存 | OG/CG/DG | A | 扫描大于共享缓存的变化工作集 | `fact_sales` |
-| 204 | `memory_plancache_growth` | 内存 | OG/CG/DG/CAP | A | 长连接创建大量唯一 PREPARE | `plan_data`、plan cache |
-| 205 | `memory_session_context_growth` | 内存 | OG/CG/DG | A | 长事务打开大量 cursor/Portal | `fact_sales`、session context |
-| 206 | `memory_global_cache_pressure` | 内存 | OG/CG/DG/CAP | A | 分批创建和访问小表、索引及目录 | `global_cache_targets`、catalog cache |
-| 207 | `memory_total_pressure` | 内存 | OG/CG/DG | A | 组合排序、Hash、计划缓存和 cursor | 201、202、204、205 的对象 |
-| 208 | `memory_retention` | 内存 | OG/CG/DG | A | 停止新 SQL 后保持长连接观察驻留 | plan/session memory context |
-| 209 | `memory_oom_guarded` | 内存 | OG/CG/DG | B | 受保护地增加执行内存直到数据库拒绝或保护线 | `sort_data`、`fact_sales` |
-| 301 | `io_sequential_read` | I/O 与网络 | OG/CG/DG | A | 变化范围的大表顺序扫描 | `fact_sales` |
-| 302 | `io_random_read` | I/O 与网络 | OG/CG/DG | A | 超过有效缓存集合的随机主键点查 | `accounts` |
-| 303 | `io_wal_write` | I/O 与网络 | OG/CG/DG | A | 高频更新和小事务提交生成 WAL | `accounts` |
-| 304 | `io_temp_spill` | I/O 与网络 | OG/CG/DG | A | 降低 `work_mem` 强制排序/Hash 落盘 | `fact_sales` |
-| 305 | `io_checkpoint_flush` | I/O 与网络 | OG/CG/DG | B | 制造脏页后执行或观察 checkpoint | `vacuum_targets`、checkpoint |
-| 321 | `network_client_egress` | I/O 与网络 | OG/CG/DG | A | 向客户端返回大量 payload | `fact_sales` |
-| 322 | `network_client_ingress` | I/O 与网络 | OG/CG/DG | A | 客户端 PBE 批量上传 payload | `network_ingress` |
-| 331 | `network_cn_dn_stream` | I/O 与网络 | DG | A | 多 DN 聚合产生 GATHER stream | `fact_sales` |
-| 332 | `network_distributed_shuffle` | I/O 与网络 | DG | A | 非共置列关联产生 REDISTRIBUTE | `fact_sales`、`dist_join_data` |
-| 333 | `network_distributed_broadcast` | I/O 与网络 | DG | A | Hash 小表强制 BROADCAST | `fact_sales`、`dist_small_hash` |
-| 341 | `network_latency_injection` | I/O 与网络 | OG/CG/DG/provider | C | 对精确 peer/port 注入 netem 延迟 | `tc` qdisc/filter |
-| 342 | `network_packet_loss` | I/O 与网络 | OG/CG/DG/provider | C | 对精确 peer/port 注入 netem 丢包 | `tc` qdisc/filter |
-| 343 | `network_partition` | I/O 与网络 | OG/CG/DG/provider | C | run 专属 nft 规则隔离精确链路 | `nft` table/chain |
-| 401 | `connection_pool` | 连接池和线程池 | OG/CG/DG | A | 建立 idle、idle-in-tx 和 active 连接 | tagged sessions |
-| 402 | `thread_pool` | 连接池和线程池 | OG/CG/DG/CAP | A | active session 数超过可用线程 | thread-pool views |
-| 403 | `connection_churn` | 连接池和线程池 | OG/CG/DG | A | 高频连接、认证、`SELECT 1`、断开 | connection/authentication |
-| 404 | `threadpool_queue` | 连接池和线程池 | OG/CG/DG/CAP | A | 有界 CPU SQL 使会话进入线程队列 | thread-pool queue |
-| 405 | `pooler_cn_dn_pressure` | 连接池和线程池 | DG | A | 多 CN session 竞争 DN pooler 连接 | pooler、`fact_sales` |
-| 501 | `lock_row_chain` | 锁与并发 | OG/CG/DG | A | 多事务逐行形成 blocker/waiter 链 | `lock_targets` |
-| 502 | `lock_table_exclusive` | 锁与并发 | OG/CG/DG | A | AccessExclusive 阻塞 AccessShare | `lock_table_targets` |
-| 503 | `lock_ddl_wait` | 锁与并发 | OG/CG/DG | A | DML 持锁，DDL 等待 | `lock_ddl_targets` |
-| 504 | `lock_deadlock` | 锁与并发 | OG/CG/DG | A | 两事务反向更新形成死锁环 | `lock_targets` |
-| 505 | `lock_ddl_blocks_dml` | 锁与并发 | OG/CG/DG | A | 未提交 DDL 阻塞 DML | `lock_ddl_targets` |
-| 506 | `lock_select_blocks_ddl` | 锁与并发 | OG/CG/DG | A | 长事务 SELECT 阻塞 DDL | `lock_ddl_targets` |
-| 507 | `lock_vacuum_blocks_ddl` | 锁与并发 | OG/CG/DG | A | 运行中 VACUUM 与 DDL 竞争 | `vacuum_targets` |
-| 508 | `lock_ddl_blocks_vacuum` | 锁与并发 | OG/CG/DG | A | AccessExclusive 阻塞 VACUUM | `vacuum_targets` |
-| 509 | `lock_createindex_blocks_dml` | 锁与并发 | OG/CG/DG | A | 普通 CREATE INDEX 阻塞 DML | `vacuum_targets` |
-| 510 | `lock_dml_blocks_createindex` | 锁与并发 | OG/CG/DG | A | 未提交 DML 阻塞 CREATE INDEX | `vacuum_targets` |
-| 511 | `lock_distributed_ddl_global` | 锁与并发 | DG | A | 多 CN DDL 竞争全局 regular lock | `ddl_global_*` |
-| 512 | `lock_distributed_txn_chain` | 锁与并发 | DG | A | 跨分片事务形成全局等待链 | `dist_lock_targets` |
-| 520 | `lockmode_accessshare_accessexclusive` | 锁与并发 | OG/CG/DG | A | AS holder 阻塞 AX waiter | `lock_mode_targets` |
-| 521 | `lockmode_rowshare_exclusive` | 锁与并发 | OG/CG/DG | A | RS holder 阻塞 X waiter | `lock_mode_targets` |
-| 522 | `lockmode_rowshare_accessexclusive` | 锁与并发 | OG/CG/DG | A | RS holder 阻塞 AX waiter | `lock_mode_targets` |
-| 523 | `lockmode_rowexclusive_share` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 S waiter | `lock_mode_targets` |
-| 524 | `lockmode_rowexclusive_sharerowexclusive` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 SRX waiter | `lock_mode_targets` |
-| 525 | `lockmode_rowexclusive_exclusive` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 X waiter | `lock_mode_targets` |
-| 526 | `lockmode_rowexclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 AX waiter | `lock_mode_targets` |
-| 527 | `lockmode_shareupdateexclusive_self` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 SUE waiter | `lock_mode_targets` |
-| 528 | `lockmode_shareupdateexclusive_share` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 S waiter | `lock_mode_targets` |
-| 529 | `lockmode_shareupdateexclusive_sharerowexclusive` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 SRX waiter | `lock_mode_targets` |
-| 530 | `lockmode_shareupdateexclusive_exclusive` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 X waiter | `lock_mode_targets` |
-| 531 | `lockmode_shareupdateexclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 AX waiter | `lock_mode_targets` |
-| 532 | `lockmode_share_sharerowexclusive` | 锁与并发 | OG/CG/DG | A | S holder 阻塞 SRX waiter | `lock_mode_targets` |
-| 533 | `lockmode_share_exclusive` | 锁与并发 | OG/CG/DG | A | S holder 阻塞 X waiter | `lock_mode_targets` |
-| 534 | `lockmode_share_accessexclusive` | 锁与并发 | OG/CG/DG | A | S holder 阻塞 AX waiter | `lock_mode_targets` |
-| 535 | `lockmode_sharerowexclusive_self` | 锁与并发 | OG/CG/DG | A | SRX holder 阻塞 SRX waiter | `lock_mode_targets` |
-| 536 | `lockmode_sharerowexclusive_exclusive` | 锁与并发 | OG/CG/DG | A | SRX holder 阻塞 X waiter | `lock_mode_targets` |
-| 537 | `lockmode_sharerowexclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | SRX holder 阻塞 AX waiter | `lock_mode_targets` |
-| 538 | `lockmode_exclusive_self` | 锁与并发 | OG/CG/DG | A | X holder 阻塞 X waiter | `lock_mode_targets` |
-| 539 | `lockmode_exclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | X holder 阻塞 AX waiter | `lock_mode_targets` |
-| 540 | `lockmode_accessexclusive_self` | 锁与并发 | OG/CG/DG | A | AX holder 阻塞 AX waiter | `lock_mode_targets` |
-| 601 | `planchange_stats_target` | 执行计划 | OG/CG/DG/CAP | A | 降低列统计采样目标后 ANALYZE | `plan_data.stats_target_key` |
-| 602 | `planchange_index_unusable` | 执行计划 | OG/CG/DG/CAP | A | 将基准索引置为 UNUSABLE | `plan_index_unusable_idx` |
-| 603 | `planchange_stats_ndistinct` | 执行计划 | OG/CG/DG/CAP | A | 修改 `n_distinct` 和统计目标 | `plan_data.stats_ndistinct_key` |
-| 604 | `planchange_stats_extended` | 执行计划 | OG/CG/DG/CAP | A | 删除相关列扩展统计 | `plan_data.stats_corr_a/b` |
-| 605 | `planchange_index_drop` | 执行计划 | OG/CG/DG | A | 删除基准索引使访问路径跳变 | `plan_index_drop_idx` |
-| 606 | `planchange_index_shape` | 执行计划 | OG/CG/DG | A | 将优良复合索引替换为反向列序索引 | `plan_data.index_shape_*` |
-| 621 | `hardparse_literal_flood` | 执行计划 | OG/CG/DG | A | 持续生成唯一整数常量 SQL 文本 | `fact_sales` |
-| 622 | `hardparse_unprepared` | 执行计划 | OG/CG/DG | A | simple-query 重复发送未预编译 SQL | `fact_sales` |
-| 623 | `hardparse_force_custom` | 执行计划 | OG/CG/DG/CAP | A | 强制 prepared statement 使用 custom plan | `fact_sales`、plan cache |
-| 624 | `hardparse_session_churn` | 执行计划 | OG/CG/DG | A | 短连接反复 PREPARE/EXECUTE | `fact_sales` |
-| 625 | `hardparse_ddl_invalidation` | 执行计划 | OG/CG/DG | A | 索引 DDL 反复使缓存计划失效 | `hardparse_targets` |
-| 626 | `hardparse_gpc_bypass` | 执行计划 | OG/CG/DG/CAP | A | `no_gpc` 绕过全局计划缓存 | GPC、`fact_sales` |
-| 701 | `replication_wal_pressure` | 主备与集群 | OG/CG/DG/PS | A | 主库或主 DN 高频更新提交 | `replication_targets` |
-| 702 | `replication_sync_commit_block` | 主备与集群 | OG/CG/DG/PS | A | `remote_apply` 高频提交等待同步备库 | `replication_targets` |
-| 703 | `replication_replay_delay` | 主备与集群 | OG/CG/DG/PS/provider | B | 设置备库回放延迟或短时暂停回放 | standby replay control |
-| 704 | `replication_standby_read_conflict` | 主备与集群 | OG/CG/DG/PS | A | 备库长快照与主库 DELETE/VACUUM 冲突 | `replication_conflict_targets` |
-| 705 | `replication_network_delay` | 主备与集群 | OG/CG/DG/PS/provider | C | 对复制 peer 注入精确网络延迟 | replication link、`tc` |
-| 706 | `replication_network_partition` | 主备与集群 | OG/CG/DG/PS/provider | C | 隔离一个复制 peer/分片主备链路 | replication link、`nft` |
-| 721 | `cluster_data_skew` | 主备与集群 | DG | A | 95% 数据写入同一 HASH key | `cluster_skew_data` |
-| 722 | `cluster_cn_hotspot` | 主备与集群 | DG | A | 所有 workload 固定连接一个 CN | CN endpoint |
-| 723 | `cluster_dn_hotspot` | 主备与集群 | DG | A | 选择映射到同一 DN 的分布键 | `fact_sales.dist_key` |
-| 724 | `cluster_cross_shard_txn` | 主备与集群 | DG | A | 一个事务更新两个不同 shard | `dist_txn_targets` |
-| 725 | `cluster_gtm_pressure` | 主备与集群 | DG/GTM | A | 高频极短跨分片事务申请全局 XID | `dist_txn_targets`、GTM |
-| 726 | `cluster_partial_node_slow` | 主备与集群 | DG/provider | C | 降低一个 CN/DN peer 链路质量 | node link、`tc` |
-| 727 | `cluster_node_failure` | 主备与集群 | DG/provider | C | 停止一个有健康副本的节点 | node process/provider |
-| 728 | `cluster_switchover` | 主备与集群 | DG/provider | C | 在同步健康前提下计划内切换 | node roles/provider |
-| 801 | `vacuum_pressure` | 维护操作 | OG/CG/DG | A/B | 制造 dead tuples 后运行 VACUUM；FULL 为 B | `vacuum_targets` |
+| 编号 | 正式名称 | 类别 | 故障场景描述 | 制造方式摘要 | 核心数据表/对象 |
+|---|---|---|---|---|---|
+| 101 | `tp_cpu` | CPU | 模拟高并发短事务持续消耗 CPU，导致交易响应时间升高 | 并发点查、更新、插入和短事务提交 | `accounts`、`orders` |
+| 102 | `ap_cpu` | CPU | 模拟复杂分析查询占满 CPU，导致批量查询和并发业务变慢 | 大表扫描、Hash Join、聚合和排序 | `fact_sales`、`dim_product` |
+| 103 | `mixed_cpu` | CPU | 模拟交易与分析负载争抢 CPU，导致两类业务相互干扰 | 按比例同时运行 TP 与 AP worker | 101、102 的公共对象 |
+| 201 | `memory_workmem_sort` | 内存 | 模拟并发大排序占用大量执行内存，导致会话内存快速增长 | 提高 session `work_mem` 并执行大排序 | `sort_data`、`fact_sales` |
+| 202 | `memory_workmem_hash` | 内存 | 模拟 Hash 运算占用大量执行内存，导致内存压力和查询排队 | 大 Hash Join 和 Hash Aggregate | `fact_sales` |
+| 203 | `memory_sharedbuffer_churn` | 内存 | 模拟变化工作集超过共享缓存，导致缓存频繁淘汰和命中率下降 | 扫描大于共享缓存的变化工作集 | `fact_sales` |
+| 204 | `memory_plancache_growth` | 内存 | 模拟大量唯一执行计划进入缓存，导致计划缓存持续膨胀 | 长连接创建大量唯一 PREPARE | `plan_data`、plan cache |
+| 205 | `memory_session_context_growth` | 内存 | 模拟长事务会话上下文持续增长，导致单会话内存长期占用 | 长事务打开大量 cursor/Portal | `fact_sales`、session context |
+| 206 | `memory_global_cache_pressure` | 内存 | 模拟大量数据库对象挤压全局和目录缓存，导致元数据缓存压力 | 分批创建和访问小表、索引及目录 | `global_cache_targets`、catalog cache |
+| 207 | `memory_total_pressure` | 内存 | 模拟多类内存消费者叠加，导致数据库总内存逼近保护阈值 | 组合排序、Hash、计划缓存和 cursor | 201、202、204、205 的对象 |
+| 208 | `memory_retention` | 内存 | 模拟负载停止后会话内存仍不释放，呈现类似内存泄漏的驻留现象 | 停止新 SQL 后保持长连接观察驻留 | plan/session memory context |
+| 209 | `memory_oom_guarded` | 内存 | 模拟数据库内存耗尽前后的保护、拒绝执行或受控 OOM 行为 | 受保护地增加执行内存直到数据库拒绝或保护线 | `sort_data`、`fact_sales` |
+| 301 | `io_sequential_read` | I/O 与网络 | 模拟大表持续顺序读取，导致存储吞吐饱和和读延迟升高 | 变化范围的大表顺序扫描 | `fact_sales` |
+| 302 | `io_random_read` | I/O 与网络 | 模拟超出缓存容量的随机读取，导致随机 I/O 延迟升高 | 超过有效缓存集合的随机主键点查 | `accounts` |
+| 303 | `io_wal_write` | I/O 与网络 | 模拟高频事务产生大量 WAL，导致日志写入成为瓶颈 | 高频更新和小事务提交生成 WAL | `accounts` |
+| 304 | `io_temp_spill` | I/O 与网络 | 模拟排序或 Hash 内存不足而落盘，导致临时文件 I/O 激增 | 降低 `work_mem` 强制排序/Hash 落盘 | `fact_sales` |
+| 305 | `io_checkpoint_flush` | I/O 与网络 | 模拟 checkpoint 集中刷脏页，导致写延迟和前台事务抖动 | 制造脏页后执行或观察 checkpoint | `vacuum_targets`、checkpoint |
+| 321 | `network_client_egress` | I/O 与网络 | 模拟数据库向客户端发送大结果集，导致出口带宽和发送等待升高 | 向客户端返回大量 payload | `fact_sales` |
+| 322 | `network_client_ingress` | I/O 与网络 | 模拟客户端持续上传大批数据，导致入口带宽和接收处理压力 | 客户端 PBE 批量上传 payload | `network_ingress` |
+| 331 | `network_cn_dn_stream` | I/O 与网络 | 模拟分布式查询在 CN 与 DN 间汇聚大量数据，导致 stream 拥塞 | 多 DN 聚合产生 GATHER stream | `fact_sales` |
+| 332 | `network_distributed_shuffle` | I/O 与网络 | 模拟非共置关联触发跨 DN 数据重分布，导致网络流量激增 | 非共置列关联产生 REDISTRIBUTE | `fact_sales`、`dist_join_data` |
+| 333 | `network_distributed_broadcast` | I/O 与网络 | 模拟小表向所有 DN 广播，导致广播链路和接收端压力升高 | Hash 小表强制 BROADCAST | `fact_sales`、`dist_small_hash` |
+| 341 | `network_latency_injection` | I/O 与网络 | 模拟指定数据库链路出现高延迟，导致请求和复制确认变慢 | 对精确 peer/port 注入 netem 延迟 | `tc` qdisc/filter |
+| 342 | `network_packet_loss` | I/O 与网络 | 模拟指定数据库链路出现丢包，导致重传、超时和吞吐下降 | 对精确 peer/port 注入 netem 丢包 | `tc` qdisc/filter |
+| 343 | `network_partition` | I/O 与网络 | 模拟指定节点间网络中断，导致连接失败或集群通信隔离 | run 专属 nft 规则隔离精确链路 | `nft` table/chain |
+| 401 | `connection_pool` | 连接池和线程池 | 模拟连接池被不同状态的会话占满，导致新业务无法及时获取连接 | 建立 idle、idle-in-tx 和 active 连接 | tagged sessions |
+| 402 | `thread_pool` | 连接池和线程池 | 模拟活跃会话超过工作线程容量，导致线程资源饱和 | active session 数超过可用线程 | thread-pool views |
+| 403 | `connection_churn` | 连接池和线程池 | 模拟短连接频繁建立和断开，导致认证与连接管理开销升高 | 高频连接、认证、`SELECT 1`、断开 | connection/authentication |
+| 404 | `threadpool_queue` | 连接池和线程池 | 模拟工作线程不足导致会话排队，造成请求等待时间增长 | 有界 CPU SQL 使会话进入线程队列 | thread-pool queue |
+| 405 | `pooler_cn_dn_pressure` | 连接池和线程池 | 模拟多个 CN 争抢 DN 连接池，导致分布式查询等待连接 | 多 CN session 竞争 DN pooler 连接 | pooler、`fact_sales` |
+| 501 | `lock_row_chain` | 锁与并发 | 模拟多个事务形成行锁等待链，导致阻塞逐级传播 | 多事务逐行形成 blocker/waiter 链 | `lock_targets` |
+| 502 | `lock_table_exclusive` | 锁与并发 | 模拟表级排他锁阻塞普通查询，导致访问该表的会话排队 | AccessExclusive 阻塞 AccessShare | `lock_table_targets` |
+| 503 | `lock_ddl_wait` | 锁与并发 | 模拟未提交 DML 使 DDL 长时间等待表锁 | DML 持锁，DDL 等待 | `lock_ddl_targets` |
+| 504 | `lock_deadlock` | 锁与并发 | 模拟两个事务循环等待形成死锁并触发数据库检测 | 两事务反向更新形成死锁环 | `lock_targets` |
+| 505 | `lock_ddl_blocks_dml` | 锁与并发 | 模拟未提交 DDL 阻塞后续 DML，导致业务读写等待 | 未提交 DDL 阻塞 DML | `lock_ddl_targets` |
+| 506 | `lock_select_blocks_ddl` | 锁与并发 | 模拟长事务查询持锁阻塞 DDL，导致结构变更无法完成 | 长事务 SELECT 阻塞 DDL | `lock_ddl_targets` |
+| 507 | `lock_vacuum_blocks_ddl` | 锁与并发 | 模拟 VACUUM 与 DDL 争锁，导致结构变更等待 | 运行中 VACUUM 与 DDL 竞争 | `vacuum_targets` |
+| 508 | `lock_ddl_blocks_vacuum` | 锁与并发 | 模拟 DDL 排他锁阻塞 VACUUM，导致维护任务无法推进 | AccessExclusive 阻塞 VACUUM | `vacuum_targets` |
+| 509 | `lock_createindex_blocks_dml` | 锁与并发 | 模拟普通建索引阻塞业务 DML，导致写事务积压 | 普通 CREATE INDEX 阻塞 DML | `vacuum_targets` |
+| 510 | `lock_dml_blocks_createindex` | 锁与并发 | 模拟未提交 DML 阻塞建索引，导致索引维护等待 | 未提交 DML 阻塞 CREATE INDEX | `vacuum_targets` |
+| 511 | `lock_distributed_ddl_global` | 锁与并发 | 模拟多 CN 同时执行 DDL 争抢全局锁，导致分布式 DDL 排队 | 多 CN DDL 竞争全局 regular lock | `ddl_global_*` |
+| 512 | `lock_distributed_txn_chain` | 锁与并发 | 模拟跨分片事务形成全局锁等待链，导致多个节点事务阻塞 | 跨分片事务形成全局等待链 | `dist_lock_targets` |
+| 520 | `lockmode_accessshare_accessexclusive` | 锁与并发 | 模拟 AccessShare 持锁会话阻塞 AccessExclusive 请求 | AS holder 阻塞 AX waiter | `lock_mode_targets` |
+| 521 | `lockmode_rowshare_exclusive` | 锁与并发 | 模拟 RowShare 持锁会话阻塞 Exclusive 请求 | RS holder 阻塞 X waiter | `lock_mode_targets` |
+| 522 | `lockmode_rowshare_accessexclusive` | 锁与并发 | 模拟 RowShare 持锁会话阻塞 AccessExclusive 请求 | RS holder 阻塞 AX waiter | `lock_mode_targets` |
+| 523 | `lockmode_rowexclusive_share` | 锁与并发 | 模拟 RowExclusive 持锁会话阻塞 Share 请求 | RX holder 阻塞 S waiter | `lock_mode_targets` |
+| 524 | `lockmode_rowexclusive_sharerowexclusive` | 锁与并发 | 模拟 RowExclusive 持锁会话阻塞 ShareRowExclusive 请求 | RX holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 525 | `lockmode_rowexclusive_exclusive` | 锁与并发 | 模拟 RowExclusive 持锁会话阻塞 Exclusive 请求 | RX holder 阻塞 X waiter | `lock_mode_targets` |
+| 526 | `lockmode_rowexclusive_accessexclusive` | 锁与并发 | 模拟 RowExclusive 持锁会话阻塞 AccessExclusive 请求 | RX holder 阻塞 AX waiter | `lock_mode_targets` |
+| 527 | `lockmode_shareupdateexclusive_self` | 锁与并发 | 模拟两个 ShareUpdateExclusive 请求互相排斥，后发请求等待 | SUE holder 阻塞 SUE waiter | `lock_mode_targets` |
+| 528 | `lockmode_shareupdateexclusive_share` | 锁与并发 | 模拟 ShareUpdateExclusive 持锁会话阻塞 Share 请求 | SUE holder 阻塞 S waiter | `lock_mode_targets` |
+| 529 | `lockmode_shareupdateexclusive_sharerowexclusive` | 锁与并发 | 模拟 ShareUpdateExclusive 持锁会话阻塞 ShareRowExclusive 请求 | SUE holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 530 | `lockmode_shareupdateexclusive_exclusive` | 锁与并发 | 模拟 ShareUpdateExclusive 持锁会话阻塞 Exclusive 请求 | SUE holder 阻塞 X waiter | `lock_mode_targets` |
+| 531 | `lockmode_shareupdateexclusive_accessexclusive` | 锁与并发 | 模拟 ShareUpdateExclusive 持锁会话阻塞 AccessExclusive 请求 | SUE holder 阻塞 AX waiter | `lock_mode_targets` |
+| 532 | `lockmode_share_sharerowexclusive` | 锁与并发 | 模拟 Share 持锁会话阻塞 ShareRowExclusive 请求 | S holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 533 | `lockmode_share_exclusive` | 锁与并发 | 模拟 Share 持锁会话阻塞 Exclusive 请求 | S holder 阻塞 X waiter | `lock_mode_targets` |
+| 534 | `lockmode_share_accessexclusive` | 锁与并发 | 模拟 Share 持锁会话阻塞 AccessExclusive 请求 | S holder 阻塞 AX waiter | `lock_mode_targets` |
+| 535 | `lockmode_sharerowexclusive_self` | 锁与并发 | 模拟两个 ShareRowExclusive 请求互相排斥，后发请求等待 | SRX holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 536 | `lockmode_sharerowexclusive_exclusive` | 锁与并发 | 模拟 ShareRowExclusive 持锁会话阻塞 Exclusive 请求 | SRX holder 阻塞 X waiter | `lock_mode_targets` |
+| 537 | `lockmode_sharerowexclusive_accessexclusive` | 锁与并发 | 模拟 ShareRowExclusive 持锁会话阻塞 AccessExclusive 请求 | SRX holder 阻塞 AX waiter | `lock_mode_targets` |
+| 538 | `lockmode_exclusive_self` | 锁与并发 | 模拟两个 Exclusive 请求互相排斥，后发请求等待 | X holder 阻塞 X waiter | `lock_mode_targets` |
+| 539 | `lockmode_exclusive_accessexclusive` | 锁与并发 | 模拟 Exclusive 持锁会话阻塞 AccessExclusive 请求 | X holder 阻塞 AX waiter | `lock_mode_targets` |
+| 540 | `lockmode_accessexclusive_self` | 锁与并发 | 模拟两个 AccessExclusive 请求互相排斥，后发请求等待 | AX holder 阻塞 AX waiter | `lock_mode_targets` |
+| 601 | `planchange_stats_target` | 执行计划 | 模拟统计采样不足引发基数估算偏差和执行计划跳变 | 降低列统计采样目标后 ANALYZE | `plan_data.stats_target_key` |
+| 602 | `planchange_index_unusable` | 执行计划 | 模拟索引不可用后访问路径退化并发生执行计划跳变 | 将基准索引置为 UNUSABLE | `plan_index_unusable_idx` |
+| 603 | `planchange_stats_ndistinct` | 执行计划 | 模拟列唯一值估算失真引发连接或扫描计划跳变 | 修改 `n_distinct` 和统计目标 | `plan_data.stats_ndistinct_key` |
+| 604 | `planchange_stats_extended` | 执行计划 | 模拟相关列扩展统计缺失引发选择率误判和计划跳变 | 删除相关列扩展统计 | `plan_data.stats_corr_a/b` |
+| 605 | `planchange_index_drop` | 执行计划 | 模拟基准索引被删除后查询改走低效访问路径 | 删除基准索引使访问路径跳变 | `plan_index_drop_idx` |
+| 606 | `planchange_index_shape` | 执行计划 | 模拟复合索引列序变化导致索引能力下降和计划跳变 | 将优良复合索引替换为反向列序索引 | `plan_data.index_shape_*` |
+| 621 | `hardparse_literal_flood` | 执行计划 | 模拟大量不同字面量 SQL 无法复用计划，导致硬解析激增 | 持续生成唯一整数常量 SQL 文本 | `fact_sales` |
+| 622 | `hardparse_unprepared` | 执行计划 | 模拟应用不使用预编译语句，导致重复 SQL 持续硬解析 | simple-query 重复发送未预编译 SQL | `fact_sales` |
+| 623 | `hardparse_force_custom` | 执行计划 | 模拟预编译语句每次生成定制计划，导致解析和优化开销升高 | 强制 prepared statement 使用 custom plan | `fact_sales`、plan cache |
+| 624 | `hardparse_session_churn` | 执行计划 | 模拟短连接使会话级计划无法复用，导致反复解析和优化 | 短连接反复 PREPARE/EXECUTE | `fact_sales` |
+| 625 | `hardparse_ddl_invalidation` | 执行计划 | 模拟频繁 DDL 使缓存计划反复失效，导致重新解析风暴 | 索引 DDL 反复使缓存计划失效 | `hardparse_targets` |
+| 626 | `hardparse_gpc_bypass` | 执行计划 | 模拟绕过全局计划缓存后跨会话计划复用失效，导致硬解析升高 | `no_gpc` 绕过全局计划缓存 | GPC、`fact_sales` |
+| 701 | `replication_wal_pressure` | 主备与集群 | 模拟主库 WAL 生成速度超过备库接收或回放能力，导致复制积压 | 主库或主 DN 高频更新提交 | `replication_targets` |
+| 702 | `replication_sync_commit_block` | 主备与集群 | 模拟备库确认不及时导致主库同步提交等待和事务延迟升高 | `remote_apply` 高频提交等待同步备库 | `replication_targets` |
+| 703 | `replication_replay_delay` | 主备与集群 | 模拟备库回放延迟持续扩大，导致主备数据可见性差距增加 | 设置备库回放延迟或短时暂停回放 | standby replay control |
+| 704 | `replication_standby_read_conflict` | 主备与集群 | 模拟备库长查询与主库清理操作冲突，导致查询取消或回放等待 | 备库长快照与主库 DELETE/VACUUM 冲突 | `replication_conflict_targets` |
+| 705 | `replication_network_delay` | 主备与集群 | 模拟复制网络延迟导致 WAL 传输、确认和追赶速度下降 | 对复制 peer 注入精确网络延迟 | replication link、`tc` |
+| 706 | `replication_network_partition` | 主备与集群 | 模拟复制链路中断导致备库失联、WAL 堆积或同步提交受阻 | 隔离一个复制 peer/分片主备链路 | replication link、`nft` |
+| 721 | `cluster_data_skew` | 主备与集群 | 模拟数据集中到少数分片，导致节点间容量和计算负载失衡 | 95% 数据写入同一 HASH key | `cluster_skew_data` |
+| 722 | `cluster_cn_hotspot` | 主备与集群 | 模拟客户端流量集中到单个 CN，导致协调节点成为瓶颈 | 所有 workload 固定连接一个 CN | CN endpoint |
+| 723 | `cluster_dn_hotspot` | 主备与集群 | 模拟请求集中访问单个 DN，导致数据节点负载热点 | 选择映射到同一 DN 的分布键 | `fact_sales.dist_key` |
+| 724 | `cluster_cross_shard_txn` | 主备与集群 | 模拟跨分片事务增加协调和提交开销，导致事务延迟上升 | 一个事务更新两个不同 shard | `dist_txn_targets` |
+| 725 | `cluster_gtm_pressure` | 主备与集群 | 模拟大量跨分片短事务争用全局事务服务，导致 GTM 压力升高 | 高频极短跨分片事务申请全局 XID | `dist_txn_targets`、GTM |
+| 726 | `cluster_partial_node_slow` | 主备与集群 | 模拟单个 CN 或 DN 变慢，导致分布式查询被最慢节点拖延 | 降低一个 CN/DN peer 链路质量 | node link、`tc` |
+| 727 | `cluster_node_failure` | 主备与集群 | 模拟集群节点故障，验证副本接管、业务报错和恢复过程 | 停止一个有健康副本的节点 | node process/provider |
+| 728 | `cluster_switchover` | 主备与集群 | 模拟计划内主备切换，验证连接中断、角色变化和业务恢复 | 在同步健康前提下计划内切换 | node roles/provider |
+| 801 | `vacuum_pressure` | 维护操作 | 模拟大量垃圾元组清理占用 I/O 和锁资源，导致前台业务抖动 | 制造 dead tuples 后运行 VACUUM；FULL 为 B | `vacuum_targets` |
 
 ## 4. 产品、拓扑和能力模型
 
