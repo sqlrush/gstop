@@ -164,15 +164,17 @@ func dumpToText(dump model.DumpData) string {
 			lines = append(lines, "")
 			continue
 		}
-		buf := make([]rune, maxX+1)
+		var buf strings.Builder
 		for x := 0; x <= maxX; x++ {
 			if r, ok := row[x]; ok {
-				buf[x] = r
+				if r != 0 { // zero marks the continuation column of a wide rune.
+					buf.WriteRune(r)
+				}
 			} else {
-				buf[x] = ' '
+				buf.WriteByte(' ')
 			}
 		}
-		lines = append(lines, string(buf))
+		lines = append(lines, buf.String())
 	}
 	return strings.Join(lines, "\n")
 }

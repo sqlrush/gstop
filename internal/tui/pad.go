@@ -2,14 +2,17 @@ package tui
 
 import (
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/uniseg"
 
 	"gstop/internal/model"
 )
 
 // cell is one rendered character and its style.
 type cell struct {
-	r     rune
-	style model.Style
+	r            rune
+	combining    []rune
+	style        model.Style
+	continuation bool
 }
 
 // Pad is a fixed-size off-screen character buffer, the analogue of a curses pad
@@ -58,17 +61,31 @@ func (p *Pad) AddStr(y, x int, text string, style model.Style) {
 		return
 	}
 	col := x
-	for _, r := range text {
-		if col < 0 {
-			col++
+	graphemes := uniseg.NewGraphemes(text)
+	for graphemes.Next() {
+		runes := graphemes.Runes()
+		if len(runes) == 0 {
 			continue
 		}
-		if col >= p.width {
+		width := graphemes.Width()
+		if width < 1 {
+			width = 1
+		}
+		if col < 0 {
+			col += width
+			continue
+		}
+		if col+width > p.width {
 			break
 		}
-		p.cells[y*p.width+col] = cell{r: r, style: style}
-		p.dump.Set(y, col, r)
-		col++
+		combining := append([]rune(nil), runes[1:]...)
+		p.cells[y*p.width+col] = cell{r: runes[0], combining: combining, style: style}
+		p.dump.Set(y, col, runes[0])
+		for offset := 1; offset < width; offset++ {
+			p.cells[y*p.width+col+offset] = cell{style: style, continuation: true}
+			p.dump.Set(y, col+offset, 0)
+		}
+		col += width
 	}
 }
 
@@ -93,12 +110,21 @@ func (p *Pad) DumpData() model.DumpData { return p.dump.Clone() }
 // clipped to the screen bounds, reproducing pad.refresh(0,0, begin_y, begin_x,
 // begin_y+height-1, begin_x+width-1). It is a no-op when the pad is hidden.
 func (p *Pad) Blit(screen tcell.Screen, beginX, beginY int) {
+	p.BlitViewport(screen, beginX, beginY, 0)
+}
+
+// BlitViewport copies the pad to screen starting at sourceY. It is used by
+// scrollable full-screen views whose content is taller than the terminal.
+func (p *Pad) BlitViewport(screen tcell.Screen, beginX, beginY, sourceY int) {
 	if !p.toScreen || screen == nil {
 		return
 	}
+	if sourceY < 0 {
+		sourceY = 0
+	}
 	screenW, screenH := screen.Size()
-	for y := 0; y < p.height; y++ {
-		sy := beginY + y
+	for y := sourceY; y < p.height; y++ {
+		sy := beginY + y - sourceY
 		if sy < 0 || sy >= screenH {
 			continue
 		}
@@ -108,7 +134,10 @@ func (p *Pad) Blit(screen tcell.Screen, beginX, beginY int) {
 				continue
 			}
 			c := p.cells[y*p.width+x]
-			screen.SetContent(sx, sy, c.r, nil, toTcell(c.style))
+			if c.continuation {
+				continue
+			}
+			screen.SetContent(sx, sy, c.r, c.combining, toTcell(c.style))
 		}
 	}
 }

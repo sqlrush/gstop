@@ -19,6 +19,8 @@ const snapshotHeaderLine = "Snapshot:  ID       TIMESTAMP            SQL_ACS  IN
 // of plan_change.trigger_emergency.
 func (s *PlanChange) triggerEmergency(ins InsInfo, sql SQLInfo, snap SQLInfo, hasTriggered bool) {
 	s.Trigger()
+	sqlText := s.findSQLText(snap.UniqueSQLID)
+	s.recordPlanChangeEvent(ins.SnapTS, sql, snap, sqlText)
 
 	insSnap, ok := s.deps.Persist.GetInsInfoSnap(snap.DBID, snap.SnapID)
 	if !ok {
@@ -26,7 +28,6 @@ func (s *PlanChange) triggerEmergency(ins InsInfo, sql SQLInfo, snap SQLInfo, ha
 		return
 	}
 
-	sqlText := s.findSQLText(snap.UniqueSQLID)
 	analyzeCmd := planAnalyzeCommand(sqlText)
 	sqlText = firstLine(sqlText)
 
@@ -63,6 +64,9 @@ func (s *PlanChange) comparisonRow(label string, snapID int, ts string, sqlAcs, 
 // reportAlarm appends the quick-kill command (when permitted) and reports the
 // plan-change alarm.
 func (s *PlanChange) reportAlarm(uniqueSQLID int64, sqlText, analyzeCmd string) {
+	if !s.notificationsAreEnabled() {
+		return
+	}
 	terminateCmd := fmt.Sprintf("SELECT pg_terminate_session(pid, sessionid) FROM pg_stat_activity WHERE unique_sql_id = %d;", uniqueSQLID)
 	if s.deps.Cfg.GetBool("main.support_emergency_command", false) {
 		s.AddInfo("")

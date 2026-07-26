@@ -2,6 +2,8 @@ package emergency
 
 import (
 	"math"
+	"sort"
+	"sync"
 	"time"
 
 	"gstop/internal/dbconn"
@@ -28,6 +30,27 @@ type PlanChange struct {
 
 	lastStatement []dbconn.Row
 	lastSnapTS    time.Time
+
+	eventMu              sync.Mutex
+	eventHistory         []PlanChangeEvent
+	activeEvents         map[int64]int
+	notificationsEnabled bool
+}
+
+// PlanChangeEvent is one retained plan-regression lifecycle record. Unlike the
+// emergency panel's per-cycle state, recovered events remain available to the
+// health dashboard for the lifetime of this gstop process.
+type PlanChangeEvent struct {
+	SQLID         int64
+	Query         string
+	FirstSeen     time.Time
+	LastSeen      time.Time
+	RecoveredAt   time.Time
+	PreviousAcs   int
+	CurrentAcs    int
+	PreviousLatUS float64
+	CurrentLatUS  float64
+	Recovered     bool
 }
 
 // analyzeResult holds one cycle's derived instance and per-SQL statistics.
@@ -41,7 +64,79 @@ type analyzeResult struct {
 // database query.
 func NewPlanChange(deps Deps) *PlanChange {
 	persistNum := deps.Cfg.GetInt("emergency.plan_change.snapshot_persist_number", 300)
-	return &PlanChange{Base: NewBase(planChangeName, planChangeHeader, deps, persistNum)}
+	return &PlanChange{
+		Base:                 NewBase(planChangeName, planChangeHeader, deps, persistNum),
+		activeEvents:         map[int64]int{},
+		notificationsEnabled: true,
+	}
+}
+
+// SetNotificationsEnabled controls alarms and remediation text without turning
+// off snapshot comparison or event recording. Health-only mode disables it.
+func (s *PlanChange) SetNotificationsEnabled(enabled bool) {
+	s.eventMu.Lock()
+	s.notificationsEnabled = enabled
+	s.eventMu.Unlock()
+}
+
+// Events returns retained plan changes ordered by most recently observed first.
+func (s *PlanChange) Events() []PlanChangeEvent {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	out := append([]PlanChangeEvent(nil), s.eventHistory...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
+	return out
+}
+
+func (s *PlanChange) recordPlanChangeEvent(at time.Time, current, previous SQLInfo, query string) {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	if s.activeEvents == nil {
+		s.activeEvents = map[int64]int{}
+	}
+	index, exists := s.activeEvents[current.UniqueSQLID]
+	if !exists {
+		event := PlanChangeEvent{
+			SQLID:         current.UniqueSQLID,
+			Query:         query,
+			FirstSeen:     at,
+			PreviousAcs:   previous.SQLAcsCnt,
+			PreviousLatUS: previous.SQLLatency,
+		}
+		s.eventHistory = append(s.eventHistory, event)
+		index = len(s.eventHistory) - 1
+		s.activeEvents[current.UniqueSQLID] = index
+	}
+	event := s.eventHistory[index]
+	event.LastSeen = at
+	event.CurrentAcs = current.SQLAcsCnt
+	event.CurrentLatUS = current.SQLLatency
+	event.Recovered = false
+	event.RecoveredAt = time.Time{}
+	if event.Query == "" {
+		event.Query = query
+	}
+	s.eventHistory[index] = event
+}
+
+func (s *PlanChange) recordPlanChangeRecovered(sqlID int64, at time.Time) {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	index, ok := s.activeEvents[sqlID]
+	if !ok {
+		return
+	}
+	event := s.eventHistory[index]
+	event.Recovered = true
+	event.RecoveredAt = at
+	s.eventHistory[index] = event
+	delete(s.activeEvents, sqlID)
+}
+
+func (s *PlanChange) notificationsAreEnabled() bool {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	return s.notificationsEnabled
 }
 
 // Analyze samples the statement view, derives and persists per-SQL statistics,
@@ -224,6 +319,7 @@ func (s *PlanChange) judgeRecovered(triggered []int64) {
 			continue
 		}
 		if triggered == nil || !containsID(triggered, info.UniqueSQLID) {
+			s.recordPlanChangeRecovered(info.UniqueSQLID, s.snap.SnapTS)
 			s.deps.Persist.UpdateEmergencySQLRecovered(s.dbID, info.SnapID, info.UniqueSQLID)
 			s.deps.Logger.Info("Plan change recovered: db_id = %d, snap_id = %d, unique_sql_id = %d",
 				s.dbID, info.SnapID, info.UniqueSQLID)

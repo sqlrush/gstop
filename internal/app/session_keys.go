@@ -15,14 +15,24 @@ func (a *App) runSessionKeys() {
 	screenW, _ := a.screen.Size()
 
 	for {
+		if a.exitRequested.Load() {
+			return
+		}
 		key, ok := a.screen.GetKey(tui.BlockForever)
 		if !ok {
 			continue
+		}
+		if a.exitRequested.Load() || key.IsRune('q') {
+			a.requestExit()
+			return
 		}
 		a.screen.FlushInput()
 		moveStep := minInt(a.session.Height()-1, screenH-model.SessionCursorYStart-1)
 
 		if a.handleSessionKey(key, &cursorY, &cursorX, moveStep, screenH, screenW) {
+			return
+		}
+		if a.exitRequested.Load() {
 			return
 		}
 

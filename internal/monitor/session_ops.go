@@ -46,19 +46,27 @@ func (m *SessionMonitor) TerminateAll(screen *tui.Screen, cursorY int) {
 	m.deps.DB.NoReturn(cmd)
 }
 
-// pidInBlockers reports whether pid appears among the collected blocker values,
-// matching "pid in tmp_curr_sess_blocker" for integer pids.
-func pidInBlockers(pid any, blockers []any) bool {
-	p, ok := sInt64(pid)
+// blockerPIDSet provides O(1) holder lookup while classifying a session snapshot.
+// Values that are blank, NULL, or nonnumeric never enter the set.
+type blockerPIDSet map[int64]struct{}
+
+func newBlockerPIDSet(values []any) blockerPIDSet {
+	set := make(blockerPIDSet, len(values))
+	for _, value := range values {
+		if id, ok := sInt64(value); ok {
+			set[id] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (s blockerPIDSet) contains(value any) bool {
+	id, ok := sInt64(value)
 	if !ok {
 		return false
 	}
-	for _, b := range blockers {
-		if bID, ok := sInt64(b); ok && bID == p {
-			return true
-		}
-	}
-	return false
+	_, ok = s[id]
+	return ok
 }
 
 // sortKeyGreater orders a before b for a descending sort, comparing numerically

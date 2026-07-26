@@ -12,7 +12,9 @@
 package dbconn
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"sync"
 	"time"
 
@@ -36,6 +38,8 @@ type DB struct {
 	cfg    *config.Config
 	logger *logging.Logger
 	now    func() time.Time
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu           sync.Mutex
 	pool         *sql.DB
@@ -48,8 +52,38 @@ type DB struct {
 // New builds a DB bound to cfg. The underlying pool is created lazily on first
 // use, so New never blocks on the network.
 func New(cfg *config.Config, logger *logging.Logger) *DB {
-	return &DB{cfg: cfg, logger: logger, now: time.Now}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &DB{cfg: cfg, logger: logger, now: time.Now, ctx: ctx, cancel: cancel}
 }
+
+// operationContext bounds one foreground database operation and also inherits
+// the process-wide cancellation used by q. A non-positive value falls back to
+// the safe default instead of disabling the guard accidentally.
+func (d *DB) operationContext(parents ...context.Context) (context.Context, context.CancelFunc) {
+	seconds := d.cfg.GetFloat("main.collect_timeout", 5)
+	if seconds <= 0 {
+		seconds = 5
+	}
+	base, cancelBase := context.WithCancel(d.ctx)
+	stopParent := func() bool { return false }
+	if len(parents) > 0 && parents[0] != nil {
+		stopParent = context.AfterFunc(parents[0], cancelBase)
+		if parents[0].Err() != nil {
+			cancelBase()
+		}
+	}
+	ctx, cancelTimeout := context.WithTimeout(base, time.Duration(seconds*float64(time.Second)))
+	return ctx, func() {
+		stopParent()
+		cancelTimeout()
+		cancelBase()
+	}
+}
+
+// Cancel immediately interrupts every in-flight and future database operation.
+// It is idempotent and is intentionally separate from Close so the app can make
+// cancellation the first action taken on q.
+func (d *DB) Cancel() { d.cancel() }
 
 func (d *DB) slowThreshold() time.Duration {
 	return time.Duration(d.cfg.GetFloat("main.sql_command_time_thresh", 3) * float64(time.Second))
@@ -57,7 +91,7 @@ func (d *DB) slowThreshold() time.Duration {
 
 // ensure returns a usable pool or nil. It enforces the one-attempt-per-second
 // reconnect throttle. The caller must hold d.mu.
-func (d *DB) ensure() *sql.DB {
+func (d *DB) ensure(ctx context.Context) *sql.DB {
 	if d.pool != nil && d.healthy {
 		return d.pool
 	}
@@ -67,7 +101,7 @@ func (d *DB) ensure() *sql.DB {
 	d.lastAttempt = d.now()
 
 	if d.pool == nil {
-		pool, err := sql.Open(driverName, buildDSN(d.cfg, d.cfg.GetString("main.database", "postgres")))
+		pool, err := sql.Open(driverName, d.databaseDSN(d.cfg.GetString("main.database", "postgres")))
 		if err != nil {
 			d.logger.Error("open database failed: %v", err)
 			return nil
@@ -79,9 +113,11 @@ func (d *DB) ensure() *sql.DB {
 		pool.SetMaxIdleConns(maxPoolConns)
 		d.pool = pool
 	}
-	if err := d.pool.Ping(); err != nil {
+	if err := d.pool.PingContext(ctx); err != nil {
 		d.logger.Error("database ping failed: %v", err)
-		d.healthy = false
+		if !isContextError(err) {
+			d.healthy = false
+		}
 		return nil
 	}
 	d.healthy = true
@@ -106,7 +142,7 @@ func (d *DB) Kind() dbcompat.Kind {
 
 // detectKind classifies the server from version() once, retrying on failure. It
 // must be called without holding d.mu.
-func (d *DB) detectKind(pool *sql.DB) {
+func (d *DB) detectKind(ctx context.Context, pool *sql.DB) {
 	d.mu.Lock()
 	done := d.kindDetected
 	d.mu.Unlock()
@@ -114,7 +150,7 @@ func (d *DB) detectKind(pool *sql.DB) {
 		return
 	}
 	var version string
-	if err := pool.QueryRow("select version();").Scan(&version); err != nil {
+	if err := pool.QueryRowContext(ctx, "select version();").Scan(&version); err != nil {
 		return // leave undetected; retried on the next query
 	}
 	kind := dbcompat.Detect(version)
@@ -128,25 +164,48 @@ func (d *DB) detectKind(pool *sql.DB) {
 // Query runs a SELECT and returns its rows, or nil on any failure (connection
 // down, SQL error), logging the cause. Mirrors util.execute_query.
 func (d *DB) Query(query string) []Row {
+	return d.QueryContext(context.Background(), query)
+}
+
+// QueryContext is Query with an additional caller deadline. The effective
+// lifetime is the earliest of the caller, collect_timeout, and global q cancel.
+func (d *DB) QueryContext(parent context.Context, query string) []Row {
 	var out []Row
 	timing.LogSlow(d.logger, "query", query, d.slowThreshold(), func() {
-		out = d.doQuery(query)
+		out = d.doQuery(parent, query)
 	})
 	return out
 }
 
-func (d *DB) doQuery(query string) []Row {
+func (d *DB) doQuery(parent context.Context, query string) []Row {
+	ctx, cancel := d.operationContext(parent)
+	defer cancel()
+	contextFailure := func(fallback error) error {
+		if parent != nil && parent.Err() != nil {
+			return parent.Err()
+		}
+		return firstError(ctx.Err(), fallback)
+	}
+
 	d.mu.Lock()
-	pool := d.ensure()
+	pool := d.ensure(ctx)
 	d.mu.Unlock()
 	if pool == nil {
+		if ctx.Err() != nil {
+			d.logContextFailure("query", query, contextFailure(nil))
+			return nil
+		}
 		d.logger.Warning("Connection is None when exec query: %s", query)
 		return nil
 	}
-	d.detectKind(pool)
+	d.detectKind(ctx, pool)
 
-	rows, err := pool.Query(query)
+	rows, err := pool.QueryContext(ctx, query)
 	if err != nil {
+		if isContextError(err) || ctx.Err() != nil {
+			d.logContextFailure("query", query, contextFailure(err))
+			return nil
+		}
 		d.logger.Error("Exec query '%s' failed: %v", query, err)
 		d.markUnhealthy()
 		return nil
@@ -155,6 +214,10 @@ func (d *DB) doQuery(query string) []Row {
 
 	out, err := scanRows(rows)
 	if err != nil {
+		if isContextError(err) || ctx.Err() != nil {
+			d.logContextFailure("query", query, contextFailure(err))
+			return nil
+		}
 		d.logger.Error("Scan query '%s' failed: %v", query, err)
 		d.markUnhealthy()
 		return nil
@@ -167,14 +230,24 @@ func (d *DB) doQuery(query string) []Row {
 func (d *DB) NoReturn(query string) bool {
 	ok := false
 	timing.LogSlow(d.logger, "query", query, d.slowThreshold(), func() {
+		ctx, cancel := d.operationContext()
+		defer cancel()
 		d.mu.Lock()
-		pool := d.ensure()
+		pool := d.ensure(ctx)
 		d.mu.Unlock()
 		if pool == nil {
+			if ctx.Err() != nil {
+				d.logContextFailure("query", query, ctx.Err())
+				return
+			}
 			d.logger.Warning("Connection is None when exec query: %s", query)
 			return
 		}
-		if _, err := pool.Exec(query); err != nil {
+		if _, err := pool.ExecContext(ctx, query); err != nil {
+			if isContextError(err) || ctx.Err() != nil {
+				d.logContextFailure("query", query, firstError(ctx.Err(), err))
+				return
+			}
 			d.logger.Error("Exec query '%s' failed: %v", query, err)
 			d.markUnhealthy()
 			return
@@ -189,16 +262,27 @@ func (d *DB) NoReturn(query string) bool {
 // database, and returns a map of database name to its rows. Mirrors
 // util.execute_query_on_user_db.
 func (d *DB) ExecuteOnUserDB(query string) map[string][]Row {
+	ctx, cancel := d.operationContext()
+	defer cancel()
+
 	d.mu.Lock()
-	pool := d.ensure()
+	pool := d.ensure(ctx)
 	d.mu.Unlock()
 	if pool == nil {
+		if ctx.Err() != nil {
+			d.logContextFailure("cross-database query", query, ctx.Err())
+			return nil
+		}
 		d.logger.Warning("Connection is None when exec query: %s", query)
 		return nil
 	}
 
-	dbRows, err := pool.Query("SELECT datname FROM pg_database WHERE datdba <> 10;")
+	dbRows, err := pool.QueryContext(ctx, "SELECT datname FROM pg_database WHERE datdba <> 10;")
 	if err != nil {
+		if isContextError(err) || ctx.Err() != nil {
+			d.logContextFailure("cross-database query", query, firstError(ctx.Err(), err))
+			return nil
+		}
 		d.logger.Error("list user databases failed: %v", err)
 		d.markUnhealthy()
 		return nil
@@ -212,20 +296,21 @@ func (d *DB) ExecuteOnUserDB(query string) map[string][]Row {
 
 	result := make(map[string][]Row, len(names))
 	for _, row := range names {
+		if ctx.Err() != nil {
+			d.logContextFailure("cross-database query", query, ctx.Err())
+			return nil
+		}
 		name := Row(row).Str(0)
 		if name == "" {
 			continue
 		}
-		result[name] = d.queryOnDatabase(name, query)
+		result[name] = d.queryOnDatabase(ctx, name, query)
 	}
 	return result
 }
 
-func (d *DB) queryOnDatabase(database, query string) []Row {
-	if !d.cfg.GetBool("main.password_free", true) {
-		return nil // create_connection only supports password-free connections
-	}
-	pool, err := sql.Open(driverName, buildDSN(d.cfg, database))
+func (d *DB) queryOnDatabase(ctx context.Context, database, query string) []Row {
+	pool, err := sql.Open(driverName, d.databaseDSN(database))
 	if err != nil {
 		d.logger.Warning("Create connection to database %s failed: %v", database, err)
 		return nil
@@ -233,19 +318,32 @@ func (d *DB) queryOnDatabase(database, query string) []Row {
 	defer pool.Close()
 	pool.SetMaxOpenConns(1)
 
-	rows, err := pool.Query(query)
+	rows, err := pool.QueryContext(ctx, query)
 	if err != nil {
+		if isContextError(err) || ctx.Err() != nil {
+			d.logContextFailure("query in database "+database, query, firstError(ctx.Err(), err))
+			return nil
+		}
 		d.logger.Error("Exec query '%s' in database '%s' failed: %v", query, database, err)
 		return nil
 	}
 	defer rows.Close()
 	out, err := scanRows(rows)
 	if err != nil {
+		if isContextError(err) || ctx.Err() != nil {
+			d.logContextFailure("query in database "+database, query, firstError(ctx.Err(), err))
+			return nil
+		}
 		d.logger.Error("Scan query '%s' in database '%s' failed: %v", query, database, err)
 		return nil
 	}
 	return out
 }
+
+// databaseDSN builds a connection string for any database using the same
+// authentication mode as the primary connection. In particular, password-based
+// launches can inspect every user database just like password-free launches.
+func (d *DB) databaseDSN(database string) string { return buildDSN(d.cfg, database) }
 
 // BackgroundQuery runs a statement on a detached goroutine, used by emergency
 // modules to fire off remediation without blocking the loop. Mirrors
@@ -261,13 +359,44 @@ func (d *DB) BackgroundQuery(query string) {
 
 // Close releases the pool.
 func (d *DB) Close() {
+	d.Cancel()
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.pool != nil {
-		d.pool.Close()
-		d.pool = nil
-		d.healthy = false
+	pool := d.pool
+	d.pool = nil
+	d.healthy = false
+	d.mu.Unlock()
+	if pool == nil {
+		return
 	}
+	done := make(chan struct{})
+	go func() {
+		_ = pool.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		d.logger.Warning("Database pool close exceeded 250ms; exiting without further wait.")
+	}
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func firstError(primary, fallback error) error {
+	if primary != nil {
+		return primary
+	}
+	return fallback
+}
+
+func (d *DB) logContextFailure(operation, query string, err error) {
+	if errors.Is(err, context.Canceled) {
+		d.logger.Warning("Database %s canceled: %s", operation, query)
+		return
+	}
+	d.logger.Warning("Database %s exceeded collect_timeout: %s", operation, query)
 }
 
 func scanRows(rows *sql.Rows) ([]Row, error) {

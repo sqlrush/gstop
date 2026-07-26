@@ -89,7 +89,7 @@ const sessionQueryGaussDB = `WITH curr_clock_time AS (SELECT * FROM clock_timest
             END),
             t.wait_event,
             t.block_sessionid
-        FROM pg_catalog.pg_stat_activity a
-            LEFT JOIN pg_thread_wait_status t ON a.sessionid = t.sessionid
-        ORDER BY a.state;
+	        FROM pg_catalog.pg_stat_activity a
+	            LEFT JOIN pg_thread_wait_status t ON a.pid = t.tid AND a.sessionid = t.sessionid
+	        ORDER BY a.state;
         `
