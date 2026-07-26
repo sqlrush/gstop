@@ -4,7 +4,7 @@
 
 **日期：** 2026-07-25
 
-**状态：** 方案已确认，待实现计划
+**状态：** 方案已确认，开发计划已完成，待实现
 
 ## 1. 目标
 
@@ -64,6 +64,105 @@ gsbench run 621
 gsbench run hardparse_literal_flood
 gsbench run 301,304,702
 ```
+
+### 3.1 完整场景目录（90 项）
+
+适用环境缩写：`OG` 为 openGauss，`CG` 为集中式 GaussDB，`DG` 为分布式
+GaussDB，`PS` 表示必须存在主备复制，`CAP` 表示必须通过对应能力探测。风险等级
+沿用第 17 节定义；`A/B` 表示普通模式为 A，但启用管理型变体时提升为 B。
+
+| 编号 | 正式名称 | 类别 | 适用环境 | 风险等级 | 制造方式摘要 | 核心数据表/对象 |
+|---|---|---|---|---|---|---|
+| 101 | `tp_cpu` | CPU | OG/CG/DG | A | 并发点查、更新、插入和短事务提交 | `accounts`、`orders` |
+| 102 | `ap_cpu` | CPU | OG/CG/DG | A | 大表扫描、Hash Join、聚合和排序 | `fact_sales`、`dim_product` |
+| 103 | `mixed_cpu` | CPU | OG/CG/DG | A | 按比例同时运行 TP 与 AP worker | 101、102 的公共对象 |
+| 201 | `memory_workmem_sort` | 内存 | OG/CG/DG | A | 提高 session `work_mem` 并执行大排序 | `sort_data`、`fact_sales` |
+| 202 | `memory_workmem_hash` | 内存 | OG/CG/DG | A | 大 Hash Join 和 Hash Aggregate | `fact_sales` |
+| 203 | `memory_sharedbuffer_churn` | 内存 | OG/CG/DG | A | 扫描大于共享缓存的变化工作集 | `fact_sales` |
+| 204 | `memory_plancache_growth` | 内存 | OG/CG/DG/CAP | A | 长连接创建大量唯一 PREPARE | `plan_data`、plan cache |
+| 205 | `memory_session_context_growth` | 内存 | OG/CG/DG | A | 长事务打开大量 cursor/Portal | `fact_sales`、session context |
+| 206 | `memory_global_cache_pressure` | 内存 | OG/CG/DG/CAP | A | 分批创建和访问小表、索引及目录 | `global_cache_targets`、catalog cache |
+| 207 | `memory_total_pressure` | 内存 | OG/CG/DG | A | 组合排序、Hash、计划缓存和 cursor | 201、202、204、205 的对象 |
+| 208 | `memory_retention` | 内存 | OG/CG/DG | A | 停止新 SQL 后保持长连接观察驻留 | plan/session memory context |
+| 209 | `memory_oom_guarded` | 内存 | OG/CG/DG | B | 受保护地增加执行内存直到数据库拒绝或保护线 | `sort_data`、`fact_sales` |
+| 301 | `io_sequential_read` | I/O 与网络 | OG/CG/DG | A | 变化范围的大表顺序扫描 | `fact_sales` |
+| 302 | `io_random_read` | I/O 与网络 | OG/CG/DG | A | 超过有效缓存集合的随机主键点查 | `accounts` |
+| 303 | `io_wal_write` | I/O 与网络 | OG/CG/DG | A | 高频更新和小事务提交生成 WAL | `accounts` |
+| 304 | `io_temp_spill` | I/O 与网络 | OG/CG/DG | A | 降低 `work_mem` 强制排序/Hash 落盘 | `fact_sales` |
+| 305 | `io_checkpoint_flush` | I/O 与网络 | OG/CG/DG | B | 制造脏页后执行或观察 checkpoint | `vacuum_targets`、checkpoint |
+| 321 | `network_client_egress` | I/O 与网络 | OG/CG/DG | A | 向客户端返回大量 payload | `fact_sales` |
+| 322 | `network_client_ingress` | I/O 与网络 | OG/CG/DG | A | 客户端 PBE 批量上传 payload | `network_ingress` |
+| 331 | `network_cn_dn_stream` | I/O 与网络 | DG | A | 多 DN 聚合产生 GATHER stream | `fact_sales` |
+| 332 | `network_distributed_shuffle` | I/O 与网络 | DG | A | 非共置列关联产生 REDISTRIBUTE | `fact_sales`、`dist_join_data` |
+| 333 | `network_distributed_broadcast` | I/O 与网络 | DG | A | Hash 小表强制 BROADCAST | `fact_sales`、`dist_small_hash` |
+| 341 | `network_latency_injection` | I/O 与网络 | OG/CG/DG/provider | C | 对精确 peer/port 注入 netem 延迟 | `tc` qdisc/filter |
+| 342 | `network_packet_loss` | I/O 与网络 | OG/CG/DG/provider | C | 对精确 peer/port 注入 netem 丢包 | `tc` qdisc/filter |
+| 343 | `network_partition` | I/O 与网络 | OG/CG/DG/provider | C | run 专属 nft 规则隔离精确链路 | `nft` table/chain |
+| 401 | `connection_pool` | 连接池和线程池 | OG/CG/DG | A | 建立 idle、idle-in-tx 和 active 连接 | tagged sessions |
+| 402 | `thread_pool` | 连接池和线程池 | OG/CG/DG/CAP | A | active session 数超过可用线程 | thread-pool views |
+| 403 | `connection_churn` | 连接池和线程池 | OG/CG/DG | A | 高频连接、认证、`SELECT 1`、断开 | connection/authentication |
+| 404 | `threadpool_queue` | 连接池和线程池 | OG/CG/DG/CAP | A | 有界 CPU SQL 使会话进入线程队列 | thread-pool queue |
+| 405 | `pooler_cn_dn_pressure` | 连接池和线程池 | DG | A | 多 CN session 竞争 DN pooler 连接 | pooler、`fact_sales` |
+| 501 | `lock_row_chain` | 锁与并发 | OG/CG/DG | A | 多事务逐行形成 blocker/waiter 链 | `lock_targets` |
+| 502 | `lock_table_exclusive` | 锁与并发 | OG/CG/DG | A | AccessExclusive 阻塞 AccessShare | `lock_table_targets` |
+| 503 | `lock_ddl_wait` | 锁与并发 | OG/CG/DG | A | DML 持锁，DDL 等待 | `lock_ddl_targets` |
+| 504 | `lock_deadlock` | 锁与并发 | OG/CG/DG | A | 两事务反向更新形成死锁环 | `lock_targets` |
+| 505 | `lock_ddl_blocks_dml` | 锁与并发 | OG/CG/DG | A | 未提交 DDL 阻塞 DML | `lock_ddl_targets` |
+| 506 | `lock_select_blocks_ddl` | 锁与并发 | OG/CG/DG | A | 长事务 SELECT 阻塞 DDL | `lock_ddl_targets` |
+| 507 | `lock_vacuum_blocks_ddl` | 锁与并发 | OG/CG/DG | A | 运行中 VACUUM 与 DDL 竞争 | `vacuum_targets` |
+| 508 | `lock_ddl_blocks_vacuum` | 锁与并发 | OG/CG/DG | A | AccessExclusive 阻塞 VACUUM | `vacuum_targets` |
+| 509 | `lock_createindex_blocks_dml` | 锁与并发 | OG/CG/DG | A | 普通 CREATE INDEX 阻塞 DML | `vacuum_targets` |
+| 510 | `lock_dml_blocks_createindex` | 锁与并发 | OG/CG/DG | A | 未提交 DML 阻塞 CREATE INDEX | `vacuum_targets` |
+| 511 | `lock_distributed_ddl_global` | 锁与并发 | DG | A | 多 CN DDL 竞争全局 regular lock | `ddl_global_*` |
+| 512 | `lock_distributed_txn_chain` | 锁与并发 | DG | A | 跨分片事务形成全局等待链 | `dist_lock_targets` |
+| 520 | `lockmode_accessshare_accessexclusive` | 锁与并发 | OG/CG/DG | A | AS holder 阻塞 AX waiter | `lock_mode_targets` |
+| 521 | `lockmode_rowshare_exclusive` | 锁与并发 | OG/CG/DG | A | RS holder 阻塞 X waiter | `lock_mode_targets` |
+| 522 | `lockmode_rowshare_accessexclusive` | 锁与并发 | OG/CG/DG | A | RS holder 阻塞 AX waiter | `lock_mode_targets` |
+| 523 | `lockmode_rowexclusive_share` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 S waiter | `lock_mode_targets` |
+| 524 | `lockmode_rowexclusive_sharerowexclusive` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 525 | `lockmode_rowexclusive_exclusive` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 X waiter | `lock_mode_targets` |
+| 526 | `lockmode_rowexclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | RX holder 阻塞 AX waiter | `lock_mode_targets` |
+| 527 | `lockmode_shareupdateexclusive_self` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 SUE waiter | `lock_mode_targets` |
+| 528 | `lockmode_shareupdateexclusive_share` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 S waiter | `lock_mode_targets` |
+| 529 | `lockmode_shareupdateexclusive_sharerowexclusive` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 530 | `lockmode_shareupdateexclusive_exclusive` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 X waiter | `lock_mode_targets` |
+| 531 | `lockmode_shareupdateexclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | SUE holder 阻塞 AX waiter | `lock_mode_targets` |
+| 532 | `lockmode_share_sharerowexclusive` | 锁与并发 | OG/CG/DG | A | S holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 533 | `lockmode_share_exclusive` | 锁与并发 | OG/CG/DG | A | S holder 阻塞 X waiter | `lock_mode_targets` |
+| 534 | `lockmode_share_accessexclusive` | 锁与并发 | OG/CG/DG | A | S holder 阻塞 AX waiter | `lock_mode_targets` |
+| 535 | `lockmode_sharerowexclusive_self` | 锁与并发 | OG/CG/DG | A | SRX holder 阻塞 SRX waiter | `lock_mode_targets` |
+| 536 | `lockmode_sharerowexclusive_exclusive` | 锁与并发 | OG/CG/DG | A | SRX holder 阻塞 X waiter | `lock_mode_targets` |
+| 537 | `lockmode_sharerowexclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | SRX holder 阻塞 AX waiter | `lock_mode_targets` |
+| 538 | `lockmode_exclusive_self` | 锁与并发 | OG/CG/DG | A | X holder 阻塞 X waiter | `lock_mode_targets` |
+| 539 | `lockmode_exclusive_accessexclusive` | 锁与并发 | OG/CG/DG | A | X holder 阻塞 AX waiter | `lock_mode_targets` |
+| 540 | `lockmode_accessexclusive_self` | 锁与并发 | OG/CG/DG | A | AX holder 阻塞 AX waiter | `lock_mode_targets` |
+| 601 | `planchange_stats_target` | 执行计划 | OG/CG/DG/CAP | A | 降低列统计采样目标后 ANALYZE | `plan_data.stats_target_key` |
+| 602 | `planchange_index_unusable` | 执行计划 | OG/CG/DG/CAP | A | 将基准索引置为 UNUSABLE | `plan_index_unusable_idx` |
+| 603 | `planchange_stats_ndistinct` | 执行计划 | OG/CG/DG/CAP | A | 修改 `n_distinct` 和统计目标 | `plan_data.stats_ndistinct_key` |
+| 604 | `planchange_stats_extended` | 执行计划 | OG/CG/DG/CAP | A | 删除相关列扩展统计 | `plan_data.stats_corr_a/b` |
+| 605 | `planchange_index_drop` | 执行计划 | OG/CG/DG | A | 删除基准索引使访问路径跳变 | `plan_index_drop_idx` |
+| 606 | `planchange_index_shape` | 执行计划 | OG/CG/DG | A | 将优良复合索引替换为反向列序索引 | `plan_data.index_shape_*` |
+| 621 | `hardparse_literal_flood` | 执行计划 | OG/CG/DG | A | 持续生成唯一整数常量 SQL 文本 | `fact_sales` |
+| 622 | `hardparse_unprepared` | 执行计划 | OG/CG/DG | A | simple-query 重复发送未预编译 SQL | `fact_sales` |
+| 623 | `hardparse_force_custom` | 执行计划 | OG/CG/DG/CAP | A | 强制 prepared statement 使用 custom plan | `fact_sales`、plan cache |
+| 624 | `hardparse_session_churn` | 执行计划 | OG/CG/DG | A | 短连接反复 PREPARE/EXECUTE | `fact_sales` |
+| 625 | `hardparse_ddl_invalidation` | 执行计划 | OG/CG/DG | A | 索引 DDL 反复使缓存计划失效 | `hardparse_targets` |
+| 626 | `hardparse_gpc_bypass` | 执行计划 | OG/CG/DG/CAP | A | `no_gpc` 绕过全局计划缓存 | GPC、`fact_sales` |
+| 701 | `replication_wal_pressure` | 主备与集群 | OG/CG/DG/PS | A | 主库或主 DN 高频更新提交 | `replication_targets` |
+| 702 | `replication_sync_commit_block` | 主备与集群 | OG/CG/DG/PS | A | `remote_apply` 高频提交等待同步备库 | `replication_targets` |
+| 703 | `replication_replay_delay` | 主备与集群 | OG/CG/DG/PS/provider | B | 设置备库回放延迟或短时暂停回放 | standby replay control |
+| 704 | `replication_standby_read_conflict` | 主备与集群 | OG/CG/DG/PS | A | 备库长快照与主库 DELETE/VACUUM 冲突 | `replication_conflict_targets` |
+| 705 | `replication_network_delay` | 主备与集群 | OG/CG/DG/PS/provider | C | 对复制 peer 注入精确网络延迟 | replication link、`tc` |
+| 706 | `replication_network_partition` | 主备与集群 | OG/CG/DG/PS/provider | C | 隔离一个复制 peer/分片主备链路 | replication link、`nft` |
+| 721 | `cluster_data_skew` | 主备与集群 | DG | A | 95% 数据写入同一 HASH key | `cluster_skew_data` |
+| 722 | `cluster_cn_hotspot` | 主备与集群 | DG | A | 所有 workload 固定连接一个 CN | CN endpoint |
+| 723 | `cluster_dn_hotspot` | 主备与集群 | DG | A | 选择映射到同一 DN 的分布键 | `fact_sales.dist_key` |
+| 724 | `cluster_cross_shard_txn` | 主备与集群 | DG | A | 一个事务更新两个不同 shard | `dist_txn_targets` |
+| 725 | `cluster_gtm_pressure` | 主备与集群 | DG/GTM | A | 高频极短跨分片事务申请全局 XID | `dist_txn_targets`、GTM |
+| 726 | `cluster_partial_node_slow` | 主备与集群 | DG/provider | C | 降低一个 CN/DN peer 链路质量 | node link、`tc` |
+| 727 | `cluster_node_failure` | 主备与集群 | DG/provider | C | 停止一个有健康副本的节点 | node process/provider |
+| 728 | `cluster_switchover` | 主备与集群 | DG/provider | C | 在同步健康前提下计划内切换 | node roles/provider |
+| 801 | `vacuum_pressure` | 维护操作 | OG/CG/DG | A/B | 制造 dead tuples 后运行 VACUUM；FULL 为 B | `vacuum_targets` |
 
 ## 4. 产品、拓扑和能力模型
 
@@ -139,68 +238,792 @@ type ScenarioDefinition struct {
 
 产品能力缺失不能静默转为成功。
 
-## 5. 数据集和 SQL 约定
+## 5. 测试数据 DDL、容量换算和建数 SQL
 
-以下示例使用占位符：
+### 5.1 占位符和生成边界
+
+本节给出 `gsbench init` 必须实现的完整逻辑 DDL 和建数 SQL。占位符含义如下：
 
 - `<S>`：经过标识符校验和正确引用的 benchmark schema；
 - `<RUN>`：仅含安全字符的 run ID；
 - `<NODE>`：能力探测得到的节点名；
 - `<IFACE>`、`<PEER_IP>`、`<PEER_PORT>`：外部故障提供器确认过的精确目标；
-- `<DATA_DIR>`：自管环境中经过白名单检查的实例数据目录。
+- `<DATA_DIR>`：自管环境中经过白名单检查的实例数据目录；
+- `<CUSTOMER_ROWS>`、`<ORDER_ROWS>`：容量算法得到并绑定进内部 SQL 模板的目标行数；
+- `<ROWS_PER_OBJECT>`：206 根据对象数和该场景容量保护线计算的单对象行数；
+- `<N>`：程序生成且经过上下界检查的整数序号；
+- `$1/$2`：当前插入批次的起止高水位，均为程序绑定的 `bigint` 参数。
 
 SQL 由程序内部模板生成，配置文件不能提供任意 SQL。所有表都属于 `<S>`，不会访问
-业务表。
+业务表。DDL 中的对象名来自固定目录，不接受用户输入的表名、列名或分布键。
 
-集中式和 openGauss 使用普通表。分布式 GaussDB 使用显式分布策略：
+### 5.2 用户输入容量的解析和安全校验
 
-```sql
-CREATE TABLE <S>.fact_sales (
-    id bigint NOT NULL,
-    dist_key bigint NOT NULL,
-    customer_id bigint NOT NULL,
-    product_id int NOT NULL,
-    store_id int NOT NULL,
-    amount numeric(18,2) NOT NULL,
-    payload varchar(256)
-) DISTRIBUTE BY HASH (dist_key);
+目标容量优先级固定为：
 
-CREATE TABLE <S>.dim_product (
-    id int PRIMARY KEY,
-    category_id int NOT NULL,
-    payload varchar(256)
-) DISTRIBUTE BY REPLICATION;
+```text
+init --size
+  > data.max_size_gb
+  > profile 默认值（quick=5GiB，stress=20GiB）
 ```
 
-大事实表使用均匀 HASH 分布，小维表使用 REPLICATION。数据倾斜场景使用单独的
-`cluster_skew_data`，不会改变公共事实表。
+`--size` 接受 `100GB`、`1.5TB`、`2TB`；`data.max_size_gb` 接受 1～2048。
+换算统一使用二进制单位：
 
-数据集按用途增加或保留以下对象：
+```text
+1 GiB = 1024^3 bytes
+1 TiB = 1024^4 bytes
+```
 
-| 用途 | 表 |
-|---|---|
-| TP/AP/CPU | `accounts`、`customers`、`orders`、`order_items`、`fact_sales`、`dim_product`、`dim_store` |
-| 内存/I/O | `sort_data`、`network_ingress`、`global_cache_targets` |
-| 计划和硬解析 | `plan_data`、`hardparse_targets` |
-| 锁 | `lock_targets`、`lock_table_targets`、`lock_ddl_targets`、`lock_mode_targets`、`dist_lock_targets` |
-| 主备 | `replication_targets`、`replication_conflict_targets` |
-| 分布式集群 | `cluster_skew_data`、`dist_join_data`、`dist_small_hash`、`dist_txn_targets` |
-| 维护 | `vacuum_targets` |
-| 元数据 | `meta_dataset`、`meta_runs`、`meta_journal`、`meta_batches`、`meta_plan_cache` |
+令用户请求值为 `T`。开始建表前必须同时满足：
 
-分布式 GaussDB 中，事实/事务/锁表显式 HASH 分布，维表显式 REPLICATION。metadata
-表不能依赖集中式 `bigserial PRIMARY KEY` 定义直接创建：`meta_runs` 和
-`meta_journal` 以 `run_id` 为分布键并使用包含分布键的复合主键；无需自增列的小型
-只读元数据才允许使用 REPLICATION。`doctor/init --dry-run` 必须打印最终选择的建表
-变体。
+```text
+0 < T <= 2 TiB
+safe_available = free_bytes - total_bytes * min_free_disk_percent / 100
+T <= safe_available
+```
+
+如果请求值大于安全容量，`init` 直接失败并打印请求值、剩余空间和保留空间，不能
+静默缩小用户输入。建数过程中每个批次前重新检查磁盘；空间跌破保留线时停止并保留
+已写入的高水位，以便扩容后续建。
+
+### 5.3 表预算、目标行数和批次数
+
+目标容量 `T` 表示整个 benchmark 数据集的容量上限，不只是 heap。算法预留：
+
+```text
+79%  可按容量扩展的基础表 heap 预算
+ 6%  固定小表、锁表和元数据预算
+15%  索引、行头、FSM/VM、TOAST 和估算误差
+```
+
+对每张可扩展表 `i`：
+
+```text
+target_rows_i =
+  max(min_rows_i, floor(T * weight_i / 100 / estimated_row_bytes_i))
+
+batch_rows_i =
+  clamp(floor(64 MiB / estimated_row_bytes_i), 10,000, 250,000)
+
+batch_count_i =
+  ceil(max(0, target_rows_i - high_water_i) / batch_rows_i)
+```
+
+权重只用于初始计划，不代表实际物理占用。表完成后读取 heap 和 index 的实际大小；
+数据集总占用达到 `0.95 * T` 后，不再启动新的可选扩展批次。达到 `T` 或磁盘安全线
+时立即停止。低于 `0.90 * T` 且仍有安全空间时，按权重差额继续补批，最多校准三轮，
+防止压缩率或行头估算差异造成无限循环。
+
+| 表 | 权重 | 估算行宽 | 最低行数 | 主要场景 |
+|---|---:|---:|---:|---|
+| `customers` | 2% | 320 B | 10,000 | 101、102 |
+| `accounts` | 6% | 352 B | 100,000 | 101、302、303 |
+| `orders` | 6% | 160 B | 100,000 | 101 |
+| `order_items` | 7% | 128 B | 200,000 | 101 |
+| `fact_sales` | 20% | 192 B | 500,000 | 102、201～205、301、321、331～333、621～624 |
+| `sort_data` | 8% | 640 B | 100,000 | 201、209 |
+| `plan_data` | 12% | 640 B | 1,000,000 | 204、601～606 |
+| `hardparse_targets` | 3% | 320 B | 100,000 | 625 |
+| `vacuum_targets` | 5% | 1,152 B | 100,000 | 305、507～510、801 |
+| `replication_targets` | 2% | 320 B | 100,000 | 701～703 |
+| `replication_conflict_targets` | 1% | 320 B | 100,000 | 704 |
+| `cluster_skew_data` | 2% | 320 B | 100,000 | 721 |
+| `dist_join_data` | 2% | 192 B | 100,000 | 332 |
+| `dist_small_hash` | 1% | 128 B | 10,000 | 333 |
+| `dist_txn_targets` | 2% | 128 B | 100,000 | 724、725 |
+
+`cluster_skew_data` 的 2% 是运行 721 时的瞬时容量预留；公共 `init` 只创建空表，
+721 的 Prepare 再按本表目标行数分批装载并在恢复时清空。`network_ingress` 同样
+使用瞬时预留，不在公共 `init` 中预装 payload。
+
+以下对象使用固定基线，不按 `T` 无限放大：
+
+| 表 | 固定目标行数 |
+|---|---:|
+| `dim_product` | 100,000 |
+| `dim_store` | 10,000 |
+| `global_cache_targets` | 10,000 |
+| `lock_targets` | 10,000 |
+| `lock_table_targets`、`lock_ddl_targets`、`lock_mode_targets` | 各 1,000 |
+| `ddl_global_1`～`ddl_global_4` | 各 10,000 |
+| `dist_lock_targets` | 100,000 |
+| `network_ingress` | 初始 0，由 322 按 run 写入并恢复删除 |
+| `meta_*` | 仅写运行和恢复元数据 |
+
+示例：用户执行 `gsbench init --size 100GB`，`fact_sales` 的初始目标为：
+
+```text
+floor(100 * 1024^3 * 20% / 192) = 111,848,106 rows
+```
+
+批次约为 `64MiB / 192B = 349,525` 行，经上限裁剪后使用 250,000 行，共 448 批。
+`init --dry-run` 必须打印输入容量、每张表的权重、估算行宽、目标行数、批大小、批数、
+当前高水位和预计新增字节。
+
+### 5.4 集中式和分布式 DDL 方言
+
+为避免维护两份会漂移的列定义，代码以本节的逻辑 DDL 为唯一来源，并展开两个宏：
+
+| 逻辑宏 | openGauss/集中式 GaussDB | 分布式 GaussDB |
+|---|---|---|
+| `@HASH(column_list)` | 删除宏，不追加子句 | `DISTRIBUTE BY HASH (column_list)` |
+| `@REPLICATION` | 删除宏，不追加子句 | `DISTRIBUTE BY REPLICATION` |
+
+因此，去掉宏后的 SQL 就是 openGauss/集中式 DDL；替换宏后的 SQL 是分布式
+GaussDB DDL。`init --dry-run` 输出的必须是展开后的可执行 SQL，不能把宏发送给
+数据库。
+
+GaussDB 分布式 HASH 表的主键全部包含分布键，避免因为主键/唯一键不包含分布键而
+无意创建 GSI。只有 `dim_product`、`dim_store` 和只读的 `meta_dataset` 使用
+REPLICATION；高频写入的元数据仍按稳定键 HASH 分布。
+
+```sql
+CREATE TABLE <S>.meta_dataset (
+    key varchar(128) PRIMARY KEY,
+    value text NOT NULL,
+    updated_at timestamp NOT NULL DEFAULT current_timestamp
+) @REPLICATION;
+
+CREATE TABLE <S>.meta_runs (
+    run_id varchar(96) NOT NULL,
+    scenarios text NOT NULL,
+    phase varchar(32) NOT NULL,
+    status varchar(32) NOT NULL,
+    owner_name varchar(128) NOT NULL,
+    started_at timestamp NOT NULL,
+    updated_at timestamp NOT NULL,
+    detail text,
+    PRIMARY KEY (run_id)
+) @HASH(run_id);
+
+CREATE TABLE <S>.meta_journal (
+    run_id varchar(96) NOT NULL,
+    action_id bigint NOT NULL,
+    scenario_code integer NOT NULL,
+    action_kind varchar(64) NOT NULL,
+    target_node varchar(128),
+    target_endpoint varchar(256),
+    original_state text,
+    forward_action text NOT NULL,
+    inverse_action text NOT NULL,
+    verify_action text,
+    state varchar(32) NOT NULL,
+    error_text text,
+    created_at timestamp NOT NULL DEFAULT current_timestamp,
+    updated_at timestamp NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (run_id, action_id)
+) @HASH(run_id);
+
+CREATE TABLE <S>.meta_batches (
+    table_name varchar(128) NOT NULL,
+    high_water bigint NOT NULL,
+    target_rows bigint NOT NULL,
+    estimated_row_bytes bigint NOT NULL,
+    dataset_version varchar(32) NOT NULL,
+    updated_at timestamp NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (table_name)
+) @HASH(table_name);
+
+CREATE TABLE <S>.meta_plan_cache (
+    signature varchar(64) NOT NULL,
+    scenario_code integer NOT NULL,
+    sql_text text NOT NULL,
+    plan_text text NOT NULL,
+    updated_at timestamp NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (signature, scenario_code)
+) @HASH(signature);
+
+CREATE TABLE <S>.customers (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    region_id integer NOT NULL,
+    name varchar(96),
+    payload varchar(256),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.accounts (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    customer_id bigint NOT NULL,
+    balance numeric(18,2) NOT NULL,
+    payload varchar(256),
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.orders (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    customer_id bigint NOT NULL,
+    status integer NOT NULL,
+    amount numeric(18,2) NOT NULL,
+    created_at timestamp NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.order_items (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    order_id bigint NOT NULL,
+    product_id integer NOT NULL,
+    quantity integer NOT NULL,
+    amount numeric(18,2) NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.dim_product (
+    id integer PRIMARY KEY,
+    category_id integer NOT NULL,
+    name varchar(96),
+    payload varchar(256)
+) @REPLICATION;
+
+CREATE TABLE <S>.dim_store (
+    id integer PRIMARY KEY,
+    region_id integer NOT NULL,
+    name varchar(96)
+) @REPLICATION;
+
+CREATE TABLE <S>.fact_sales (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    sale_date date NOT NULL,
+    customer_id bigint NOT NULL,
+    product_id integer NOT NULL,
+    store_id integer NOT NULL,
+    amount numeric(18,2) NOT NULL,
+    quantity integer NOT NULL,
+    payload varchar(256),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.sort_data (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    group_id integer NOT NULL,
+    sort_key bigint NOT NULL,
+    payload varchar(512),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.network_ingress (
+    run_id varchar(96) NOT NULL,
+    dist_key bigint NOT NULL,
+    seq bigint NOT NULL,
+    payload varchar(1024) NOT NULL,
+    created_at timestamp NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (dist_key, run_id, seq)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.global_cache_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value varchar(64),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.plan_data (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    lookup_key bigint NOT NULL,
+    skew_key integer NOT NULL,
+    stats_target_key integer NOT NULL,
+    stats_ndistinct_key bigint NOT NULL,
+    stats_corr_a integer NOT NULL,
+    stats_corr_b integer NOT NULL,
+    index_unusable_key bigint NOT NULL,
+    index_drop_key bigint NOT NULL,
+    index_shape_lead integer NOT NULL,
+    index_shape_tail bigint NOT NULL,
+    payload varchar(512),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.hardparse_targets (
+    lookup_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    payload varchar(256),
+    PRIMARY KEY (lookup_key, id)
+) @HASH(lookup_key);
+
+CREATE TABLE <S>.lock_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    payload varchar(256),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.lock_table_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    payload varchar(256),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.lock_ddl_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    payload varchar(256),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.lock_mode_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.ddl_global_1 (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.ddl_global_2 (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.ddl_global_3 (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.ddl_global_4 (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.dist_lock_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    payload varchar(256),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.replication_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    version bigint NOT NULL,
+    payload varchar(256),
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.replication_conflict_targets (
+    dist_key bigint NOT NULL,
+    run_id varchar(96) NOT NULL,
+    id bigint NOT NULL,
+    payload varchar(256),
+    created_at timestamp NOT NULL,
+    PRIMARY KEY (dist_key, run_id, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.cluster_skew_data (
+    skew_key bigint NOT NULL,
+    id bigint NOT NULL,
+    payload varchar(256),
+    PRIMARY KEY (skew_key, id)
+) @HASH(skew_key);
+
+CREATE TABLE <S>.dist_join_data (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    join_key bigint NOT NULL,
+    value bigint NOT NULL,
+    payload varchar(128),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.dist_small_hash (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    product_id integer NOT NULL,
+    category_id integer NOT NULL,
+    payload varchar(64),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.dist_txn_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value bigint NOT NULL,
+    payload varchar(64),
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE TABLE <S>.vacuum_targets (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    group_id integer NOT NULL,
+    version bigint NOT NULL,
+    payload varchar(1024),
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (dist_key, id)
+) @HASH(dist_key);
+
+CREATE INDEX accounts_customer_idx
+ON <S>.accounts (customer_id, dist_key, id);
+
+CREATE INDEX orders_customer_idx
+ON <S>.orders (customer_id, dist_key, id);
+
+CREATE INDEX order_items_order_idx
+ON <S>.order_items (order_id, dist_key, id);
+
+CREATE INDEX fact_sales_product_idx
+ON <S>.fact_sales (product_id, dist_key, id);
+
+CREATE INDEX fact_sales_customer_idx
+ON <S>.fact_sales (customer_id, dist_key, id);
+
+CREATE INDEX sort_data_sort_idx
+ON <S>.sort_data (sort_key, dist_key, id);
+
+CREATE INDEX plan_data_lookup_idx
+ON <S>.plan_data (lookup_key, dist_key, id);
+
+CREATE INDEX plan_stats_target_idx
+ON <S>.plan_data (stats_target_key, dist_key, id);
+
+CREATE INDEX plan_stats_ndistinct_idx
+ON <S>.plan_data (stats_ndistinct_key, dist_key, id);
+
+CREATE INDEX plan_stats_corr_idx
+ON <S>.plan_data (stats_corr_a, stats_corr_b, dist_key, id);
+
+CREATE INDEX plan_index_unusable_idx
+ON <S>.plan_data (index_unusable_key, dist_key, id);
+
+CREATE INDEX plan_index_drop_idx
+ON <S>.plan_data (index_drop_key, dist_key, id);
+
+CREATE INDEX plan_index_shape_good_idx
+ON <S>.plan_data (index_shape_lead, index_shape_tail, dist_key, id);
+
+CREATE INDEX hardparse_targets_lookup_idx
+ON <S>.hardparse_targets (lookup_key, id);
+
+CREATE INDEX replication_conflict_run_idx
+ON <S>.replication_conflict_targets (run_id, dist_key, id);
+
+CREATE INDEX vacuum_targets_group_idx
+ON <S>.vacuum_targets (group_id, dist_key, id);
+```
+
+分片键选择规则：
+
+| 表组 | 分片字段 | 原因 |
+|---|---|---|
+| `customers`、`accounts`、`orders` | `dist_key=customer_id` | 客户维度 TP 操作可定位并尽量共置 |
+| `order_items` | `dist_key=order_id` | 订单明细按订单定位 |
+| `fact_sales`、`sort_data`、`plan_data` | `dist_key=mod(id, distribution_cardinality)` | 高基数且均匀，适合扫描、计划和 DN 热点选键 |
+| `hardparse_targets` | `lookup_key` | prepared 查询可单 DN 定位 |
+| 普通锁、复制、事务和维护表 | `dist_key` | 客户端可以明确选择同 DN 或不同 DN |
+| `cluster_skew_data` | `skew_key` | 721 故意让 95% 行使用相同值 |
+| `dist_join_data` | `dist_key`，关联列为 `join_key` | 332 故意制造非共置 JOIN 和 REDISTRIBUTE |
+| `dist_small_hash` | `dist_key`，关联列为 `product_id` | 333 保持为 HASH 小表以制造 BROADCAST |
+| `dim_product`、`dim_store` | REPLICATION | 只读小维表，避免普通星型查询产生额外 stream |
+| `meta_runs`、`meta_journal` | `run_id` | 同一 run 的状态和动作稳定路由 |
+
+除 721 的专用倾斜表外，普通 HASH 表的 `dist_key` 必须具有足够基数。不能对
+`region_id`、`status`、`category_id` 等低基数字段分片。
+
+### 5.5 按容量生成测试数据的 SQL
+
+每张表都使用同一个增量协议：
+
+1. 从 `<S>.meta_batches` 读取 `high_water`；
+2. 计算本轮 `start=high_water+1` 和
+   `end=min(start+batch_rows-1,target_rows)`；
+3. 绑定 `$1=start`、`$2=end` 执行固定 INSERT；
+4. 提交成功后更新高水位；
+5. 批次失败时不推进高水位，重试不会重复已提交范围。
+
+可扩展表和固定基线表的 SQL 如下。这里的 `mod(g,1048576)+1` 提供约一百万个普通
+分布键；分布式能力适配器也可以根据 bucket/shard 数提高该基数，但不能降低到少于
+`1024 * shard_count`。
+
+```sql
+INSERT INTO <S>.customers
+    (dist_key,id,region_id,name,payload)
+SELECT g, g, mod(g,100), 'customer-' || g, repeat('c',128)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.accounts
+    (dist_key,id,customer_id,balance,payload,updated_at)
+SELECT mod(g,<CUSTOMER_ROWS>)+1, g, mod(g,<CUSTOMER_ROWS>)+1,
+       1000, repeat('a',128), current_timestamp
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.orders
+    (dist_key,id,customer_id,status,amount,created_at)
+SELECT mod(g,<CUSTOMER_ROWS>)+1, g, mod(g,<CUSTOMER_ROWS>)+1,
+       mod(g,5), mod(g,10000),
+       current_date - (mod(g,365)::integer)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.order_items
+    (dist_key,id,order_id,product_id,quantity,amount)
+SELECT mod(g,<ORDER_ROWS>)+1, g, mod(g,<ORDER_ROWS>)+1,
+       mod(g,100000)+1, mod(g,10)+1, mod(g,5000)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.dim_product
+    (id,category_id,name,payload)
+SELECT g, mod(g,1000), 'product-' || g, repeat('p',128)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.dim_store
+    (id,region_id,name)
+SELECT g, mod(g,100), 'store-' || g
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.fact_sales
+    (dist_key,id,sale_date,customer_id,product_id,store_id,
+     amount,quantity,payload)
+SELECT mod(g,1048576)+1, g,
+       current_date - (mod(g,730)::integer),
+       mod(g,<CUSTOMER_ROWS>)+1,
+       mod(g,100000)+1,
+       mod(g,10000)+1,
+       mod(g,100000)/100.0,
+       mod(g,20)+1,
+       repeat('f',96)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.sort_data
+    (dist_key,id,group_id,sort_key,payload)
+SELECT mod(g,1048576)+1, g, mod(g,4096), mod(g*7919,2147483647),
+       repeat(chr(65+mod(g,26)::integer),512)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.global_cache_targets
+    (dist_key,id,value)
+SELECT g, g, 'cache-' || g
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.plan_data
+    (dist_key,id,lookup_key,skew_key,stats_target_key,
+     stats_ndistinct_key,stats_corr_a,stats_corr_b,
+     index_unusable_key,index_drop_key,index_shape_lead,
+     index_shape_tail,payload)
+SELECT mod(g,1048576)+1,
+       g,
+       g,
+       CASE WHEN mod(g,100)<95 THEN 1 ELSE mod(g,1000) END,
+       CASE WHEN mod(g,100)<80 THEN mod(g,4)+1
+            ELSE mod(g,1000)+100 END,
+       mod(g,1000000)+1,
+       mod(g,1000),
+       mod(g,1000),
+       g,
+       g,
+       mod(g,1000),
+       g,
+       repeat('s',400)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.hardparse_targets
+    (lookup_key,id,value,payload)
+SELECT mod(g,1000000)+1, g, mod(g,10000), repeat('h',192)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.lock_targets
+    (dist_key,id,value,payload)
+SELECT g, g, 0, repeat('l',128)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.lock_table_targets
+    (dist_key,id,value,payload)
+SELECT g, g, 0, repeat('t',128)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.lock_ddl_targets
+    (dist_key,id,value,payload)
+SELECT g, g, 0, repeat('d',128)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.lock_mode_targets
+    (dist_key,id,value)
+SELECT g, g, 0
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.ddl_global_1 (dist_key,id,value)
+SELECT g,g,0 FROM generate_series($1,$2) AS g;
+INSERT INTO <S>.ddl_global_2 (dist_key,id,value)
+SELECT g,g,0 FROM generate_series($1,$2) AS g;
+INSERT INTO <S>.ddl_global_3 (dist_key,id,value)
+SELECT g,g,0 FROM generate_series($1,$2) AS g;
+INSERT INTO <S>.ddl_global_4 (dist_key,id,value)
+SELECT g,g,0 FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.dist_lock_targets
+    (dist_key,id,value,payload)
+SELECT mod(g,1048576)+1, g, 0, repeat('x',128)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.replication_targets
+    (dist_key,id,version,payload,updated_at)
+SELECT mod(g,1048576)+1, g, 0, repeat('r',192), current_timestamp
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.replication_conflict_targets
+    (dist_key,run_id,id,payload,created_at)
+SELECT mod(g,1048576)+1, 'baseline', g, repeat('c',192),
+       current_timestamp
+FROM generate_series($1,$2) AS g;
+
+-- 704 Prepare：从 baseline 克隆当前 run 的受控子集。
+INSERT INTO <S>.replication_conflict_targets
+    (dist_key,run_id,id,payload,created_at)
+SELECT dist_key, '<RUN>', id, payload, current_timestamp
+FROM <S>.replication_conflict_targets
+WHERE run_id='baseline'
+  AND id BETWEEN $1 AND $2;
+
+-- 721 Prepare：该表在公共 init 后保持为空，本语句按 2% 容量预留装载。
+INSERT INTO <S>.cluster_skew_data
+    (skew_key,id,payload)
+SELECT CASE WHEN mod(g,100)<95 THEN 1 ELSE g END,
+       g, repeat('k',192)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.dist_join_data
+    (dist_key,id,join_key,value,payload)
+SELECT mod(g*17,1048576)+1, g, mod(g,<CUSTOMER_ROWS>)+1,
+       mod(g,10000), repeat('j',96)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.dist_small_hash
+    (dist_key,id,product_id,category_id,payload)
+SELECT mod(g*31,1048576)+1, g, mod(g,100000)+1,
+       mod(g,1000), repeat('b',48)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.dist_txn_targets
+    (dist_key,id,value,payload)
+SELECT mod(g,1048576)+1, g, 0, repeat('z',48)
+FROM generate_series($1,$2) AS g;
+
+INSERT INTO <S>.vacuum_targets
+    (dist_key,id,group_id,version,payload,updated_at)
+SELECT mod(g,1048576)+1, g, mod(g,1000), 0,
+       repeat('v',900), current_timestamp
+FROM generate_series($1,$2) AS g;
+```
+
+322 的网络入流量数据不能在 `init` 中预生成，而由客户端通过 PBE 发送实际 payload：
+
+```sql
+INSERT INTO <S>.network_ingress
+    (run_id,dist_key,seq,payload)
+VALUES ($1,$2,$3,$4);
+```
+
+其中 `$2=mod(seq,1048576)+1`，`$4` 为客户端实际传输的 payload。恢复只删除当前 run：
+
+```sql
+DELETE FROM <S>.network_ingress WHERE run_id=$1;
+```
+
+206 的全局缓存场景需要动态对象，但对象定义仍是固定模板。`<N>` 只能是程序生成的
+有界整数：
+
+```sql
+CREATE TABLE <S>.gcache_<RUN>_<N> (
+    dist_key bigint NOT NULL,
+    id bigint NOT NULL,
+    value varchar(64),
+    PRIMARY KEY (dist_key,id)
+) @HASH(dist_key);
+
+CREATE INDEX gcache_<RUN>_<N>_value_idx
+ON <S>.gcache_<RUN>_<N> (value,dist_key,id);
+
+INSERT INTO <S>.gcache_<RUN>_<N>
+SELECT g,g,'value-' || g
+FROM generate_series(1,<ROWS_PER_OBJECT>) AS g;
+```
+
+每个 CREATE 前先 journal 对应 DROP；恢复只删除当前 run 的对象。
+
+场景级临时数据同样计入 `T`：206 的动态对象最多使用 `1% * T`，322 的未清理
+payload 最多使用 `1% * T`，721 最多使用预留的 `2% * T`。三者还必须受
+`profileCapGB` 和实时磁盘安全线共同约束，不能因为公共 `init` 已完成就绕过容量
+保护。
+
+### 5.6 实际容量和分布校验
+
+集中式/openGauss 在每轮校准后读取：
+
+```sql
+SELECT c.relname,
+       pg_relation_size(c.oid) AS heap_bytes,
+       pg_indexes_size(c.oid) AS index_bytes
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname=$1
+  AND c.relkind='r';
+```
+
+分布式 GaussDB 由能力适配器在各主 DN 执行同等查询并按逻辑表求和；不能只把当前
+CN 的本地大小当作整个集群大小。若版本只提供实例级存储 API，则 provider 返回每个
+DN 的对象大小并保留 `node_name`。无法取得全局实际大小时，`--dry-run` 可以继续，
+真实 `init` 只允许使用保守估算并明确输出 `size_source=estimate`。
+
+普通 HASH 表建数后执行分布检查：
+
+```sql
+SELECT xc_node_id, count(*) AS rows
+FROM <S>.fact_sales
+GROUP BY xc_node_id
+ORDER BY xc_node_id;
+```
+
+除 `cluster_skew_data` 外，最大/最小 DN 行数差超过 10% 时，`init` 返回失败并提示
+分布键异常。721 的专用表反向要求 95% 热 key 已形成明显 DN 倾斜。分布键还必须通过
+目录或产品函数验证，例如：
+
+```sql
+SELECT getdistributekey('<S>.fact_sales');
+```
+
+预期为 `dist_key`；`dim_product`、`dim_store` 必须验证为 REPLICATION。
+
+### 5.7 schema 和对象创建兼容规则
 
 schema 创建继续采用：
 
-1. 查询 `pg_catalog.pg_namespace`；
+1. 查询 `pg_catalog.pg_namespace`：
+
+   ```sql
+   SELECT 1
+   FROM pg_catalog.pg_namespace
+   WHERE nspname=$1;
+   ```
+
 2. 不存在时执行普通 `CREATE SCHEMA <S>`；
 3. 并发创建遇到重复 schema 后重新查询。
 
-不使用 `CREATE SCHEMA IF NOT EXISTS`。
+不使用 `CREATE SCHEMA IF NOT EXISTS`。每张表和索引同样先查询系统目录；只有不存在
+时才执行本节展开后的普通 `CREATE TABLE` 或 `CREATE INDEX`。已存在对象必须校验
+列定义、分布策略和 dataset version，不能用 `IF NOT EXISTS` 掩盖结构不一致。
 
 ## 6. 场景生命周期和动作日志
 
@@ -1764,22 +2587,15 @@ nft delete table inet gsbench_<RUN>
 
 **适用范围：** 分布式 GaussDB。
 
-建表：
-
-```sql
-CREATE TABLE <S>.cluster_skew_data (
-    id bigint,
-    skew_key bigint,
-    payload varchar(256)
-) DISTRIBUTE BY HASH (skew_key);
-```
+表定义使用第 5.4 节的统一 DDL：主键为 `(skew_key,id)`，分布策略为
+`DISTRIBUTE BY HASH (skew_key)`。
 
 制造 95% 单 key 数据：
 
 ```sql
-INSERT INTO <S>.cluster_skew_data
-SELECT g,
-       CASE WHEN mod(g, 100) < 95 THEN 1 ELSE g END,
+INSERT INTO <S>.cluster_skew_data (skew_key,id,payload)
+SELECT CASE WHEN mod(g, 100) < 95 THEN 1 ELSE g END,
+       g,
        repeat('s', 128)
 FROM generate_series($1, $2) AS g;
 ```
@@ -2312,6 +3128,8 @@ go vet ./...
 - [openGauss gs_ctl](https://docs.opengauss.org/en/docs/latest/tool_and_commandreference/gs_ctl.html)
 - [GaussDB 分布式架构和组件](https://support.huaweicloud.com/productdesc-gaussdb/gaussdb_01_003.html)
 - [GaussDB 分布式 CREATE TABLE 和 DISTRIBUTE BY](https://support.huaweicloud.com/intl/en-us/distributed-devg-v8-gaussdb/gaussdb-12-0567.html)
+- [GaussDB 分布列选择最佳实践](https://support.huaweicloud.com/eu/distributed-devg-v3-gaussdb/gaussdb-12-0657.html)
+- [GaussDB 数据库对象大小函数](https://support.huaweicloud.com/intl/en-us/distributed-devg-v8-gaussdb/gaussdb-12-2660.html)
 - [GaussDB 分布式 STATEMENT_HISTORY](https://support.huaweicloud.com/intl/en-us/distributed-devg-v2-gaussdb/gaussdb-12-0660.html)
 - [GaussDB GLOBAL_LOCKS](https://support.huaweicloud.com/intl/en-us/distributed-devg-v8-gaussdb/gaussdb-12-1576.html)
 - [GaussDB GLOBAL_THREAD_WAIT_STATUS](https://support.huaweicloud.com/intl/en-us/distributed-devg-v8-gaussdb/gaussdb-12-1476.html)
