@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 type BaselineRepairResult struct {
@@ -219,6 +220,51 @@ func VerifyPlanBaseline(ctx context.Context, db *Database, schema string) error 
 		errs = append(errs, err)
 	} else if extended < 1 {
 		errs = append(errs, fmt.Errorf("extended statistics are missing"))
+	}
+	definitions, err := PlanScenarioDefinitions(schema)
+	if err != nil {
+		errs = append(errs, err)
+	} else if err := verifyPlanBaselinePlans(ctx, databasePlanBaselineExplainer{db}, definitions); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+type planBaselineExplainer interface {
+	Explain(context.Context, string) (string, error)
+}
+
+type databasePlanBaselineExplainer struct{ db *Database }
+
+func (e databasePlanBaselineExplainer) Explain(ctx context.Context, query string) (string, error) {
+	return explainLiteral(ctx, e.db, query)
+}
+
+func verifyPlanBaselinePlans(
+	ctx context.Context,
+	explainer planBaselineExplainer,
+	definitions []PlanScenarioDefinition,
+) error {
+	if explainer == nil {
+		return fmt.Errorf("baseline plan explainer is unavailable")
+	}
+	var errs []error
+	for _, definition := range definitions {
+		matched := false
+		for _, candidate := range definition.Candidates {
+			plan, err := explainer.Explain(ctx, candidate)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s explain baseline: %w", definition.Name, err))
+				break
+			}
+			if strings.Contains(plan, definition.ExpectedBaselineToken) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			errs = append(errs, fmt.Errorf("%s baseline plan is missing %q", definition.Name, definition.ExpectedBaselineToken))
+		}
 	}
 	return errors.Join(errs...)
 }

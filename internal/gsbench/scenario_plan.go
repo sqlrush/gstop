@@ -93,7 +93,7 @@ func NewPlanChangeScenario(def PlanScenarioDefinition, coordinator *PlanCoordina
 	return &PlanChangeScenario{def: def, coordinator: coordinator}
 }
 
-func (s *PlanChangeScenario) Code() ScenarioCode { return 0 }
+func (s *PlanChangeScenario) Code() ScenarioCode { return s.def.Code }
 func (s *PlanChangeScenario) Name() string       { return s.def.Name }
 
 func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
@@ -132,6 +132,21 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		)
 	}
 
+	if len(s.def.Candidates) == 0 {
+		definitions, err := PlanScenarioDefinitions(rt.Config.Data.Schema)
+		if err != nil {
+			return err
+		}
+		for _, definition := range definitions {
+			if definition.Code == s.def.Code && definition.Name == s.def.Name {
+				s.def = definition
+				break
+			}
+		}
+		if len(s.def.Candidates) == 0 {
+			return fmt.Errorf("plan scenario definition %03d is unavailable", s.def.Code)
+		}
+	}
 	s.baselines = nil
 	for _, sqlText := range s.def.Candidates {
 		observation, err := ObserveLiteralPlan(ctx, rt.Database, sqlText, s.samples)

@@ -2,7 +2,9 @@ package gsbench
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +17,14 @@ import (
 )
 
 const benchDriverName = "opengauss"
+
+const (
+	applicationNameMaxBytes        = 63
+	applicationRunTokenMaxBytes    = 21
+	applicationWorkerRoleBytes     = 7
+	applicationTokenHashChars      = 10
+	applicationCompressedTokenMark = "~"
+)
 
 var tagComponentRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
@@ -91,19 +101,124 @@ func openDatabase(
 }
 
 func ApplicationName(runID, scenario, workerID string) (string, error) {
-	for label, value := range map[string]string{"run id": runID, "scenario": scenario, "worker id": workerID} {
-		if value == "" || !tagComponentRE.MatchString(value) {
-			return "", fmt.Errorf("unsafe %s %q", label, value)
-		}
+	prefix, err := taggedScenarioPrefix(runID, scenario)
+	if err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("gsbench/%s/%s/%s", runID, scenario, workerID), nil
+	workerToken, err := applicationToken(
+		"worker id",
+		workerID,
+		applicationNameMaxBytes-len(prefix),
+	)
+	if err != nil {
+		return "", err
+	}
+	return prefix + workerToken, nil
 }
 
-func TaggedSessionPredicate(runID string) (query, arg string, err error) {
-	if runID == "" || !tagComponentRE.MatchString(runID) {
-		return "", "", fmt.Errorf("unsafe run id %q", runID)
+func taggedScenarioPattern(runID, scenario string) (string, error) {
+	prefix, err := taggedScenarioPrefix(runID, scenario)
+	if err != nil {
+		return "", err
 	}
-	return "application_name LIKE $1", "gsbench/" + runID + "/%", nil
+	return taggedLIKEPattern(prefix), nil
+}
+
+func taggedScenarioPrefix(runID, scenario string) (string, error) {
+	if err := validateTagComponent("run id", runID); err != nil {
+		return "", err
+	}
+	if err := validateTagComponent("scenario", scenario); err != nil {
+		return "", err
+	}
+	runToken := runID
+	scenarioMaxBytes := applicationNameMaxBytes -
+		len("gsbench///") -
+		len(runToken) -
+		applicationWorkerRoleBytes
+	if scenarioMaxBytes <= 0 ||
+		len(scenario) > scenarioMaxBytes &&
+			scenarioMaxBytes < len(applicationCompressedTokenMark)+applicationTokenHashChars {
+		var err error
+		runToken, err = applicationToken("run id", runID, applicationRunTokenMaxBytes)
+		if err != nil {
+			return "", err
+		}
+		scenarioMaxBytes = applicationNameMaxBytes -
+			len("gsbench///") -
+			len(runToken) -
+			applicationWorkerRoleBytes
+	}
+	scenarioToken, err := applicationToken(
+		"scenario",
+		scenario,
+		scenarioMaxBytes,
+	)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("gsbench/%s/%s/", runToken, scenarioToken), nil
+}
+
+func applicationToken(label, value string, maxBytes int) (string, error) {
+	if err := validateTagComponent(label, value); err != nil {
+		return "", err
+	}
+	if len(value) <= maxBytes {
+		return value, nil
+	}
+	sum := sha256.Sum256([]byte(value))
+	hash := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
+		sum[:],
+	)
+	hash = strings.ToLower(hash)
+	hashBytes := maxBytes - len(applicationCompressedTokenMark)
+	if hashBytes <= applicationTokenHashChars {
+		return applicationCompressedTokenMark + hash[:hashBytes], nil
+	}
+	hash = hash[:applicationTokenHashChars]
+	prefixBytes := maxBytes -
+		len(applicationCompressedTokenMark) -
+		applicationTokenHashChars -
+		1
+	return applicationCompressedTokenMark + value[:prefixBytes] + "-" + hash, nil
+}
+
+func validateTagComponent(label, value string) error {
+	if value == "" || !tagComponentRE.MatchString(value) {
+		return fmt.Errorf("unsafe %s %q", label, value)
+	}
+	return nil
+}
+
+func taggedLIKEPattern(prefix string) string {
+	escaped := strings.NewReplacer(
+		`\`, `\\`,
+		`%`, `\%`,
+		`_`, `\_`,
+	).Replace(prefix)
+	return escaped + "%"
+}
+
+func TaggedSessionPredicate(runID string) (query string, args []any, err error) {
+	runToken, err := applicationToken("run id", runID, applicationRunTokenMaxBytes)
+	if err != nil {
+		return "", nil, err
+	}
+	patterns := []string{taggedLIKEPattern("gsbench/" + runToken + "/")}
+	if runToken != runID {
+		patterns = append(patterns, taggedLIKEPattern("gsbench/"+runID+"/"))
+	}
+	conditions := make([]string, 0, len(patterns))
+	args = make([]any, 0, len(patterns))
+	for index, pattern := range patterns {
+		conditions = append(
+			conditions,
+			fmt.Sprintf("application_name LIKE $%d ESCAPE E'\\\\'", index+1),
+		)
+		args = append(args, pattern)
+	}
+	return "(" + strings.Join(conditions, " OR ") + ")", args, nil
 }
 
 func (d *Database) operationContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -236,29 +351,29 @@ func (d *Database) Probe(parent context.Context, _, query string) (string, error
 }
 
 func (d *Database) CancelTagged(parent context.Context, runID string) error {
-	predicate, arg, err := TaggedSessionPredicate(runID)
+	predicate, args, err := TaggedSessionPredicate(runID)
 	if err != nil {
 		return err
 	}
 	query := "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE " + predicate + " AND pid <> pg_backend_pid()"
-	return d.signalTagged(parent, query, arg, "cancel")
+	return d.signalTagged(parent, query, args, "cancel")
 }
 
 func (d *Database) TerminateTagged(parent context.Context, runID string) error {
-	query, arg, err := StopTaggedSQL(runID)
+	query, args, err := StopTaggedSQL(runID)
 	if err != nil {
 		return err
 	}
-	return d.signalTagged(parent, query, arg, "terminate")
+	return d.signalTagged(parent, query, args, "terminate")
 }
 
 func (d *Database) signalTagged(
 	parent context.Context,
 	query string,
-	arg string,
+	args []any,
 	operation string,
 ) error {
-	rows, err := d.Query(parent, query, arg)
+	rows, err := d.Query(parent, query, args...)
 	if err != nil {
 		return err
 	}
@@ -286,7 +401,7 @@ func (d *Database) TaggedSessionState(
 	parent context.Context,
 	runID string,
 ) (sessions int, locks int, err error) {
-	predicate, arg, err := TaggedSessionPredicate(runID)
+	predicate, args, err := TaggedSessionPredicate(runID)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -299,7 +414,7 @@ func (d *Database) TaggedSessionState(
 			"application_name",
 			"a.application_name",
 		),
-		[]any{arg},
+		args,
 		&sessions,
 		&locks,
 	)

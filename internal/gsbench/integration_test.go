@@ -10,8 +10,8 @@ import (
 	"testing"
 )
 
-func TestFoundationSmokeWithoutLiveDatabase(t *testing.T) {
-	t.Run("shipped config loads safe foundation defaults", func(t *testing.T) {
+func TestReleaseSmokeWithoutLiveDatabase(t *testing.T) {
+	t.Run("shipped config loads safe lightweight-release defaults", func(t *testing.T) {
 		configPath := filepath.Join("..", "..", "configs", "gsbench.cfg")
 		cfg, err := LoadConfig(configPath, Overrides{})
 		if err != nil {
@@ -39,6 +39,10 @@ func TestFoundationSmokeWithoutLiveDatabase(t *testing.T) {
 				"fault provider defaults=%+v",
 				cfg.FaultProvider,
 			)
+		}
+		if cfg.Data.CapacityProvider != "auto" ||
+			cfg.Data.PhysicalSizeProvider != "auto" {
+			t.Fatalf("shipped data providers=%+v", cfg.Data)
 		}
 	})
 

@@ -63,12 +63,12 @@ func ReadStaleRecoveryStatus(
 	return status, errors.Join(errs...)
 }
 
-func StopTaggedSQL(runID string) (query, arg string, err error) {
-	predicate, arg, err := TaggedSessionPredicate(runID)
+func StopTaggedSQL(runID string) (query string, args []any, err error) {
+	predicate, args, err := TaggedSessionPredicate(runID)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
-	return "SELECT pg_terminate_session(pid,sessionid) FROM pg_stat_activity WHERE " + predicate + " AND pid<>pg_backend_pid()", arg, nil
+	return "SELECT pg_terminate_session(pid,sessionid) FROM pg_stat_activity WHERE " + predicate + " AND pid<>pg_backend_pid()", args, nil
 }
 
 func CleanupPlan(schema string, withData bool) ([]string, error) {

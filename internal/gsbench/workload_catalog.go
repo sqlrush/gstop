@@ -32,5 +32,39 @@ func ScenarioWorkloadStatements(runtime *Runtime, scenario string) ([]string, er
 			"UPDATE " + schema + ".vacuum_targets SET version=version+1,payload=payload||'x',updated_at=current_timestamp",
 		}, nil
 	}
+	if code, ok := planChangeCodeForName(scenario); ok {
+		definitions, err := PlanScenarioDefinitions(schema)
+		if err != nil {
+			return nil, err
+		}
+		for _, definition := range definitions {
+			if definition.Code == code {
+				return append([]string(nil), definition.Candidates...), nil
+			}
+		}
+	}
+	if definition, err := DefaultScenarioCatalog().Resolve(scenario); err == nil && definition.Code >= 621 && definition.Code <= 626 {
+		statement, statementErr := hardParseLiteralSQL(definition.Code, schema, 42)
+		if statementErr != nil {
+			return nil, statementErr
+		}
+		return []string{statement}, nil
+	}
+	if definition, err := DefaultScenarioCatalog().Resolve(scenario); err == nil {
+		if lifecycle, lifecycleErr := memoryLifecycleFor(definition.Code); lifecycleErr == nil {
+			statements := make([]string, 0, len(lifecycle.AllocationCodes))
+			for _, code := range lifecycle.AllocationCodes {
+				workload, workloadErr := ResourceWorkloadFor(code, schema, runtime.Environment)
+				if workloadErr != nil {
+					return nil, workloadErr
+				}
+				statements = append(statements, workload.Statement)
+			}
+			return statements, nil
+		}
+		if workload, workloadErr := ResourceWorkloadFor(definition.Code, schema, runtime.Environment); workloadErr == nil {
+			return []string{workload.Statement}, nil
+		}
+	}
 	return nil, fmt.Errorf("unknown scenario %q", scenario)
 }

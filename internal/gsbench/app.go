@@ -1448,7 +1448,7 @@ func (b *databaseRestoreBackend) VerifyRestore(
 		return err
 	}
 	for _, runID := range runIDs {
-		predicate, arg, err := TaggedSessionPredicate(runID)
+		predicate, args, err := TaggedSessionPredicate(runID)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -1457,7 +1457,7 @@ func (b *databaseRestoreBackend) VerifyRestore(
 		if err := b.db.Scan(
 			ctx,
 			"SELECT count(*) FROM pg_stat_activity WHERE "+predicate,
-			[]any{arg},
+			args,
 			&sessionCount,
 		); err != nil {
 			errs = append(errs, fmt.Errorf(

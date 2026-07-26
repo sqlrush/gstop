@@ -72,12 +72,12 @@ func capabilitiesFor(env Environment) Capabilities {
 
 func validatePlanCapability(name string, capabilities Capabilities) error {
 	supported := map[string]bool{
-		"plan_stats_target":    capabilities.PlanColumnStats,
-		"plan_index_unusable":  capabilities.PlanIndexUnusable,
-		"plan_stats_ndistinct": capabilities.PlanNDistinct,
-		"plan_stats_extended":  capabilities.PlanExtendedStats,
-		"plan_index_drop":      true,
-		"plan_index_shape":     true,
+		"planchange_stats_target":    capabilities.PlanColumnStats,
+		"planchange_index_unusable":  capabilities.PlanIndexUnusable,
+		"planchange_stats_ndistinct": capabilities.PlanNDistinct,
+		"planchange_stats_extended":  capabilities.PlanExtendedStats,
+		"planchange_index_drop":      true,
+		"planchange_index_shape":     true,
 	}
 	if !supported[name] {
 		return fmt.Errorf("%s is unsupported by this openGauss/GaussDB catalog", name)

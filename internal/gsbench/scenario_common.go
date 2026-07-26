@@ -73,6 +73,7 @@ type sqlWorkload struct {
 	op      SQLWorkerOp
 
 	disableOperationTimeout bool
+	cleanup                 SQLWorkerOp
 	mu                      sync.Mutex
 	sessions                map[int]*TaggedConn
 }
@@ -86,6 +87,12 @@ func newSQLWorkload(ctx context.Context, runtime *Runtime, name string, maxWorke
 func newSQLWorkloadWithoutOperationTimeout(ctx context.Context, runtime *Runtime, name string, maxWorkers int, op SQLWorkerOp) *sqlWorkload {
 	workload := newSQLWorkload(ctx, runtime, name, maxWorkers, op)
 	workload.disableOperationTimeout = true
+	return workload
+}
+
+func newSQLWorkloadWithCleanup(ctx context.Context, runtime *Runtime, name string, maxWorkers int, op, cleanup SQLWorkerOp) *sqlWorkload {
+	workload := newSQLWorkload(ctx, runtime, name, maxWorkers, op)
+	workload.cleanup = cleanup
 	return workload
 }
 
@@ -129,6 +136,11 @@ func (w *sqlWorkload) Stop(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for id, conn := range w.sessions {
+		if w.cleanup != nil {
+			if cleanupErr := w.cleanup(ctx, conn.Conn, id); err == nil {
+				err = cleanupErr
+			}
+		}
 		if closeErr := conn.Close(); err == nil {
 			err = closeErr
 		}

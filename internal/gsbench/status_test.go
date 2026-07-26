@@ -9,10 +9,11 @@ import (
 )
 
 func TestStopTaggedSQLUsesExactRunBoundary(t *testing.T) {
-	query, arg, err := StopTaggedSQL("run-1")
+	query, args, err := StopTaggedSQL("run-1")
 	if err != nil {
 		t.Fatal(err)
 	}
+	arg := onlyStringArgument(t, args)
 	if arg != "gsbench/run-1/%" || !strings.Contains(query, "pg_terminate_session") {
 		t.Fatalf("query=%q arg=%q", query, arg)
 	}

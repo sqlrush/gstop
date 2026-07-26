@@ -1095,7 +1095,12 @@ func TestRunnerUnknownCodeFailsExplicitly(t *testing.T) {
 
 func TestDefaultScenarioFactoriesRegisterOnlyRunnableCatalogCodes(t *testing.T) {
 	factories := DefaultScenarioFactories()
-	for _, code := range []ScenarioCode{101, 102, 103, 401, 402, 801} {
+	for _, code := range []ScenarioCode{
+		101, 102, 103,
+		201, 202, 203, 204, 205, 207, 208,
+		301, 302, 303, 304, 321, 322, 331, 332, 333,
+		401, 402, 403, 404, 801,
+	} {
 		factory := factories[code]
 		if factory == nil {
 			t.Errorf("runnable scenario %03d has no factory", code)
@@ -1114,17 +1119,49 @@ func TestDefaultScenarioFactoriesRegisterOnlyRunnableCatalogCodes(t *testing.T) 
 			t.Errorf("factory %03d returned %#v", code, scenario)
 		}
 	}
+	lockCodes := append(lockScenarioCodes(501, 506), lockScenarioCodes(508, 510)...)
+	for _, code := range append(lockCodes, lockScenarioCodes(520, 540)...) {
+		factory := factories[code]
+		if factory == nil {
+			t.Errorf("runnable scenario %03d has no factory", code)
+			continue
+		}
+		definition := DefaultScenarioCatalog().MustCode(code)
+		scenario, err := factory(definition, Environment{Product: ProductOpenGauss, Topology: TopologyStandalone, Supported: true})
+		if err != nil || scenario == nil || scenario.Code() != code {
+			t.Errorf("lock factory %03d returned %#v, %v", code, scenario, err)
+		}
+	}
+	for _, code := range append(lockScenarioCodes(601, 606), lockScenarioCodes(621, 625)...) {
+		factory := factories[code]
+		if factory == nil {
+			t.Errorf("runnable scenario %03d has no factory", code)
+			continue
+		}
+		definition := DefaultScenarioCatalog().MustCode(code)
+		scenario, err := factory(definition, Environment{Product: ProductOpenGauss, Topology: TopologyStandalone, Supported: true})
+		if err != nil || scenario == nil || scenario.Code() != code {
+			t.Errorf("plan factory %03d returned %#v, %v", code, scenario, err)
+		}
+	}
 	for _, code := range []ScenarioCode{
-		201, 501,
-		601, 602, 603, 604, 605, 606,
+		206, 209, 305, 341, 342, 343, 405, 507, 511, 512,
 	} {
 		if factories[code] != nil {
 			t.Errorf("legacy/future scenario %03d is registered", code)
 		}
 	}
-	if len(factories) != 6 {
-		t.Fatalf("factory count=%d want=6", len(factories))
+	if len(factories) != 65 {
+		t.Fatalf("factory count=%d want=65", len(factories))
 	}
+}
+
+func lockScenarioCodes(first, last ScenarioCode) []ScenarioCode {
+	codes := make([]ScenarioCode, 0, last-first+1)
+	for code := first; code <= last; code++ {
+		codes = append(codes, code)
+	}
+	return codes
 }
 
 func TestRunnerRejectsFactoryScenarioCodeMismatch(t *testing.T) {

@@ -9,17 +9,17 @@ import (
 func TestPlanRegressionRequiresChangedPlanSameResultAndSlowdown(t *testing.T) {
 	base := PlanObservation{StructureSignature: "Index Scan", ResultFingerprint: "42:900", Median: 10 * time.Millisecond}
 	worse := PlanObservation{StructureSignature: "Seq Scan", ResultFingerprint: "42:900", Median: 25 * time.Millisecond}
-	result := EvaluatePlanChange("plan_index_unusable", base, worse, 2.0)
+	result := EvaluatePlanChange("planchange_index_unusable", base, worse, 2.0)
 	if result.Outcome != OutcomeSuccess {
 		t.Fatalf("result=%+v", result)
 	}
 	worse.StructureSignature = "Index Scan"
-	if got := EvaluatePlanChange("plan_index_unusable", base, worse, 2.0).Outcome; got != OutcomeFailed {
+	if got := EvaluatePlanChange("planchange_index_unusable", base, worse, 2.0).Outcome; got != OutcomeFailed {
 		t.Fatalf("unchanged plan outcome=%s", got)
 	}
 	worse.StructureSignature = "Seq Scan"
 	worse.ResultFingerprint = "different"
-	if got := EvaluatePlanChange("plan_index_unusable", base, worse, 2.0).Outcome; got != OutcomeFailed {
+	if got := EvaluatePlanChange("planchange_index_unusable", base, worse, 2.0).Outcome; got != OutcomeFailed {
 		t.Fatalf("wrong-result outcome=%s", got)
 	}
 }
@@ -35,9 +35,9 @@ func TestLiteralPlanWorkerUsesExactSQLWithoutArguments(t *testing.T) {
 }
 
 func TestPlanScenarioUsesItsCanonicalName(t *testing.T) {
-	def := PlanScenarioDefinition{Name: "plan_index_drop", Candidates: []string{"SELECT 1"}}
+	def := PlanScenarioDefinition{Code: 605, Name: "planchange_index_drop", Candidates: []string{"SELECT 1"}}
 	scenario := NewPlanChangeScenario(def, &PlanCoordinator{})
-	if scenario.Name() != "plan_index_drop" {
+	if scenario.Name() != "planchange_index_drop" || scenario.Code() != 605 {
 		t.Fatalf("name=%s", scenario.Name())
 	}
 }

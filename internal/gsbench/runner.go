@@ -88,7 +88,7 @@ func NewRunner(
 }
 
 func DefaultScenarioFactories() map[ScenarioCode]ScenarioFactory {
-	return map[ScenarioCode]ScenarioFactory{
+	factories := map[ScenarioCode]ScenarioFactory{
 		101: func(
 			ScenarioDefinition,
 			Environment,
@@ -126,6 +126,13 @@ func DefaultScenarioFactories() map[ScenarioCode]ScenarioFactory {
 			return NewVacuumScenario(), nil
 		},
 	}
+	for code, factory := range ResourceScenarioFactories() {
+		factories[code] = factory
+	}
+	for code, factory := range LockScenarioFactories() {
+		factories[code] = factory
+	}
+	return factories
 }
 
 func (r *Runner) Run(ctx context.Context, codes []ScenarioCode) RunSummary {
