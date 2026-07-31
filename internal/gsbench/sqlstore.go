@@ -665,12 +665,20 @@ func equalDatasetColumns(actual, expected []datasetColumnShape) bool {
 	}
 	seen := make(map[string]bool, len(actual))
 	for _, column := range actual {
-		if seen[column.Name] || expectedByName[column.Name] != column {
+		expectedColumn, exists := expectedByName[column.Name]
+		if seen[column.Name] || !exists ||
+			expectedColumn.NotNull != column.NotNull ||
+			!datasetColumnTypesEquivalent(column.Type, expectedColumn.Type) {
 			return false
 		}
 		seen[column.Name] = true
 	}
 	return true
+}
+
+func datasetColumnTypesEquivalent(actual, expected string) bool {
+	return actual == expected ||
+		(expected == "date" && actual == "timestamp(0)withouttimezone")
 }
 
 func datasetDistributionMatches(actual, expected string) bool {

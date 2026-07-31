@@ -396,7 +396,7 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 			return err
 		}
 	}
-	if err := m.ensureDatasetObjects(ctx, ordinaryDDL); err != nil {
+	if err := m.ensureDatasetObjects(ctx, ordinaryDDL, DatasetObjectTable); err != nil {
 		return err
 	}
 	if !hasVersions {
@@ -433,13 +433,23 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 			}
 		}
 	}
-	if err := m.validateDatasetObjects(ctx, plan.DDL); err != nil {
+	if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectTable); err != nil {
 		return err
 	}
-	if err := m.ensureDatasetObjects(ctx, plan.PostMigrationDDL); err != nil {
+	if err := m.ensureDatasetObjects(ctx, ordinaryDDL, DatasetObjectIndex); err != nil {
+		return err
+	}
+	if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectIndex); err != nil {
+		return err
+	}
+	if err := m.ensureDatasetObjects(
+		ctx, plan.PostMigrationDDL, DatasetObjectIndex,
+	); err != nil {
 		return fmt.Errorf("initialize post-migration DDL: %w", err)
 	}
-	if err := m.validateDatasetObjects(ctx, plan.PostMigrationDDL); err != nil {
+	if err := m.validateDatasetObjects(
+		ctx, plan.PostMigrationDDL, DatasetObjectIndex,
+	); err != nil {
 		return fmt.Errorf("validate post-migration DDL: %w", err)
 	}
 	inspector, inspectPhysical := m.exec.(DatasetPhysicalInspector)
@@ -770,18 +780,25 @@ func (m *DatasetManager) calibrateDataset(
 	return physical, nil
 }
 
-func (m *DatasetManager) ensureDatasetObjects(ctx context.Context, statements []string) error {
+func (m *DatasetManager) ensureDatasetObjects(
+	ctx context.Context,
+	statements []string,
+	kind DatasetObjectKind,
+) error {
 	catalog, hasCatalog := m.exec.(DatasetObjectCatalog)
 	for _, statement := range statements {
+		object, err := parseDatasetObject(statement)
+		if err != nil {
+			return err
+		}
+		if object.Kind != kind {
+			continue
+		}
 		if !hasCatalog {
 			if err := m.exec.Exec(ctx, statement); err != nil {
 				return fmt.Errorf("create dataset object: %w", err)
 			}
 			continue
-		}
-		object, err := parseDatasetObject(statement)
-		if err != nil {
-			return err
 		}
 		exists, err := catalog.DatasetObjectExists(ctx, object)
 		if err != nil {
@@ -793,14 +810,18 @@ func (m *DatasetManager) ensureDatasetObjects(ctx context.Context, statements []
 					return fmt.Errorf("migrate legacy table %s: %w", object.Name, err)
 				}
 			}
-		} else if err := m.exec.Exec(ctx, statement); err != nil {
+		} else if err := m.exec.Exec(ctx, object.DDL); err != nil {
 			return fmt.Errorf("create dataset %s %s: %w", object.Kind, object.Name, err)
 		}
 	}
 	return nil
 }
 
-func (m *DatasetManager) validateDatasetObjects(ctx context.Context, statements []string) error {
+func (m *DatasetManager) validateDatasetObjects(
+	ctx context.Context,
+	statements []string,
+	kind DatasetObjectKind,
+) error {
 	catalog, ok := m.exec.(DatasetObjectCatalog)
 	if !ok {
 		return nil
@@ -810,7 +831,13 @@ func (m *DatasetManager) validateDatasetObjects(ctx context.Context, statements 
 		if err != nil {
 			return err
 		}
+		if object.Kind != kind {
+			continue
+		}
 		if err := catalog.ValidateDatasetObject(ctx, object); err != nil {
+			if object.Kind == DatasetObjectTable {
+				return fmt.Errorf("validate dataset table %s: %w", object.Name, err)
+			}
 			return fmt.Errorf("validate dataset %s %s: %w", object.Kind, object.Name, err)
 		}
 	}

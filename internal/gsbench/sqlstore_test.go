@@ -1177,6 +1177,30 @@ func TestDatasetColumnShapeComparisonStillRejectsWrongNamedContract(t *testing.T
 	}
 }
 
+func TestDatasetColumnShapeComparisonAcceptsGaussDBORADateAlias(t *testing.T) {
+	expected := []datasetColumnShape{{
+		Name: "sale_date", Type: "date", NotNull: true,
+	}}
+	actual := []datasetColumnShape{{
+		Name: "sale_date", Type: "timestamp(0)withouttimezone", NotNull: true,
+	}}
+	if !equalDatasetColumns(actual, expected) {
+		t.Fatal("GaussDB ORA DATE catalog alias was rejected")
+	}
+}
+
+func TestDatasetColumnShapeComparisonRejectsOtherTimestampForDate(t *testing.T) {
+	expected := []datasetColumnShape{{
+		Name: "sale_date", Type: "date", NotNull: true,
+	}}
+	actual := []datasetColumnShape{{
+		Name: "sale_date", Type: "timestamp", NotNull: true,
+	}}
+	if equalDatasetColumns(actual, expected) {
+		t.Fatal("non-ORA timestamp unexpectedly matched date")
+	}
+}
+
 func TestDatasetDistributionMatchesExactCanonicalStrategyAndKeys(t *testing.T) {
 	tests := []struct {
 		name     string

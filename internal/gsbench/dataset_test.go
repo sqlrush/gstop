@@ -208,12 +208,13 @@ type recordingDatasetExecutor struct {
 
 type catalogDatasetExecutor struct {
 	recordingDatasetExecutor
-	existing  map[string]bool
-	validated []string
-	migrated  []string
-	events    []string
-	version   string
-	recorded  string
+	existing       map[string]bool
+	validationErrs map[string]error
+	validated      []string
+	migrated       []string
+	events         []string
+	version        string
+	recorded       string
 }
 
 type atomicDatasetExecutor struct {
@@ -257,7 +258,7 @@ func (e *catalogDatasetExecutor) ValidateDatasetObject(
 ) error {
 	e.validated = append(e.validated, object.Name)
 	e.events = append(e.events, "validate:"+object.Name)
-	return nil
+	return e.validationErrs[string(object.Kind)+":"+object.Name]
 }
 
 func (e *catalogDatasetExecutor) DatasetVersion(context.Context, string) (string, error) {
@@ -493,6 +494,46 @@ func TestDatasetInitCatalogChecksAndValidatesExistingObjects(t *testing.T) {
 	}
 	if exec.recorded != datasetVersion {
 		t.Fatalf("recorded version=%q want=%q", exec.recorded, datasetVersion)
+	}
+}
+
+func TestDatasetInitValidatesExistingTablesBeforeCreatingIndexes(t *testing.T) {
+	plan, err := PlanDataset(
+		datasetConfig("quick", 1),
+		Capacity{TotalBytes: 20 << 30, FreeBytes: 20 << 30},
+		testDatasetEnvironment(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := map[string]bool{}
+	for _, statement := range plan.DDL {
+		object, parseErr := parseDatasetObject(statement)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if object.Kind == DatasetObjectTable {
+			existing[string(object.Kind)+":"+object.Name] = true
+		}
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed: completedDatasetBatches(plan), schemaExists: true,
+		},
+		existing: existing,
+		validationErrs: map[string]error{
+			"table:accounts": errors.New("columns differ: dist_key is missing"),
+		},
+		version: datasetVersion,
+	}
+	err = NewDatasetManager(exec).Init(context.Background(), plan)
+	if err == nil || !strings.Contains(err.Error(), "validate dataset table accounts") {
+		t.Fatalf("err=%v", err)
+	}
+	for _, statement := range exec.statements {
+		if strings.HasPrefix(statement, "CREATE INDEX accounts_customer_idx ") {
+			t.Fatalf("dependent index was created before table validation: %s", statement)
+		}
 	}
 }
 
