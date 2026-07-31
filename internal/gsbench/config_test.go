@@ -62,16 +62,31 @@ func TestConfigParsesExplicitDatasetProviders(t *testing.T) {
 	body := strings.Replace(
 		minimalConfig(),
 		"schema = gsbench",
-		"schema = gsbench\ncapacity_provider = tablespace_quota\nphysical_size_provider = catalog",
+		"schema = gsbench\ncapacity_provider = local_data_directory\ndata_directory_host_root = /var/chroot\nphysical_size_provider = catalog",
 		1,
 	)
 	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Data.CapacityProvider != "tablespace_quota" ||
+	if cfg.Data.CapacityProvider != "local_data_directory" ||
+		cfg.Data.DataDirectoryHostRoot != "/var/chroot" ||
 		cfg.Data.PhysicalSizeProvider != "catalog" {
 		t.Fatalf("dataset providers=%+v", cfg.Data)
+	}
+}
+
+func TestConfigRejectsRelativeDataDirectoryHostRoot(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"schema = gsbench",
+		"schema = gsbench\ndata_directory_host_root = var/chroot",
+		1,
+	)
+	if _, err := LoadConfig(
+		writeTestConfig(t, body), Overrides{},
+	); err == nil || !strings.Contains(err.Error(), "data_directory_host_root") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

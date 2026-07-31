@@ -148,9 +148,10 @@ func parseTablespaceQuota(value string) (int64, error) {
 type storageStat func(path string) (totalBytes, freeBytes int64, err error)
 
 type localDataDirectoryCapacityProvider struct {
-	db   journalDatabase
-	host string
-	stat storageStat
+	db       journalDatabase
+	host     string
+	hostRoot string
+	stat     storageStat
 }
 
 func (p localDataDirectoryCapacityProvider) CapacityFacts(
@@ -174,22 +175,59 @@ func (p localDataDirectoryCapacityProvider) CapacityFacts(
 		return nil, fmt.Errorf(
 			"server data_directory %q is not an absolute local path", dataDirectory)
 	}
+	capacityPath := dataDirectory
+	source := "local_data_directory"
+	if strings.TrimSpace(p.hostRoot) != "" {
+		hostRoot := filepath.Clean(strings.TrimSpace(p.hostRoot))
+		if !filepath.IsAbs(hostRoot) {
+			return nil, fmt.Errorf(
+				"data_directory host root %q is not an absolute path", p.hostRoot)
+		}
+		relativeDataDirectory, err := filepath.Rel(
+			string(filepath.Separator),
+			dataDirectory,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"map server data_directory %q under host root %q: %w",
+				dataDirectory, hostRoot, err,
+			)
+		}
+		if relativeDataDirectory == ".." ||
+			strings.HasPrefix(
+				relativeDataDirectory,
+				".."+string(filepath.Separator),
+			) {
+			return nil, fmt.Errorf(
+				"server data_directory %q escapes host root %q",
+				dataDirectory, hostRoot,
+			)
+		}
+		capacityPath = filepath.Join(hostRoot, relativeDataDirectory)
+		source = "local_data_directory_host_root"
+	}
 	stat := p.stat
 	if stat == nil {
 		stat = statLocalStorage
 	}
-	total, free, err := stat(dataDirectory)
+	total, free, err := stat(capacityPath)
 	if err != nil {
+		if capacityPath == dataDirectory {
+			return nil, fmt.Errorf(
+				"stat exact server data_directory %q: %w; no client-path fallback is allowed",
+				dataDirectory, err,
+			)
+		}
 		return nil, fmt.Errorf(
-			"stat exact server data_directory %q: %w; no client-path fallback is allowed",
-			dataDirectory, err,
+			"stat mapped server data_directory %q at host path %q: %w; no client-path fallback is allowed",
+			dataDirectory, capacityPath, err,
 		)
 	}
 	return []StorageCapacityFact{{
 		NodeName:   "local",
 		TotalBytes: total,
 		FreeBytes:  free,
-		Source:     "local_data_directory",
+		Source:     source,
 	}}, nil
 }
 
@@ -238,13 +276,17 @@ func selectDatasetCapacityProvider(
 	case "auto":
 		if isProvablyLocalDatabaseHost(cfg.Database.Host) {
 			return localDataDirectoryCapacityProvider{
-				db: db, host: cfg.Database.Host,
+				db:       db,
+				host:     cfg.Database.Host,
+				hostRoot: cfg.Data.DataDirectoryHostRoot,
 			}, nil
 		}
 		return tablespaceQuotaCapacityProvider{db: db}, nil
 	case "local_data_directory":
 		return localDataDirectoryCapacityProvider{
-			db: db, host: cfg.Database.Host,
+			db:       db,
+			host:     cfg.Database.Host,
+			hostRoot: cfg.Data.DataDirectoryHostRoot,
 		}, nil
 	case "tablespace_quota":
 		return tablespaceQuotaCapacityProvider{db: db}, nil

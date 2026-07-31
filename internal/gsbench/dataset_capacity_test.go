@@ -301,6 +301,79 @@ func TestLocalDataDirectoryProviderNeverFallsBackFromMissingServerPath(t *testin
 	}
 }
 
+func TestLocalDataDirectoryProviderMapsServerPathUnderConfiguredHostRoot(t *testing.T) {
+	db := &fakeCapacityDatabase{scan: func(dest ...any) error {
+		*(dest[0].(*string)) = "/var/lib/engine/data1"
+		return nil
+	}}
+	var statPath string
+	facts, err := (localDataDirectoryCapacityProvider{
+		db:       db,
+		host:     "127.0.0.1",
+		hostRoot: "/var/chroot",
+		stat: func(path string) (int64, int64, error) {
+			statPath = path
+			return 6 << 40, 4 << 40, nil
+		},
+	}).CapacityFacts(context.Background(), testDatasetEnvironment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statPath != "/var/chroot/var/lib/engine/data1" {
+		t.Fatalf("stat path=%q", statPath)
+	}
+	want := []StorageCapacityFact{{
+		NodeName:   "local",
+		TotalBytes: 6 << 40,
+		FreeBytes:  4 << 40,
+		Source:     "local_data_directory_host_root",
+	}}
+	if !reflect.DeepEqual(facts, want) {
+		t.Fatalf("facts=%+v want=%+v", facts, want)
+	}
+}
+
+func TestAutoCapacityProviderCarriesConfiguredHostRoot(t *testing.T) {
+	cfg := datasetConfig("quick", 5)
+	cfg.Database.Host = "127.0.0.1"
+	cfg.Data.CapacityProvider = "auto"
+	cfg.Data.DataDirectoryHostRoot = "/var/chroot"
+	db := &fakeCapacityDatabase{scan: func(dest ...any) error {
+		*(dest[0].(*string)) = "/var/lib/engine/data1"
+		return nil
+	}}
+	selected, err := selectDatasetCapacityProvider(
+		cfg,
+		testDatasetEnvironment(),
+		db,
+		DatasetExternalProviders{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, ok := selected.(localDataDirectoryCapacityProvider)
+	if !ok {
+		t.Fatalf("provider=%T", selected)
+	}
+	var statPath string
+	provider.stat = func(path string) (int64, int64, error) {
+		statPath = path
+		return 6 << 40, 4 << 40, nil
+	}
+	facts, err := provider.CapacityFacts(
+		context.Background(),
+		testDatasetEnvironment(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statPath != "/var/chroot/var/lib/engine/data1" ||
+		len(facts) != 1 ||
+		facts[0].Source != "local_data_directory_host_root" {
+		t.Fatalf("stat path=%q facts=%+v", statPath, facts)
+	}
+}
+
 func TestDistributedProviderSelectionRequiresBuildTimeWiring(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.CapacityProvider = "auto"

@@ -48,14 +48,15 @@ type RunConfig struct {
 }
 
 type DataConfig struct {
-	Schema               string
-	MaxSizeGB            int
-	TargetBytes          int64
-	MinFreeDiskPercent   int
-	ReuseExisting        bool
-	RequestedSize        string
-	CapacityProvider     string
-	PhysicalSizeProvider string
+	Schema                string
+	MaxSizeGB             int
+	TargetBytes           int64
+	MinFreeDiskPercent    int
+	ReuseExisting         bool
+	RequestedSize         string
+	CapacityProvider      string
+	DataDirectoryHostRoot string
+	PhysicalSizeProvider  string
 }
 
 type SafetyConfig struct {
@@ -165,6 +166,9 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 			ReuseExisting:      raw.GetBool("data.reuse_existing", true),
 			CapacityProvider: strings.ToLower(
 				raw.GetString("data.capacity_provider", "auto"),
+			),
+			DataDirectoryHostRoot: strings.TrimSpace(
+				raw.GetString("data.data_directory_host_root", ""),
 			),
 			PhysicalSizeProvider: strings.ToLower(
 				raw.GetString("data.physical_size_provider", "auto"),
@@ -297,6 +301,12 @@ func (c BenchConfig) Validate() error {
 	) {
 		return fmt.Errorf(
 			"data.capacity_provider must be auto, local_data_directory, or tablespace_quota",
+		)
+	}
+	if c.Data.DataDirectoryHostRoot != "" &&
+		!filepath.IsAbs(c.Data.DataDirectoryHostRoot) {
+		return fmt.Errorf(
+			"data.data_directory_host_root must be an absolute path",
 		)
 	}
 	if !stringInSet(
