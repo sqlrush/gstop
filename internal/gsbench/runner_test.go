@@ -48,6 +48,15 @@ type durationScenario struct {
 	rampDelay time.Duration
 }
 
+type executionReportingScenario struct {
+	fakeScenario
+	snapshot WorkerSnapshot
+}
+
+func (s *executionReportingScenario) ExecutionSnapshot() WorkerSnapshot {
+	return s.snapshot
+}
+
 type deadlineAtRampScenario struct {
 	fakeScenario
 	expiredAtRamp bool
@@ -65,6 +74,15 @@ type testCodeScenario struct {
 }
 
 func (s testCodeScenario) Code() ScenarioCode { return s.code }
+
+type testCodeExecutionScenario struct {
+	testCodeScenario
+	reporter executionReporter
+}
+
+func (s testCodeExecutionScenario) ExecutionSnapshot() WorkerSnapshot {
+	return s.reporter.ExecutionSnapshot()
+}
 
 func newTestRunner(
 	t *testing.T,
@@ -99,7 +117,13 @@ func newTestRunner(
 			Risk:      RiskA,
 			AppliesTo: []EnvironmentClass{EnvironmentOpenGauss},
 		}
-		candidate := testCodeScenario{Scenario: scenario, code: code}
+		var candidate Scenario = testCodeScenario{Scenario: scenario, code: code}
+		if reporter, ok := scenario.(executionReporter); ok {
+			candidate = testCodeExecutionScenario{
+				testCodeScenario: testCodeScenario{Scenario: scenario, code: code},
+				reporter:         reporter,
+			}
+		}
 		factories[code] = func(
 			ScenarioDefinition,
 			Environment,
@@ -456,12 +480,60 @@ func TestRunnerSkipsPlanAndScenarioVerificationWhenValidationDisabled(t *testing
 	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
 	runner.runtime.Config.Run.ValidationEnabled = false
 	summary := runner.Run(context.Background(), codes)
-	if summary.Outcome != OutcomeSuccess {
+	if summary.Outcome != OutcomeUnverified {
 		t.Fatalf("summary=%+v", summary)
 	}
 	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseStop}
 	if !reflect.DeepEqual(scenario.phases, want) {
 		t.Fatalf("phases=%v want=%v", scenario.phases, want)
+	}
+}
+
+func TestRunnerFailsOnExecutionErrorsWhenValidationDisabled(t *testing.T) {
+	scenario := &executionReportingScenario{
+		fakeScenario: fakeScenario{name: "one", outcome: OutcomeSuccess},
+		snapshot: WorkerSnapshot{
+			Operations: 7,
+			Errors:     2,
+			FirstError: "sentinel workload error",
+		},
+	}
+	runtime := &Runtime{RunID: "run-1"}
+	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
+	runner.runtime.Config.Run.ValidationEnabled = false
+	summary := runner.Run(context.Background(), codes)
+	if summary.Outcome != OutcomeFailed {
+		t.Fatalf("summary=%+v", summary)
+	}
+	result := summary.Results[0]
+	if !strings.Contains(result.Message, "sentinel workload error") {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(result.Evidence) < 2 || result.Evidence[0].Metric != "operations" ||
+		result.Evidence[1].Metric != "errors" {
+		t.Fatalf("execution evidence=%+v", result.Evidence)
+	}
+}
+
+func TestRunnerMarksCleanExecutionUnverifiedWhenModelValidationDisabled(t *testing.T) {
+	scenario := &executionReportingScenario{
+		fakeScenario: fakeScenario{name: "one", outcome: OutcomeSuccess},
+		snapshot:     WorkerSnapshot{Operations: 7},
+	}
+	runtime := &Runtime{RunID: "run-1"}
+	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
+	runner.runtime.Config.Run.ValidationEnabled = false
+	summary := runner.Run(context.Background(), codes)
+	if summary.Outcome != OutcomeUnverified {
+		t.Fatalf("summary=%+v", summary)
+	}
+	result := summary.Results[0]
+	if result.Message != "runtime model validation skipped" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(result.Evidence) != 3 || result.Evidence[2].Metric != "runtime_validation" ||
+		result.Evidence[2].Available {
+		t.Fatalf("validation evidence=%+v", result.Evidence)
 	}
 }
 

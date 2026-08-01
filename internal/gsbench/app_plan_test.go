@@ -11,6 +11,7 @@ func TestExitCodeForOutcome(t *testing.T) {
 		want    int
 	}{
 		{OutcomeSuccess, 0},
+		{OutcomeUnverified, 0},
 		{OutcomeNotApplicable, 0},
 		{OutcomeDegraded, 3},
 		{OutcomeNotImplemented, 1},

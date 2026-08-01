@@ -52,6 +52,10 @@ type ScenarioStrategy interface {
 	Strategy() string
 }
 
+type executionReporter interface {
+	ExecutionSnapshot() WorkerSnapshot
+}
+
 type RunSummary struct {
 	RunID   string
 	Outcome Outcome
@@ -507,7 +511,8 @@ func (r *Runner) runOne(
 				result.StartedAt = startedAt
 			}
 		} else if verify {
-			result.Message = "runtime validation disabled"
+			result.Outcome = OutcomeUnverified
+			result.Message = "runtime model validation skipped"
 		}
 	}
 	cleanupTimeout := r.runtime.Config.Safety.QueryTimeout
@@ -523,6 +528,26 @@ func (r *Runner) runOne(
 		report(PhaseStop)
 		if err := scenario.Stop(cleanupCtx, r.runtime); err != nil {
 			fail(PhaseStop, err)
+		}
+		if reporter, ok := scenario.(executionReporter); ok {
+			snapshot := reporter.ExecutionSnapshot()
+			result.Evidence = append(result.Evidence,
+				Evidence{Metric: "operations", Actual: float64(snapshot.Operations), Available: true},
+				Evidence{Metric: "errors", Actual: float64(snapshot.Errors), Available: true, Details: map[string]any{"first_error": snapshot.FirstError}},
+			)
+			if snapshot.Errors > 0 {
+				fail(PhaseHold, fmt.Errorf(
+					"workload execution errors=%d first_error=%s",
+					snapshot.Errors,
+					snapshot.FirstError,
+				))
+			}
+		}
+		if result.Outcome == OutcomeUnverified {
+			result.Evidence = append(result.Evidence, Evidence{
+				Metric: "runtime_validation", Available: false,
+				Details: map[string]any{"skipped": true},
+			})
 		}
 	}
 	strategy := "catalog_preflight"

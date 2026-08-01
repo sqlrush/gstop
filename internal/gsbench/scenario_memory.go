@@ -80,6 +80,12 @@ func (s *MemoryScenario) Hold(ctx context.Context, rt *Runtime) error {
 func (s *MemoryScenario) Verify(context.Context, *Runtime) (Result, error) {
 	return verifyCapacityResult(s.Name(), s.target, s.control.Actual, s.real, s.workload.Snapshot().Operations), nil
 }
+func (s *MemoryScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.workload == nil {
+		return WorkerSnapshot{}
+	}
+	return s.workload.Snapshot()
+}
 func (s *MemoryScenario) Stop(ctx context.Context, _ *Runtime) error {
 	if s.workload == nil {
 		return nil

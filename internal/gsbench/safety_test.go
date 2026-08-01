@@ -56,10 +56,11 @@ func TestOutcomeRankOrdersResultStates(t *testing.T) {
 	want := map[Outcome]int{
 		OutcomeSuccess:        0,
 		OutcomeNotApplicable:  0,
-		OutcomeDegraded:       1,
-		OutcomeNotImplemented: 2,
-		OutcomeFailed:         3,
-		OutcomeRestoreFailed:  4,
+		OutcomeUnverified:     1,
+		OutcomeDegraded:       2,
+		OutcomeNotImplemented: 3,
+		OutcomeFailed:         4,
+		OutcomeRestoreFailed:  5,
 	}
 	if !reflect.DeepEqual(outcomeRank, want) {
 		t.Fatalf("outcome rank = %#v, want %#v", outcomeRank, want)

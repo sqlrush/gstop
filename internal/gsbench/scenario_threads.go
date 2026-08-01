@@ -129,6 +129,12 @@ func (s *ThreadScenario) Hold(ctx context.Context, rt *Runtime) error {
 func (s *ThreadScenario) Verify(context.Context, *Runtime) (Result, error) {
 	return verifyCapacityResult(s.Name(), s.target, s.control.Actual, s.real, s.workload.Snapshot().Operations), nil
 }
+func (s *ThreadScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.workload == nil {
+		return WorkerSnapshot{}
+	}
+	return s.workload.Snapshot()
+}
 func (s *ThreadScenario) Stop(ctx context.Context, _ *Runtime) error {
 	if s.workload == nil {
 		return nil

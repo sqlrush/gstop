@@ -566,7 +566,7 @@ func commandRun(
 
 func exitCodeForOutcome(outcome Outcome) int {
 	switch outcome {
-	case OutcomeSuccess, OutcomeNotApplicable:
+	case OutcomeSuccess, OutcomeUnverified, OutcomeNotApplicable:
 		return 0
 	case OutcomeDegraded:
 		return 3

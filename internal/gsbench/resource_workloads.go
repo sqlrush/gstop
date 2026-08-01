@@ -284,6 +284,12 @@ func (s *resourceScenario) Verify(context.Context, *Runtime) (Result, error) {
 	}
 	return verifyResourceWorkload(s.code, s.workers.Snapshot(), s.evidence), nil
 }
+func (s *resourceScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.workers == nil {
+		return WorkerSnapshot{}
+	}
+	return s.workers.Snapshot()
+}
 func (s *resourceScenario) Stop(ctx context.Context, _ *Runtime) error {
 	if s.workers == nil {
 		return nil
@@ -478,6 +484,12 @@ func (s *connectionChurnScenario) Verify(context.Context, *Runtime) (Result, err
 	)
 	return result, nil
 }
+func (s *connectionChurnScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.group == nil {
+		return WorkerSnapshot{}
+	}
+	return s.group.Snapshot()
+}
 func (s *connectionChurnScenario) Stop(ctx context.Context, _ *Runtime) error {
 	if s.group == nil {
 		return nil
@@ -595,6 +607,9 @@ func (c *memoryComposite) Snapshot() WorkerSnapshot {
 		snapshot.Operations += part.Operations
 		snapshot.Errors += part.Errors
 		snapshot.TotalLatency += part.TotalLatency
+		if snapshot.FirstError == "" {
+			snapshot.FirstError = part.FirstError
+		}
 	}
 	return snapshot
 }
@@ -655,6 +670,9 @@ func (s *totalMemoryScenario) Verify(context.Context, *Runtime) (Result, error) 
 	result := verifyResourceWorkload(s.Code(), s.composite.Snapshot(), resourceEvidence{})
 	result.Evidence = append(result.Evidence, Evidence{Metric: "composed_memory_mechanisms", Target: 4, Actual: float64(len(s.composite.scenarios)), Available: len(s.composite.scenarios) == 4})
 	return result, nil
+}
+func (s *totalMemoryScenario) ExecutionSnapshot() WorkerSnapshot {
+	return s.composite.Snapshot()
 }
 func (s *totalMemoryScenario) Stop(ctx context.Context, _ *Runtime) error {
 	return s.composite.Stop(ctx)
@@ -737,6 +755,21 @@ func (s *memoryRetentionScenario) Verify(context.Context, *Runtime) (Result, err
 		result.Message = "allocation continued during the retention observation window"
 	}
 	return result, nil
+}
+func (s *memoryRetentionScenario) ExecutionSnapshot() WorkerSnapshot {
+	var combined WorkerSnapshot
+	for _, scenario := range s.scenarios {
+		part := scenario.ExecutionSnapshot()
+		combined.Target += part.Target
+		combined.Active += part.Active
+		combined.Operations += part.Operations
+		combined.Errors += part.Errors
+		combined.TotalLatency += part.TotalLatency
+		if combined.FirstError == "" {
+			combined.FirstError = part.FirstError
+		}
+	}
+	return combined
 }
 
 func (s *memoryRetentionScenario) Stop(ctx context.Context, _ *Runtime) error {

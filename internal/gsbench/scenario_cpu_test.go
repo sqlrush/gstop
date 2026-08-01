@@ -11,7 +11,9 @@ func TestTPStatementsUseIndexedReadsWritesAndInserts(t *testing.T) {
 	joined := strings.ToUpper(strings.Join(statements, "\n"))
 	for _, required := range []string{
 		"SELECT", "UPDATE GSBENCH.ACCOUNTS", "INSERT INTO GSBENCH.ORDERS",
-		"WHERE ID=42", "VALUES(9001,42,0,12.34",
+		"WHERE DIST_KEY=43 AND ID=42",
+		"ORDERS(DIST_KEY,ID,CUSTOMER_ID,STATUS,AMOUNT,CREATED_AT)",
+		"VALUES(43,9001,42,0,12.34",
 	} {
 		if !strings.Contains(joined, required) {
 			t.Errorf("TP statements missing %q: %s", required, joined)

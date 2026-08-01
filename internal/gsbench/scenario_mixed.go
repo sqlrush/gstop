@@ -130,9 +130,22 @@ func (s *MixedScenario) Hold(ctx context.Context, rt *Runtime) error {
 	return waitContext(ctx, rt.Config.Run.Duration)
 }
 func (s *MixedScenario) Verify(context.Context, *Runtime) (Result, error) {
+	return verifyCPUResult(s.Name(), s.target, s.available, s.control, s.ExecutionSnapshot()), nil
+}
+func (s *MixedScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.tp == nil || s.ap == nil {
+		return WorkerSnapshot{}
+	}
 	tp, ap := s.tp.Snapshot(), s.ap.Snapshot()
-	combined := WorkerSnapshot{Operations: tp.Operations + ap.Operations, Errors: tp.Errors + ap.Errors, Active: tp.Active + ap.Active}
-	return verifyCPUResult(s.Name(), s.target, s.available, s.control, combined), nil
+	firstError := tp.FirstError
+	if firstError == "" {
+		firstError = ap.FirstError
+	}
+	return WorkerSnapshot{
+		Target: tp.Target + ap.Target, Active: tp.Active + ap.Active,
+		Operations: tp.Operations + ap.Operations, Errors: tp.Errors + ap.Errors,
+		FirstError: firstError, TotalLatency: tp.TotalLatency + ap.TotalLatency,
+	}
 }
 func (s *MixedScenario) Stop(ctx context.Context, _ *Runtime) error {
 	err := s.tp.Stop(ctx)

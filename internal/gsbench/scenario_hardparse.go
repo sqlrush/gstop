@@ -179,6 +179,13 @@ func (s *HardParseScenario) Verify(ctx context.Context, rt *Runtime) (Result, er
 	return result, nil
 }
 
+func (s *HardParseScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.workload == nil {
+		return WorkerSnapshot{}
+	}
+	return s.workload.Snapshot()
+}
+
 func (s *HardParseScenario) Stop(ctx context.Context, _ *Runtime) error {
 	if s.workload == nil {
 		return nil

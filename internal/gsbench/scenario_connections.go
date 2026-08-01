@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 func connectionTarget(instanceMax, targetPercent, safetyMax int) int {
@@ -38,6 +39,10 @@ type ConnectionScenario struct {
 	baseline      int
 	targetPercent int
 	actualPercent float64
+	operations    atomic.Int64
+	errors        atomic.Int64
+	errorMu       sync.Mutex
+	firstError    string
 }
 
 func NewConnectionScenario() *ConnectionScenario { return &ConnectionScenario{} }
@@ -79,19 +84,23 @@ func (s *ConnectionScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	for i := 0; i < toOpen; i++ {
 		conn, err := rt.Database.OpenTagged(ctx, rt.RunID, s.Name(), strconv.Itoa(i))
 		if err != nil {
-			break
+			s.recordExecutionError(err)
+			return fmt.Errorf("open target connection %d: %w", i, err)
 		}
 		s.connections = append(s.connections, conn)
+		s.operations.Add(1)
 		switch {
 		case i < idleN:
 			// An unused established connection is intentionally idle.
 		case i < idleN+idleTxnN:
 			tx, err := conn.Conn.BeginTx(ctx, nil)
 			if err != nil {
+				s.recordExecutionError(err)
 				return err
 			}
 			if _, err := tx.ExecContext(ctx, "SELECT 1"); err != nil {
 				_ = tx.Rollback()
+				s.recordExecutionError(err)
 				return err
 			}
 			s.transactions = append(s.transactions, tx)
@@ -100,7 +109,13 @@ func (s *ConnectionScenario) Ramp(ctx context.Context, rt *Runtime) error {
 			go func(c *sql.Conn) {
 				defer s.activeWG.Done()
 				for activeCtx.Err() == nil {
-					_, _ = c.ExecContext(activeCtx, "SELECT pg_sleep(1)")
+					if _, err := c.ExecContext(activeCtx, "SELECT pg_sleep(1)"); err != nil {
+						if activeCtx.Err() == nil {
+							s.recordExecutionError(err)
+						}
+						return
+					}
+					s.operations.Add(1)
 				}
 			}(conn.Conn)
 		}
@@ -113,6 +128,27 @@ func (s *ConnectionScenario) Hold(ctx context.Context, rt *Runtime) error {
 }
 func (s *ConnectionScenario) Verify(context.Context, *Runtime) (Result, error) {
 	return verifyCapacityResult(s.Name(), float64(s.targetPercent), s.actualPercent, true, int64(len(s.connections))), nil
+}
+func (s *ConnectionScenario) ExecutionSnapshot() WorkerSnapshot {
+	s.errorMu.Lock()
+	firstError := s.firstError
+	s.errorMu.Unlock()
+	return WorkerSnapshot{
+		Target: len(s.connections), Active: len(s.connections),
+		Operations: s.operations.Load(), Errors: s.errors.Load(),
+		FirstError: firstError,
+	}
+}
+func (s *ConnectionScenario) recordExecutionError(err error) {
+	if err == nil {
+		return
+	}
+	s.errors.Add(1)
+	s.errorMu.Lock()
+	defer s.errorMu.Unlock()
+	if s.firstError == "" {
+		s.firstError = journalSafeErrorText(err.Error())
+	}
 }
 func (s *ConnectionScenario) Stop(context.Context, *Runtime) error {
 	if s.activeCancel != nil {

@@ -128,6 +128,12 @@ func (s *APScenario) Hold(ctx context.Context, rt *Runtime) error {
 func (s *APScenario) Verify(context.Context, *Runtime) (Result, error) {
 	return verifyCPUResult(s.Name(), float64(s.policy.CPUTargetPercent), s.available, s.control, s.workload.Snapshot()), nil
 }
+func (s *APScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.workload == nil {
+		return WorkerSnapshot{}
+	}
+	return s.workload.Snapshot()
+}
 
 func (s *APScenario) Stop(ctx context.Context, _ *Runtime) error {
 	if s.workload == nil {
@@ -181,6 +187,12 @@ func (s *cpuWorkloadScenario) Hold(ctx context.Context, rt *Runtime) error {
 }
 func (s *cpuWorkloadScenario) Verify(context.Context, *Runtime) (Result, error) {
 	return verifyCPUResult(s.name, s.target, s.available, s.control, s.workload.Snapshot()), nil
+}
+func (s *cpuWorkloadScenario) ExecutionSnapshot() WorkerSnapshot {
+	if s.workload == nil {
+		return WorkerSnapshot{}
+	}
+	return s.workload.Snapshot()
 }
 func (s *cpuWorkloadScenario) Stop(ctx context.Context, _ *Runtime) error {
 	if s.workload == nil {
