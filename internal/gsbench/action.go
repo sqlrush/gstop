@@ -9,6 +9,8 @@ import (
 	"unicode"
 )
 
+const sqlVerifyComparisonIndexDDL = "index_ddl"
+
 type ActionKind string
 
 const (
@@ -346,10 +348,22 @@ func SQLAction(m Mutation) Action {
 		}
 	}
 	if m.VerifyAction != "" {
+		comparison := ""
+		if strings.HasPrefix(
+			strings.ToUpper(strings.TrimSpace(m.VerifyValue)),
+			"CREATE INDEX ",
+		) {
+			comparison = sqlVerifyComparisonIndexDDL
+		}
 		action.Verify = marshalActionPayload(struct {
-			SQL      string `json:"sql"`
-			Expected string `json:"expected"`
-		}{SQL: m.VerifyAction, Expected: m.VerifyValue})
+			SQL        string `json:"sql"`
+			Expected   string `json:"expected"`
+			Comparison string `json:"comparison,omitempty"`
+		}{
+			SQL:        m.VerifyAction,
+			Expected:   m.VerifyValue,
+			Comparison: comparison,
+		})
 	}
 	return action
 }

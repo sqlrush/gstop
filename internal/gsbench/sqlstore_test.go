@@ -431,6 +431,69 @@ func TestSQLActionExecutorUsesTypedPayloadsForApplyRestoreAndVerify(t *testing.T
 	}
 }
 
+func TestSQLActionExecutorVerifiesRestoredPlanIndexesByCanonicalShape(
+	t *testing.T,
+) {
+	tests := []struct {
+		name         string
+		scenario     string
+		correctShape string
+		wrongShape   string
+	}{
+		{
+			name:         "605 dropped index",
+			scenario:     "planchange_index_drop",
+			correctShape: `CREATE INDEX plan_index_drop_idx ON "gsbench".plan_data USING btree (index_drop_key, dist_key, id)`,
+			wrongShape:   `CREATE INDEX plan_index_drop_idx ON "gsbench".plan_data USING btree (index_drop_key)`,
+		},
+		{
+			name:         "606 good-shape index",
+			scenario:     "planchange_index_shape",
+			correctShape: `CREATE INDEX plan_index_shape_good_idx ON "gsbench".plan_data USING btree (index_shape_lead, index_shape_tail, dist_key, id)`,
+			wrongShape:   `CREATE INDEX plan_index_shape_good_idx ON "gsbench".plan_data USING btree (index_shape_lead, index_shape_tail)`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutations, err := PlanMutationSet("run-1", "gsbench", test.scenario)
+			if err != nil {
+				t.Fatal(err)
+			}
+			action := SQLAction(mutations[0])
+			db := &fakeSQLActionDatabase{actual: test.correctShape}
+			executor := dbActionExecutor{db: db}
+			if err := executor.VerifyRestored(context.Background(), action); err != nil {
+				t.Fatalf("canonical index shape rejected: %v", err)
+			}
+			db.actual = test.wrongShape
+			if err := executor.VerifyRestored(context.Background(), action); err == nil ||
+				!strings.Contains(err.Error(), "index definition") {
+				t.Fatalf("wrong-shaped same-name index accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDatasetIndexMatchesRejectsEqualColumnSemanticDifferences(t *testing.T) {
+	expected := `CREATE INDEX plan_index_drop_idx ON "gsbench".plan_data (index_drop_key, dist_key, id)`
+	if !datasetIndexMatches(
+		`CREATE INDEX plan_index_drop_idx ON gsbench.plan_data USING btree (index_drop_key, dist_key, id) TABLESPACE gsbench_ts`,
+		expected,
+	) {
+		t.Fatal("explicit default btree/tablespace definition did not match canonical index")
+	}
+	for _, actual := range []string{
+		`CREATE UNIQUE INDEX plan_index_drop_idx ON gsbench.plan_data USING btree (index_drop_key, dist_key, id)`,
+		`CREATE INDEX plan_index_drop_idx ON gsbench.plan_data USING hash (index_drop_key, dist_key, id)`,
+		`CREATE INDEX plan_index_drop_idx ON gsbench.plan_data USING btree (index_drop_key, dist_key, id) WHERE index_drop_key > 0`,
+		`CREATE INDEX plan_index_drop_idx ON gsbench.plan_data USING btree (index_drop_key, dist_key, id) WITH (fillfactor=70)`,
+	} {
+		if datasetIndexMatches(actual, expected) {
+			t.Fatalf("semantically different same-column index accepted: %s", actual)
+		}
+	}
+}
+
 func TestSQLActionExecutorRejectsNonSQLActionKind(t *testing.T) {
 	db := &fakeSQLActionDatabase{}
 	executor := dbActionExecutor{db: db}
@@ -861,6 +924,32 @@ func TestFormalPlanCacheMigrationIsIdempotent(t *testing.T) {
 				sqlText,
 			)
 		}
+	}
+}
+
+func TestFormalPlanCacheMigrationClearsZeroScenarioCodeBeforeNotNull(t *testing.T) {
+	statements, err := legacyPlanCacheMigrationStatements(
+		"gsbench",
+		map[string]bool{
+			"signature": true, "scenario_code": true, "sql_text": true,
+			"plan_text": true, "updated_at": true,
+		},
+		"meta_plan_cache_pkey",
+		"PRIMARY KEY (signature, scenario_code)",
+		"HASH (signature)",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := strings.Join(statements, "\n")
+	zero := strings.Index(
+		sqlText,
+		`UPDATE "gsbench".meta_plan_cache SET scenario_code=NULL WHERE scenario_code=0`,
+	)
+	notNull := strings.Index(sqlText, "ALTER COLUMN scenario_code SET NOT NULL")
+	if zero < 0 || notNull < zero {
+		t.Fatalf("formal plan-cache migration does not clear zero before NOT NULL:\n%s", sqlText)
 	}
 }
 

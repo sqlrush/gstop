@@ -191,11 +191,6 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 	return results, errors.Join(errs...)
 }
 
-const planIndexDefinitionQuery = `SELECT pg_catalog.pg_get_indexdef(c.oid)
-	FROM pg_catalog.pg_class c
-	JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-	WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind='i'`
-
 func AnalyzeExtendedStatistics(ctx context.Context, db *Database, table string) error {
 	return db.ExecSession(ctx,
 		"SET default_statistics_target=-2",

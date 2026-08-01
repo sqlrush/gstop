@@ -40,6 +40,11 @@ var canonicalPlanIndexDefinitions = [...]planIndexDefinition{
 	{Name: "plan_index_shape_good_idx", Table: "plan_data", Columns: []string{"index_shape_lead", "index_shape_tail", "dist_key", "id"}},
 }
 
+const planIndexDefinitionQuery = `SELECT pg_catalog.pg_get_indexdef(c.oid)
+	FROM pg_catalog.pg_class c
+	JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+	WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind='i'`
+
 func planIndexDefinitions() []planIndexDefinition {
 	definitions := make([]planIndexDefinition, len(canonicalPlanIndexDefinitions))
 	for index, definition := range canonicalPlanIndexDefinitions {
@@ -93,6 +98,24 @@ func planIndexDDL(
 		definition.Table,
 		strings.Join(definition.Columns, ","),
 	), nil
+}
+
+func planIndexDefinitionLookupSQL(
+	schema string,
+	definition planIndexDefinition,
+) (string, error) {
+	if !identifierRE.MatchString(schema) ||
+		!identifierRE.MatchString(definition.Name) {
+		return "", fmt.Errorf(
+			"unsafe plan index lookup %q.%q",
+			schema,
+			definition.Name,
+		)
+	}
+	return strings.NewReplacer(
+		"$1", "'"+schema+"'",
+		"$2", "'"+definition.Name+"'",
+	).Replace(planIndexDefinitionQuery), nil
 }
 
 func planDataDDL(schema string) []string {

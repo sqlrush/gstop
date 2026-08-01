@@ -175,12 +175,16 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 		if err != nil {
 			return nil, err
 		}
+		verifyIndex, err := planIndexDefinitionLookupSQL(schema, definition)
+		if err != nil {
+			return nil, err
+		}
 		index := quotedSchema + "." + definition.Name
 		return []Mutation{base(
 			"index_drop", index,
 			"DROP INDEX "+index,
 			createIndex,
-			indexExists(definition.Name), "1",
+			verifyIndex, createIndex,
 		)}, nil
 	case "planchange_index_shape":
 		goodDefinition, ok := planIndexDefinitionByName(
@@ -192,6 +196,10 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 			)
 		}
 		goodCreate, err := planIndexDDL(schema, goodDefinition, false)
+		if err != nil {
+			return nil, err
+		}
+		verifyGood, err := planIndexDefinitionLookupSQL(schema, goodDefinition)
 		if err != nil {
 			return nil, err
 		}
@@ -210,7 +218,7 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 				"index_shape_drop_good", good,
 				"DROP INDEX "+good,
 				goodCreate,
-				indexExists(goodDefinition.Name), "1",
+				verifyGood, goodCreate,
 			),
 			base(
 				"index_shape_create_bad", bad,

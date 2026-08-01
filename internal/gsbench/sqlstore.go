@@ -590,7 +590,12 @@ type datasetTableShape struct {
 	PrimaryKey string
 }
 
-var datasetWhitespaceRE = regexp.MustCompile(`\s+`)
+var (
+	datasetWhitespaceRE      = regexp.MustCompile(`\s+`)
+	datasetIndexTablespaceRE = regexp.MustCompile(
+		`\s+tablespace\s+[a-z_][a-z0-9_$]*`,
+	)
+)
 
 func expectedDatasetTableShape(ddl string) (datasetTableShape, error) {
 	open := strings.Index(ddl, "(")
@@ -773,28 +778,54 @@ func canonicalDatasetDistribution(
 }
 
 func datasetIndexMatches(actual, expected string) bool {
-	indexParts := func(definition string) (table, columns string) {
-		normalized := strings.ReplaceAll(definition, `"`, "")
-		upper := strings.ToUpper(normalized)
-		on := strings.Index(upper, " ON ")
-		if on < 0 {
-			return "", ""
+	canonical := func(definition string) (string, bool) {
+		value := strings.ToLower(datasetWhitespaceRE.ReplaceAllString(
+			strings.TrimSpace(strings.ReplaceAll(definition, `"`, "")),
+			" ",
+		))
+		value = strings.Replace(value,
+			"create unique index if not exists ",
+			"create unique index ", 1,
+		)
+		value = strings.Replace(value,
+			"create index if not exists ",
+			"create index ", 1,
+		)
+		if !strings.HasPrefix(value, "create index ") &&
+			!strings.HasPrefix(value, "create unique index ") {
+			return "", false
 		}
-		rest := strings.TrimSpace(normalized[on+4:])
-		open := strings.LastIndex(rest, "(")
-		close := strings.LastIndex(rest, ")")
-		if open < 0 || close <= open {
-			return "", ""
+		on := strings.Index(value, " on ")
+		if on < 0 {
+			return "", false
+		}
+		restStart := on + len(" on ")
+		rest := value[restStart:]
+		open := strings.Index(rest, "(")
+		if open < 0 || !strings.Contains(rest[open+1:], ")") {
+			return "", false
 		}
 		target := strings.TrimSpace(rest[:open])
-		if using := strings.Index(strings.ToUpper(target), " USING "); using >= 0 {
+		method := "btree"
+		if using := strings.LastIndex(target, " using "); using >= 0 {
+			method = strings.TrimSpace(target[using+len(" using "):])
 			target = strings.TrimSpace(target[:using])
 		}
-		return normalizeDatasetSQL(target), normalizeDatasetSQL(rest[open+1 : close])
+		if target == "" || !identifierRE.MatchString(method) {
+			return "", false
+		}
+		value = value[:restStart] + target + " using " + method + " " +
+			strings.TrimSpace(rest[open:])
+		// CREATE INDEX without TABLESPACE follows the active default tablespace;
+		// pg_get_indexdef renders that resolved placement explicitly on Gauss.
+		// Placement is therefore ignored, while uniqueness, access method, keys,
+		// opclasses/options and predicates remain part of the comparison.
+		value = datasetIndexTablespaceRE.ReplaceAllString(value, "")
+		return normalizeDatasetSQL(value), true
 	}
-	actualTable, actualColumns := indexParts(actual)
-	expectedTable, expectedColumns := indexParts(expected)
-	return actualTable == expectedTable && actualColumns == expectedColumns
+	actualDefinition, actualOK := canonical(actual)
+	expectedDefinition, expectedOK := canonical(expected)
+	return actualOK && expectedOK && actualDefinition == expectedDefinition
 }
 
 func legacyJournalMigrationStatements(
@@ -988,6 +1019,12 @@ func legacyPlanCacheMigrationStatements(
 			statements,
 			"UPDATE "+table+" SET scenario_code="+
 				legacyJournalScenarioExpression(columns),
+		)
+	} else {
+		statements = append(
+			statements,
+			"UPDATE "+table+
+				" SET scenario_code=NULL WHERE scenario_code=0",
 		)
 	}
 	statements = append(
@@ -1740,6 +1777,7 @@ type sqlActionPayload struct {
 	SQL        string   `json:"sql,omitempty"`
 	SessionSQL []string `json:"session_sql,omitempty"`
 	Expected   string   `json:"expected,omitempty"`
+	Comparison string   `json:"comparison,omitempty"`
 }
 
 func (e dbActionExecutor) Preflight(_ context.Context, action Action) error {
@@ -1803,8 +1841,19 @@ func (e dbActionExecutor) VerifyRestored(
 	if err := e.db.Scan(ctx, payload.SQL, nil, &actual); err != nil {
 		return err
 	}
-	if !databaseValuesEqual(actual, payload.Expected) {
-		return fmt.Errorf("got %q, want %q", actual, payload.Expected)
+	switch payload.Comparison {
+	case "":
+		if !databaseValuesEqual(actual, payload.Expected) {
+			return fmt.Errorf("got %q, want %q", actual, payload.Expected)
+		}
+	case sqlVerifyComparisonIndexDDL:
+		if !datasetIndexMatches(actual, payload.Expected) {
+			return fmt.Errorf(
+				"index definition %q, expected %q",
+				actual,
+				payload.Expected,
+			)
+		}
 	}
 	return nil
 }
@@ -1880,6 +1929,26 @@ func preflightSQLActionPayload(
 			}
 		}
 		return nil
+	}
+	if payload.Comparison != "" {
+		if name != "verify" {
+			return fmt.Errorf(
+				"%s SQL payload cannot define a comparison",
+				name,
+			)
+		}
+		if payload.Comparison != sqlVerifyComparisonIndexDDL {
+			return fmt.Errorf(
+				"verify SQL payload comparison %q is unsupported",
+				payload.Comparison,
+			)
+		}
+		if strings.TrimSpace(payload.Expected) == "" {
+			return fmt.Errorf(
+				"verify SQL payload comparison %q requires an expected value",
+				payload.Comparison,
+			)
+		}
 	}
 	statements, err := legacySQLStatements(payload.SQL)
 	if err != nil {

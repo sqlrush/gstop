@@ -168,6 +168,14 @@ func TestIndexPlanMutationsUseCompleteCanonicalDefinitions(t *testing.T) {
 	); got != want {
 		t.Fatalf("605 inverse=%q want=%q", drop[0].InverseSQL, want)
 	}
+	if !strings.Contains(drop[0].VerifySQL, "pg_get_indexdef") ||
+		compactPlanDDL(drop[0].VerifyValue) != compactPlanDDL(drop[0].InverseSQL) {
+		t.Fatalf(
+			"605 restore verification does not inspect the canonical index shape: sql=%q expected=%q",
+			drop[0].VerifySQL,
+			drop[0].VerifyValue,
+		)
+	}
 
 	shape, err := PlanMutationSet(
 		"run-1", "gsbench", "planchange_index_shape",
@@ -180,10 +188,101 @@ func TestIndexPlanMutationsUseCompleteCanonicalDefinitions(t *testing.T) {
 	); got != want {
 		t.Fatalf("606 good inverse=%q want=%q", shape[0].InverseSQL, want)
 	}
+	if !strings.Contains(shape[0].VerifySQL, "pg_get_indexdef") ||
+		compactPlanDDL(shape[0].VerifyValue) != compactPlanDDL(shape[0].InverseSQL) {
+		t.Fatalf(
+			"606 restore verification does not inspect the canonical index shape: sql=%q expected=%q",
+			shape[0].VerifySQL,
+			shape[0].VerifyValue,
+		)
+	}
 	if got, want := compactPlanDDL(shape[1].ForwardSQL), compactPlanDDL(
 		"CREATE INDEX plan_index_shape_bad_idx ON gsbench.plan_data (index_shape_tail,index_shape_lead,dist_key,id)",
 	); got != want {
 		t.Fatalf("606 bad forward=%q want=%q", shape[1].ForwardSQL, want)
+	}
+}
+
+type planStatisticsRestoreDatabase struct {
+	events []string
+}
+
+func (d *planStatisticsRestoreDatabase) Exec(
+	_ context.Context,
+	query string,
+	_ ...any,
+) (sql.Result, error) {
+	d.events = append(d.events, query)
+	return nil, nil
+}
+
+func (*planStatisticsRestoreDatabase) Scan(
+	context.Context,
+	string,
+	[]any,
+	...any,
+) error {
+	return nil
+}
+
+func (d *planStatisticsRestoreDatabase) ExecSession(
+	_ context.Context,
+	statements ...string,
+) error {
+	d.events = append(d.events, "SESSION: "+strings.Join(statements, " | "))
+	return nil
+}
+
+func TestCombinedPlanStatisticsRestoreExecutesPrerequisitesBeforeAnalyze(
+	t *testing.T,
+) {
+	var actions []Action
+	var sequence int64
+	for _, scenario := range []string{
+		"planchange_stats_target",
+		"planchange_stats_ndistinct",
+		"planchange_stats_extended",
+	} {
+		mutations, err := PlanMutationSet("run-stats", "gsbench", scenario)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, mutation := range mutations {
+			sequence++
+			mutation.TargetProduct = ProductGaussDB
+			action := SQLAction(mutation)
+			action.Sequence = sequence
+			action.State = MutationApplied
+			actions = append(actions, action)
+		}
+	}
+
+	_, ordered, err := prepareRestorePlan(
+		RestoreDiscovery{DatabaseActions: actions},
+		"run-stats",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &planStatisticsRestoreDatabase{}
+	executor := dbActionExecutor{db: database}
+	for _, action := range ordered {
+		if err := executor.Restore(context.Background(), action); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := []string{
+		`ALTER TABLE "gsbench".plan_data ADD STATISTICS ((stats_corr_a,stats_corr_b))`,
+		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key RESET (n_distinct)`,
+		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key SET STATISTICS -1`,
+		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_target_key SET STATISTICS -1`,
+		`SESSION: SET default_statistics_target=-2 | ANALYZE "gsbench".plan_data ((stats_corr_a,stats_corr_b)) | RESET default_statistics_target`,
+		`ANALYZE "gsbench".plan_data(stats_ndistinct_key)`,
+		`ANALYZE "gsbench".plan_data(stats_target_key)`,
+	}
+	if !reflect.DeepEqual(database.events, want) {
+		t.Fatalf("restore events=%q want=%q", database.events, want)
 	}
 }
 
