@@ -293,13 +293,11 @@ func (r *RestoreCoordinator) Restore(
 	if err := r.backend.RepairBaseline(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("repair benchmark baseline: %w", err))
 	}
-	if r.validationEnabled {
-		if err := r.backend.RedetectTopology(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("re-detect topology: %w", err))
-		}
-		if err := r.backend.VerifyRestore(ctx, runs, actions); err != nil {
-			errs = append(errs, fmt.Errorf("verify restored state: %w", err))
-		}
+	if err := r.backend.RedetectTopology(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("re-detect topology: %w", err))
+	}
+	if err := r.backend.VerifyRestore(ctx, runs, actions); err != nil {
+		errs = append(errs, fmt.Errorf("verify restored state: %w", err))
 	}
 
 	outcome := OutcomeSuccess

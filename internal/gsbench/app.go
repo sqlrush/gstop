@@ -105,8 +105,7 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 		db.setTargetProduct(environment.Product)
 		caps = capabilitiesFor(environment)
 	}
-	if cfg.Run.ValidationEnabled &&
-		options.Command != "init" &&
+	if options.Command != "init" &&
 		options.Command != "doctor" &&
 		options.Command != "restore" &&
 		options.Command != "stop" {
@@ -283,7 +282,7 @@ func commandInit(
 	caps Capabilities,
 	log *RunLog,
 ) int {
-	if cfg.Run.ValidationEnabled && !caps.Supported {
+	if !caps.Supported {
 		log.Error("unsupported target product or topology")
 		return 1
 	}
@@ -474,7 +473,7 @@ func commandRun(
 	).Restore(
 		parent,
 		RestoreRequest{afterSuccess: func(ctx context.Context) error {
-			if cfg.Run.ValidationEnabled && scenarioCodesContainPlanChange(
+			if scenarioCodesContainPlanChange(
 				cfg.Run.ScenarioCodes,
 			) {
 				activeRunID, err := findActivePlanRun(

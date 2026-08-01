@@ -254,18 +254,19 @@ func TestApplyActionPersistsBeforeForwardExecution(t *testing.T) {
 	}
 }
 
-func TestJournalSkipsApplyPreflightWhenValidationDisabled(t *testing.T) {
+func TestJournalKeepsApplyPreflightWhenModelValidationDisabled(t *testing.T) {
 	store := &memoryActionStore{}
 	executor := &memoryActionExecutor{
 		preflightError: errors.New("preflight validation failed"),
 	}
-	if err := NewJournalWithValidation(store, executor, false).ApplyAction(
+	err := NewJournalWithValidation(store, executor, false).ApplyAction(
 		context.Background(),
 		validSQLJournalAction(),
-	); err != nil {
-		t.Fatal(err)
+	)
+	if err == nil || !strings.Contains(err.Error(), "preflight validation failed") {
+		t.Fatalf("error=%v", err)
 	}
-	if len(store.entries) != 1 || store.states[1] != MutationApplied {
+	if len(store.entries) != 0 {
 		t.Fatalf("entries=%+v states=%+v", store.entries, store.states)
 	}
 }
@@ -593,25 +594,24 @@ func TestRestoreVerificationFailureRemainsPendingForRetry(t *testing.T) {
 	}
 }
 
-func TestJournalSkipsRestoreVerificationWhenValidationDisabled(t *testing.T) {
+func TestJournalKeepsRestoreVerificationWhenModelValidationDisabled(t *testing.T) {
 	action := validSQLJournalAction()
 	action.Sequence = 7
 	action.Verify = []byte(`{"sql":"SELECT restored","expected":"true"}`)
 	action.State = MutationApplied
 	store := &memoryActionStore{entries: []Action{action}}
 	executor := &memoryActionExecutor{
-		preflightError: errors.New("preflight validation failed"),
-		verifyError:    errors.New("restore validation failed"),
+		verifyError: errors.New("restore validation failed"),
 	}
 	err := NewJournalWithValidation(store, executor, false).
 		restoreCoordinatorActions(context.Background(), []Action{action})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "restore validation failed") {
+		t.Fatalf("error=%v", err)
 	}
-	if store.states[7] != MutationRestored {
-		t.Fatalf("state=%q want=%q", store.states[7], MutationRestored)
+	if store.states[7] != MutationRestoreFailed {
+		t.Fatalf("state=%q want=%q", store.states[7], MutationRestoreFailed)
 	}
-	if len(executor.verifyActions) != 0 {
+	if len(executor.verifyActions) != 1 {
 		t.Fatalf("restore verification calls=%d", len(executor.verifyActions))
 	}
 }

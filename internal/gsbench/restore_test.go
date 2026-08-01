@@ -269,7 +269,7 @@ func TestRestoreCoordinatorRunsExactSafetyOrder(t *testing.T) {
 	}
 }
 
-func TestRestoreCoordinatorSkipsTopologyAndStateValidationWhenDisabled(t *testing.T) {
+func TestRestoreCoordinatorKeepsTopologyAndStateValidationWhenModelValidationDisabled(t *testing.T) {
 	backend := &fakeRestoreBackend{
 		discovery: RestoreDiscovery{
 			Runs: []RestoreRun{{RunID: "run-1", StartedAt: time.Unix(10, 0)}},
@@ -283,13 +283,12 @@ func TestRestoreCoordinatorSkipsTopologyAndStateValidationWhenDisabled(t *testin
 		context.Background(),
 		RestoreRequest{},
 	)
-	if summary.Failed {
-		t.Fatal(summary.Err)
+	if !summary.Failed || summary.Outcome != OutcomeRestoreFailed {
+		t.Fatalf("summary=%+v", summary)
 	}
-	for _, event := range backend.events {
-		if event == "topology" || strings.HasPrefix(event, "verify:") {
-			t.Fatalf("validation event executed: %s", event)
-		}
+	joined := strings.Join(backend.events, ",")
+	if !strings.Contains(joined, "topology") || !strings.Contains(joined, "verify:run-1") {
+		t.Fatalf("safety events=%v", backend.events)
 	}
 }
 

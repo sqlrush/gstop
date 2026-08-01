@@ -639,7 +639,7 @@ func TestDatasetInitRejectsUnsupportedVersionBeforeTableMutation(t *testing.T) {
 	}
 }
 
-func TestDatasetInitAllowsUnsupportedVersionWhenValidationDisabled(t *testing.T) {
+func TestDatasetInitRejectsUnsupportedVersionWhenModelValidationDisabled(t *testing.T) {
 	plan, err := PlanDataset(
 		datasetConfig("quick", 1),
 		Capacity{TotalBytes: 20 << 30, FreeBytes: 20 << 30},
@@ -665,15 +665,16 @@ func TestDatasetInitAllowsUnsupportedVersionWhenValidationDisabled(t *testing.T)
 		}
 		exec.existing[string(object.Kind)+":"+object.Name] = true
 	}
-	if err := NewDatasetManagerWithValidation(exec, false).Init(
+	err = NewDatasetManagerWithValidation(exec, false).Init(
 		context.Background(),
 		plan,
-	); err != nil {
-		t.Fatal(err)
+	)
+	if err == nil || !strings.Contains(err.Error(), `unsupported dataset version "99"`) {
+		t.Fatalf("err=%v", err)
 	}
 	for _, event := range exec.events {
-		if strings.HasPrefix(event, "validate:") {
-			t.Fatalf("dataset validation ran: %s", event)
+		if strings.HasPrefix(event, "migrate:") || strings.HasPrefix(event, "validate:") {
+			t.Fatalf("unsupported dataset was mutated: %s", event)
 		}
 	}
 }

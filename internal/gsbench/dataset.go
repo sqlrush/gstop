@@ -691,9 +691,7 @@ func (m *DatasetManager) bootstrapDatasetVersion(
 	switch version {
 	case "", "1", "2", "3", datasetVersion:
 	default:
-		if m.validationEnabled {
-			return nil, fmt.Errorf("unsupported dataset version %q", version)
-		}
+		return nil, fmt.Errorf("unsupported dataset version %q", version)
 	}
 	if exists {
 		return statements, nil
