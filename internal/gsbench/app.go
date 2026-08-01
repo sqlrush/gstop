@@ -286,6 +286,36 @@ func commandInit(
 		log.Error("unsupported target product or topology")
 		return 1
 	}
+	if !cfg.Run.DryRun {
+		lockIdentity := fmt.Sprintf(
+			"gsbench:init:%s:%s",
+			cfg.Database.Database,
+			cfg.Data.Schema,
+		)
+		release, err := AcquireDatabaseRunLock(ctx, db, lockIdentity)
+		if err != nil {
+			log.Error("acquire initialization lock: %v", err)
+			return 1
+		}
+		defer func() {
+			if err := release(); err != nil {
+				log.Error("release initialization lock: %v", err)
+			}
+		}()
+	}
+	exists, err := datasetExists(ctx, db, cfg.Data.Schema)
+	if err != nil {
+		log.Error("inspect existing benchmark dataset: %v", err)
+		return 1
+	}
+	if err := validateDatasetReusePolicy(
+		cfg.Data.ReuseExisting,
+		exists,
+		cfg.Data.Schema,
+	); err != nil {
+		log.Error("initialize dataset: %v", err)
+		return 1
+	}
 	providerDB := databaseJournalDB{db: db}
 	externalProviders := DatasetExternalProviders{}
 	var capacityProvider DatasetCapacityProvider

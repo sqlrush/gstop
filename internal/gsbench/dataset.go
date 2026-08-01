@@ -176,6 +176,18 @@ func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPl
 	if target > maxDatasetBytes {
 		return DatasetPlan{}, fmt.Errorf("dataset target %d exceeds 2TB", target)
 	}
+	profileCapGB := cfg.Safety.ProfileCapGB
+	if profileCapGB <= 0 {
+		profileCapGB = 256
+	}
+	profileCapBytes := int64(profileCapGB) << 30
+	if target > profileCapBytes {
+		return DatasetPlan{}, fmt.Errorf(
+			"dataset target %d exceeds safety profile cap %dGB",
+			target,
+			profileCapGB,
+		)
+	}
 	if cfg.Run.ValidationEnabled && target > available {
 		return DatasetPlan{}, fmt.Errorf(
 			"dataset capacity rejected: target=%d free=%d reserved=%d safe_available=%d",
@@ -204,6 +216,21 @@ func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPl
 	plan.Migrations = dialect.Migrations(plan.Schema)
 	plan.Batches = dialect.BatchPlans(plan.Schema, target)
 	return plan, nil
+}
+
+func validateDatasetReusePolicy(
+	reuseExisting bool,
+	datasetExists bool,
+	schema string,
+) error {
+	if reuseExisting || !datasetExists {
+		return nil
+	}
+	return fmt.Errorf(
+		"dataset schema %q already exists while data.reuse_existing=false; "+
+			"run gsbench cleanup --data for this benchmark schema before init",
+		schema,
+	)
 }
 
 func LoadDatasetHighWater(

@@ -291,6 +291,15 @@ func (c BenchConfig) Validate() error {
 	if c.Safety.MaxWorkers <= 0 || c.Safety.MaxConnections <= 0 || c.Data.MaxSizeGB <= 0 {
 		return fmt.Errorf("worker, connection, and data size limits must be positive")
 	}
+	if c.Safety.ProfileCapGB < 1 || c.Safety.ProfileCapGB > 2048 {
+		return fmt.Errorf("safety.profile_cap_gb must be between 1 and 2048")
+	}
+	if !c.Safety.RestoreOnExit {
+		return fmt.Errorf("safety.restore_on_exit=false is unsupported; restoration is mandatory")
+	}
+	if c.Safety.RestoreOriginalRole {
+		return fmt.Errorf("safety.restore_original_role=true is unsupported by the available provider")
+	}
 	if c.Data.MaxSizeGB > 2048 || c.Data.TargetBytes > maxDatasetBytes {
 		return fmt.Errorf("data size limit must not exceed 2TB")
 	}

@@ -155,22 +155,34 @@ func TestShippedConfigDoesNotAdvertiseUnavailableDatasetProviders(t *testing.T) 
 	}
 }
 
-func TestSafetyConfigParsesFaultAuthorizationSettings(t *testing.T) {
+func TestSafetyConfigParsesSupportedFaultAuthorizationSettings(t *testing.T) {
 	body := minimalConfig() + `
 [safety]
 restore_timeout = 7m
 profile_cap_gb = 128
 allow_admin_mutation = true
 allow_infrastructure_fault = true
-restore_original_role = true
 `
 	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Safety.RestoreTimeout != 7*time.Minute || cfg.Safety.ProfileCapGB != 128 ||
-		!cfg.Safety.AllowAdminMutation || !cfg.Safety.AllowInfrastructureFault || !cfg.Safety.RestoreOriginalRole {
+		!cfg.Safety.AllowAdminMutation || !cfg.Safety.AllowInfrastructureFault || cfg.Safety.RestoreOriginalRole {
 		t.Fatalf("safety=%+v", cfg.Safety)
+	}
+}
+
+func TestConfigRejectsUnsupportedRestoreSafetySettings(t *testing.T) {
+	for _, setting := range []string{
+		"restore_on_exit = false",
+		"restore_original_role = true",
+	} {
+		body := minimalConfig() + "\n[safety]\n" + setting + "\n"
+		if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil ||
+			!strings.Contains(err.Error(), strings.Split(setting, " =")[0]) {
+			t.Fatalf("setting=%q error=%v", setting, err)
+		}
 	}
 }
 

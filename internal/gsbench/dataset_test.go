@@ -11,8 +11,9 @@ import (
 
 func datasetConfig(profile string, maxGB int) BenchConfig {
 	return BenchConfig{
-		Run:  RunConfig{Profile: profile, ValidationEnabled: true},
-		Data: DataConfig{Schema: "gsbench", MaxSizeGB: maxGB, MinFreeDiskPercent: 20, ReuseExisting: true},
+		Run:    RunConfig{Profile: profile, ValidationEnabled: true},
+		Data:   DataConfig{Schema: "gsbench", MaxSizeGB: maxGB, MinFreeDiskPercent: 20, ReuseExisting: true},
+		Safety: SafetyConfig{ProfileCapGB: 256},
 	}
 }
 
@@ -71,15 +72,13 @@ func TestDatasetStressPlanDefaultsToAtMostTwentyGB(t *testing.T) {
 	}
 }
 
-func TestDatasetExplicitSizeOverridesProfileCap(t *testing.T) {
+func TestDatasetExplicitSizeCannotExceedProfileCap(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.TargetBytes = 100 << 30
-	plan, err := PlanDataset(cfg, Capacity{TotalBytes: 1 << 40, FreeBytes: 1 << 40}, testDatasetEnvironment())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.EstimatedBytes != 100<<30 {
-		t.Fatalf("estimated bytes=%d", plan.EstimatedBytes)
+	cfg.Safety.ProfileCapGB = 64
+	_, err := PlanDataset(cfg, Capacity{TotalBytes: 1 << 40, FreeBytes: 1 << 40}, testDatasetEnvironment())
+	if err == nil || !strings.Contains(err.Error(), "profile cap") {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -94,6 +93,7 @@ func TestDatasetRejectsTargetAboveTwoTiB(t *testing.T) {
 func TestDatasetAcceptsExactTwoTiBBoundary(t *testing.T) {
 	cfg := datasetConfig("stress", 20)
 	cfg.Data.TargetBytes = 2 << 40
+	cfg.Safety.ProfileCapGB = 2048
 	plan, err := PlanDataset(
 		cfg,
 		Capacity{TotalBytes: 4 << 40, FreeBytes: 4 << 40},
@@ -104,6 +104,19 @@ func TestDatasetAcceptsExactTwoTiBBoundary(t *testing.T) {
 	}
 	if plan.EstimatedBytes != 2<<40 {
 		t.Fatalf("estimated bytes=%d", plan.EstimatedBytes)
+	}
+}
+
+func TestDatasetReusePolicyRejectsExistingSchemaWithoutDroppingIt(t *testing.T) {
+	err := validateDatasetReusePolicy(false, true, "gsbench_e2e_20260801")
+	if err == nil || !strings.Contains(err.Error(), "cleanup --data") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := validateDatasetReusePolicy(true, true, "gsbench_e2e_20260801"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDatasetReusePolicy(false, false, "gsbench_e2e_20260801"); err != nil {
+		t.Fatal(err)
 	}
 }
 
