@@ -3,6 +3,7 @@ package gsbench
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -39,6 +40,19 @@ type fakeRestoreBackend struct {
 	outcomeWithoutLock    bool
 	outcomeDeadlines      []time.Time
 	outcomeWriteFailures  map[string][]error
+	discoverReadOnly      []bool
+}
+
+type ownershipRestoreBackend struct {
+	*fakeRestoreBackend
+	err error
+}
+
+func (b *ownershipRestoreBackend) ValidateRestoreOwnership(
+	context.Context,
+) error {
+	b.events = append(b.events, "ownership")
+	return b.err
 }
 
 type localLockRestoreBackend struct {
@@ -55,6 +69,7 @@ func (b *localLockRestoreBackend) AcquireRestoreLock(
 func (b *localLockRestoreBackend) DiscoverRestore(
 	context.Context,
 	string,
+	bool,
 ) (RestoreDiscovery, error) {
 	return b.discovery, nil
 }
@@ -134,8 +149,10 @@ func (f *fakeRestoreBackend) AcquireRestoreLock(context.Context) (RestoreLock, e
 func (f *fakeRestoreBackend) DiscoverRestore(
 	_ context.Context,
 	requestedRunID string,
+	readOnly bool,
 ) (RestoreDiscovery, error) {
 	f.events = append(f.events, "discover:"+requestedRunID)
+	f.discoverReadOnly = append(f.discoverReadOnly, readOnly)
 	return f.discovery, f.fail["discover"]
 }
 
@@ -269,6 +286,32 @@ func TestRestoreCoordinatorRunsExactSafetyOrder(t *testing.T) {
 	}
 }
 
+func TestRestoreCoordinatorSkipsPlanBaselineForNonPlanActions(t *testing.T) {
+	action := restoreTestAction(
+		"run-1", 1, ActionSQLMutation, "non-plan table",
+	)
+	action.ScenarioCode = 101
+	backend := &fakeRestoreBackend{
+		discovery: RestoreDiscovery{
+			Runs:            []RestoreRun{{RunID: "run-1"}},
+			DatabaseActions: []Action{action},
+		},
+		fail: map[string]error{
+			"baseline": errors.New("plan baseline should not run"),
+		},
+	}
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{},
+	)
+	if summary.Failed {
+		t.Fatal(summary.Err)
+	}
+	if strings.Contains(strings.Join(backend.events, ","), "baseline") {
+		t.Fatalf("non-plan restore events=%v", backend.events)
+	}
+}
+
 func TestRestoreCoordinatorKeepsTopologyAndStateValidationWhenModelValidationDisabled(t *testing.T) {
 	backend := &fakeRestoreBackend{
 		discovery: RestoreDiscovery{
@@ -300,7 +343,10 @@ func TestRestoreCoordinatorRunsStartupCallbackBeforeUnlockForActiveOnlyRun(
 	}}
 	summary := NewRestoreCoordinator(backend).Restore(
 		context.Background(),
-		RestoreRequest{afterSuccess: func(context.Context) error {
+		RestoreRequest{afterSuccess: func(_ context.Context, lock RestoreLock) error {
+			if lock == nil || !backend.lockHeld {
+				return errors.New("afterSuccess did not receive the held restore lock")
+			}
 			backend.events = append(backend.events, "start-new-run")
 			return nil
 		}},
@@ -647,6 +693,78 @@ func TestRestoreCoordinatorOrdersRunsNewestFirstAndActionsBySafetyPriority(t *te
 	}
 }
 
+func TestPrepareRestorePlanRestoresStatisticsBeforeAnalyze(t *testing.T) {
+	tests := []struct {
+		scenario string
+		want     []string
+	}{
+		{
+			scenario: "planchange_stats_target",
+			want: []string{
+				`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_target_key SET STATISTICS -1`,
+				`ANALYZE "gsbench".plan_data(stats_target_key)`,
+			},
+		},
+		{
+			scenario: "planchange_stats_ndistinct",
+			want: []string{
+				`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key RESET (n_distinct)`,
+				`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key SET STATISTICS -1`,
+				`ANALYZE "gsbench".plan_data(stats_ndistinct_key)`,
+			},
+		},
+		{
+			scenario: "planchange_stats_extended",
+			want: []string{
+				`ALTER TABLE "gsbench".plan_data ADD STATISTICS ((stats_corr_a,stats_corr_b))`,
+				`SET default_statistics_target=-2`,
+				`ANALYZE "gsbench".plan_data ((stats_corr_a,stats_corr_b))`,
+				`RESET default_statistics_target`,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.scenario, func(t *testing.T) {
+			mutations, err := PlanMutationSet(
+				"run-stats", "gsbench", test.scenario,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actions := make([]Action, len(mutations))
+			for index, mutation := range mutations {
+				mutation.TargetProduct = ProductGaussDB
+				actions[index] = SQLAction(mutation)
+				actions[index].Sequence = int64(index + 1)
+				actions[index].State = MutationApplied
+			}
+			_, ordered, err := prepareRestorePlan(RestoreDiscovery{
+				DatabaseActions: actions,
+			}, "run-stats")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := make([]string, 0, len(ordered))
+			for _, action := range ordered {
+				var payload struct {
+					SQL        string   `json:"sql"`
+					SessionSQL []string `json:"session_sql"`
+				}
+				if err := json.Unmarshal(action.Inverse, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload.SQL != "" {
+					got = append(got, payload.SQL)
+				}
+				got = append(got, payload.SessionSQL...)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("restore SQL=%v want=%v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRestoreCoordinatorMergesDatabaseAndLocalMirrorOnce(t *testing.T) {
 	action := restoreTestAction("run-1", 7, ActionNetworkFirewall, "nft")
 	localMirror := action
@@ -752,6 +870,34 @@ func TestRestoreDryRunDoesNotMutateOrAcquireLocks(t *testing.T) {
 		backend.events, want,
 	) {
 		t.Fatalf("dry-run events=%v want=%v", backend.events, want)
+	}
+	if !reflect.DeepEqual(backend.discoverReadOnly, []bool{true}) {
+		t.Fatalf("dry-run discovery flags=%v", backend.discoverReadOnly)
+	}
+}
+
+func TestRestoreCoordinatorValidatesOwnershipBeforeDiscoveryOrMutation(
+	t *testing.T,
+) {
+	wantErr := errors.New("schema is not owned by gsbench")
+	base := &fakeRestoreBackend{discovery: RestoreDiscovery{
+		Runs: []RestoreRun{{RunID: "run-1"}},
+	}}
+	backend := &ownershipRestoreBackend{
+		fakeRestoreBackend: base,
+		err:                wantErr,
+	}
+
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{},
+	)
+	if !summary.Failed || !errors.Is(summary.Err, wantErr) {
+		t.Fatalf("summary=%+v", summary)
+	}
+	want := []string{"lock", "ownership", "unlock"}
+	if !reflect.DeepEqual(base.events, want) {
+		t.Fatalf("events=%v want=%v", base.events, want)
 	}
 }
 
@@ -1594,6 +1740,108 @@ func TestDatabaseRestoreBackendDiscoveryFailureStillRestoresLocalControlPlaneOnc
 	if len(provider.restored) != 1 ||
 		provider.restored[0].Target != action.Target {
 		t.Fatalf("provider restores=%v want exactly once", provider.restored)
+	}
+}
+
+func TestDryRunDiscoveryFailureNeverRestoresOrWritesLocalLedger(
+	t *testing.T,
+) {
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	ledger := NewFileRecoveryLedger(path)
+	action := restoreTestAction(
+		"run-offline",
+		7,
+		ActionNetworkQDisc,
+		"qdisc-rule",
+	)
+	action.Node = "dn-1"
+	action.State = MutationApplied
+	if err := ledger.Put(context.Background(), action); err != nil {
+		t.Fatal(err)
+	}
+	provider := &recordingRestoreProvider{}
+	environment := Environment{
+		Product: ProductGaussDB, Supported: true,
+		Capabilities: make(CapabilitySet),
+	}
+	backend := &databaseRestoreBackend{
+		cfg: BenchConfig{
+			Database: DatabaseConfig{Database: "postgres"},
+			Data:     DataConfig{Schema: "gsbench"},
+			FaultProvider: FaultProviderConfig{
+				LedgerPath: path,
+			},
+		},
+		store:       &failingDiscoveryActionStore{err: errors.New("discovery unavailable")},
+		ledger:      ledger,
+		provider:    provider,
+		environment: environment,
+		executor: newRestoreDispatchExecutor(
+			nil,
+			provider,
+			environment,
+		),
+	}
+
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{DryRun: true},
+	)
+	if !summary.Failed ||
+		!strings.Contains(summary.Err.Error(), "discovery unavailable") {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if len(provider.restored) != 0 {
+		t.Fatalf("dry-run provider inverses=%v want zero", provider.restored)
+	}
+	pending, err := ledger.Pending(context.Background(), action.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].State != MutationApplied {
+		t.Fatalf("dry-run rewrote local ledger: %+v", pending)
+	}
+}
+
+func TestDatabaseRestoreBackendDryRunAfterMutatingRestoreDoesNotSyncMirrors(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	ledger := NewFileRecoveryLedger(path)
+	action := restoreTestAction(
+		"run-reused",
+		7,
+		ActionNetworkFirewall,
+		"firewall-rule",
+	)
+	action.Node = "dn-1"
+	action.State = MutationApplied
+	if err := ledger.Put(ctx, action); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.MarkRestored(ctx, action.RunID, action.Target); err != nil {
+		t.Fatal(err)
+	}
+	store := &memoryActionStore{entries: []Action{action}}
+	backend := &databaseRestoreBackend{
+		// mutating remains true when a caller reuses a backend after a real
+		// restore. The request-level readOnly bit must still dominate it.
+		mutating: true,
+		cfg: BenchConfig{Data: DataConfig{
+			// Stop after the mirror decision without needing a SQL fixture.
+			Schema: "unsafe schema",
+		}},
+		store:  store,
+		ledger: ledger,
+	}
+
+	_, err := backend.DiscoverRestore(ctx, action.RunID, true)
+	if err == nil || !strings.Contains(err.Error(), "unsafe dataset schema") {
+		t.Fatalf("discovery error=%v", err)
+	}
+	if len(store.states) != 0 {
+		t.Fatalf("dry-run synchronized database mirrors: %v", store.states)
 	}
 }
 

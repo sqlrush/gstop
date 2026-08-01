@@ -82,6 +82,9 @@ var (
 )
 
 func NewFileRecoveryLedger(path string) RecoveryLedger {
+	if absolute, err := filepath.Abs(filepath.Clean(path)); err == nil {
+		path = canonicalDarwinSystemPath(absolute)
+	}
 	return &fileRecoveryLedger{
 		path:          path,
 		syncDirectory: syncRecoveryLedgerDirectory,

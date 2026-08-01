@@ -427,15 +427,15 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 	if !ok {
 		return fmt.Errorf("unsafe schema %q", plan.Schema)
 	}
-	if err := m.ensureSchema(ctx, plan.Schema); err != nil {
+	schemaCreated, err := m.ensureSchema(ctx, plan.Schema)
+	if err != nil {
 		return err
 	}
 	versions, hasVersions := m.exec.(DatasetVersionCatalog)
 	ordinaryDDL := plan.DDL
 	if hasVersions {
-		var err error
 		ordinaryDDL, err = m.bootstrapDatasetVersion(
-			ctx, plan.Schema, plan.DDL, versions,
+			ctx, plan.Schema, plan.DDL, versions, schemaCreated,
 		)
 		if err != nil {
 			return err
@@ -755,6 +755,7 @@ func (m *DatasetManager) bootstrapDatasetVersion(
 	schema string,
 	statements []string,
 	versions DatasetVersionCatalog,
+	schemaCreated bool,
 ) ([]string, error) {
 	catalog, ok := m.exec.(DatasetObjectCatalog)
 	if !ok {
@@ -781,17 +782,42 @@ func (m *DatasetManager) bootstrapDatasetVersion(
 	if err != nil {
 		return nil, fmt.Errorf("inspect bootstrap meta_dataset: %w", err)
 	}
+	version := datasetVersion
 	if !exists {
+		if !schemaCreated {
+			return nil, fmt.Errorf(
+				"dataset schema %q is not owned by gsbench: "+
+					"the pre-existing schema has no trusted "+
+					"meta_dataset/dataset_version ownership marker",
+				schema,
+			)
+		}
 		if err := m.exec.Exec(ctx, statements[metaIndex]); err != nil {
 			return nil, fmt.Errorf("create bootstrap meta_dataset: %w", err)
 		}
-	}
-	version, err := versions.DatasetVersion(ctx, schema)
-	if err != nil {
-		return nil, fmt.Errorf("read dataset version: %w", err)
+		if err := versions.RecordDatasetVersion(
+			ctx,
+			schema,
+			datasetVersion,
+		); err != nil {
+			return nil, fmt.Errorf("record dataset ownership marker: %w", err)
+		}
+	} else {
+		version, err = versions.DatasetVersion(ctx, schema)
+		if err != nil {
+			return nil, fmt.Errorf("read dataset version: %w", err)
+		}
 	}
 	switch version {
-	case "", "1", "2", "3", datasetVersion:
+	case "":
+		if exists {
+			return nil, fmt.Errorf(
+				"dataset schema %q is not owned by gsbench: "+
+					"pre-existing meta_dataset has no dataset_version ownership marker",
+				schema,
+			)
+		}
+	case "1", "2", "3", datasetVersion:
 	default:
 		return nil, fmt.Errorf("unsupported dataset version %q", version)
 	}
@@ -1037,26 +1063,29 @@ func parseDatasetObject(statement string) (DatasetObject, error) {
 	}
 }
 
-func (m *DatasetManager) ensureSchema(ctx context.Context, schema string) error {
+func (m *DatasetManager) ensureSchema(
+	ctx context.Context,
+	schema string,
+) (bool, error) {
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {
-		return fmt.Errorf("unsafe schema %q", schema)
+		return false, fmt.Errorf("unsafe schema %q", schema)
 	}
 	exists, err := m.exec.SchemaExists(ctx, schema)
 	if err != nil {
-		return fmt.Errorf("check schema %s: %w", schema, err)
+		return false, fmt.Errorf("check schema %s: %w", schema, err)
 	}
 	if exists {
-		return nil
+		return false, nil
 	}
 	if err := m.exec.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
 		exists, checkErr := m.exec.SchemaExists(ctx, schema)
 		if checkErr == nil && exists {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("create schema %s: %w", schema, err)
+		return false, fmt.Errorf("create schema %s: %w", schema, err)
 	}
-	return nil
+	return true, nil
 }
 
 func (m *DatasetManager) migrate(

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base32"
 	"errors"
 	"fmt"
@@ -303,10 +304,54 @@ func (d *Database) ExecSession(parent context.Context, statements ...string) err
 		return err
 	}
 	defer conn.Close()
-	for _, statement := range statements {
+	for index, statement := range statements {
 		if _, err := conn.ExecContext(ctx, statement); err != nil {
-			return err
+			executionErr := fmt.Errorf(
+				"execute session statement %d: %w", index+1, err,
+			)
+			if cleanupErr := d.cleanupFailedSession(conn); cleanupErr != nil {
+				discardErr := discardSessionConnection(conn)
+				return errors.Join(
+					executionErr,
+					fmt.Errorf("clean failed session: %w", cleanupErr),
+					discardErr,
+				)
+			}
+			return executionErr
 		}
+	}
+	return nil
+}
+
+func (d *Database) cleanupFailedSession(conn *sql.Conn) error {
+	// The work context may already be canceled (for example after an ANALYZE
+	// timeout). Cleanup therefore gets its own bounded context rooted at the
+	// database lifetime, while still using the exact same physical session.
+	ctx, cancel := d.operationContext(nil)
+	defer cancel()
+	var cleanupErrors []error
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		cleanupErrors = append(
+			cleanupErrors, fmt.Errorf("rollback failed session: %w", err),
+		)
+	}
+	if _, err := conn.ExecContext(ctx, "RESET ALL"); err != nil {
+		cleanupErrors = append(
+			cleanupErrors, fmt.Errorf("reset failed session: %w", err),
+		)
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func discardSessionConnection(conn *sql.Conn) error {
+	// Returning driver.ErrBadConn from Raw tells database/sql to close the
+	// underlying driver connection instead of placing it back in the idle pool.
+	err := conn.Raw(func(any) error { return driver.ErrBadConn })
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("discard failed session connection: %w", err)
 	}
 	return nil
 }

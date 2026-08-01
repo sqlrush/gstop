@@ -3,11 +3,11 @@ package gsbench
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,13 +67,23 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 	if runID == "" && options.Command == "run" {
 		runID = newRunID()
 	}
+	if runID != "" {
+		if err := validateTagComponent("run ID", runID); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
 	logIdentity := runID
 	if logIdentity == "" {
 		logIdentity = options.Command
 	}
 	logPath := ""
 	if !commandIsReadOnly(options.Command, cfg.Run.DryRun) {
-		logPath = filepath.Join("logs", "gsbench_"+logIdentity+".log")
+		logPath, err = runLogPath(cfg.ConfigDir, logIdentity)
+		if err != nil {
+			fmt.Fprintln(stderr, "resolve log path:", err)
+			return 1
+		}
 	}
 	logger, err := NewRunLog(stdout, logPath, Version)
 	if err != nil {
@@ -131,13 +141,13 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 			runID,
 		)
 	case "status":
-		return commandStatus(ctx, db, cfg, logger, options.RunID)
+		return commandStatus(ctx, db, cfg, logger, runID)
 	case "stop":
-		return commandStop(ctx, db, cfg, logger, options.RunID)
+		return commandStop(ctx, db, cfg, logger, runID)
 	case "restore":
-		return commandRestore(ctx, db, cfg, logger, options.RunID)
+		return commandRestore(ctx, db, cfg, logger, runID)
 	case "cleanup":
-		return commandCleanup(ctx, db, cfg, logger, options.RunID, options.WithData)
+		return commandCleanup(ctx, db, cfg, logger, runID, options.WithData)
 	default:
 		logger.Error("unknown command %s", options.Command)
 		return 2
@@ -147,7 +157,9 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 func commandIsReadOnly(command string, dryRun bool) bool {
 	return command == "doctor" ||
 		command == "status" ||
-		(dryRun && (command == "restore" || command == "stop"))
+		(dryRun && (command == "restore" ||
+			command == "stop" ||
+			command == "cleanup"))
 }
 
 func commandDoctor(ctx context.Context, db *Database, cfg BenchConfig, env Environment, log *RunLog) int {
@@ -281,27 +293,19 @@ func commandInit(
 	env Environment,
 	caps Capabilities,
 	log *RunLog,
-) int {
+) (exitCode int) {
 	if !caps.Supported {
 		log.Error("unsupported target product or topology")
 		return 1
 	}
 	if !cfg.Run.DryRun {
-		lockIdentity := fmt.Sprintf(
-			"gsbench:init:%s:%s",
-			cfg.Database.Database,
-			cfg.Data.Schema,
-		)
+		lockIdentity := planDatabaseLockIdentity(cfg)
 		release, err := AcquireDatabaseRunLock(ctx, db, lockIdentity)
 		if err != nil {
-			log.Error("acquire initialization lock: %v", err)
+			log.Error("acquire plan baseline lock for initialization: %v", err)
 			return 1
 		}
-		defer func() {
-			if err := release(); err != nil {
-				log.Error("release initialization lock: %v", err)
-			}
-		}()
+		defer finishInitializationPlanLock(release, log, &exitCode)
 	}
 	exists, err := datasetExists(ctx, db, cfg.Data.Schema)
 	if err != nil {
@@ -394,12 +398,155 @@ func commandInit(
 		cfg.Run.ValidationEnabled,
 		log.Info,
 	)
-	if err := manager.Init(ctx, plan); err != nil {
-		log.Error("initialize dataset: %v", err)
-		return 1
+	backend := newDatabaseRestoreBackend(
+		db,
+		cfg,
+		log,
+		DefaultFaultProviderRegistry(),
+	)
+	if code := executeInitializationMutation(
+		ctx,
+		backend,
+		log,
+		acquireInitializationRestoreLock,
+		func() error { return manager.Init(ctx, plan) },
+	); code != 0 {
+		return code
 	}
 	log.Info("init SUCCESS")
 	return 0
+}
+
+type initializationRestoreLockAcquirer func(
+	context.Context,
+	*databaseRestoreBackend,
+) (RestoreLock, error)
+
+// acquireInitializationRestoreLock is deliberately a single-attempt lock
+// acquisition. Initialization must never trigger recovery side effects merely
+// because the database is unavailable while it is trying to exclude cleanup.
+func acquireInitializationRestoreLock(
+	ctx context.Context,
+	backend *databaseRestoreBackend,
+) (RestoreLock, error) {
+	if backend == nil {
+		return nil, fmt.Errorf("initialization restore backend is unavailable")
+	}
+	acquireLocal := backend.acquireLocalRestoreLock
+	if acquireLocal == nil {
+		acquireLocal = acquireLocalRestoreLock
+	}
+	local, err := acquireLocal(
+		ctx,
+		backend.cfg.FaultProvider.LedgerPath,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"acquire local initialization mutex: %w",
+			err,
+		)
+	}
+	if local == nil {
+		return nil, fmt.Errorf(
+			"acquire local initialization mutex: no lock returned",
+		)
+	}
+	acquireDatabase := backend.acquireDatabaseRestoreLock
+	if acquireDatabase == nil {
+		acquireDatabase = func(
+			acquireCtx context.Context,
+			local RestoreLock,
+		) (RestoreLock, error) {
+			return backend.acquireDatabaseLockWithPlanRequirement(
+				acquireCtx,
+				local,
+				false,
+			)
+		}
+	}
+	lock, lockErr := acquireDatabase(ctx, local)
+	if lockErr != nil {
+		return nil, errors.Join(
+			fmt.Errorf("acquire database initialization mutex: %w", lockErr),
+			wrapRestoreError(
+				"release local initialization mutex",
+				local.Release(),
+			),
+		)
+	}
+	if lock == nil {
+		return nil, errors.Join(
+			fmt.Errorf("acquire database initialization mutex: no lock returned"),
+			wrapRestoreError(
+				"release local initialization mutex",
+				local.Release(),
+			),
+		)
+	}
+	return lock, nil
+}
+
+func executeInitializationMutation(
+	ctx context.Context,
+	backend *databaseRestoreBackend,
+	log *RunLog,
+	acquire initializationRestoreLockAcquirer,
+	mutation func() error,
+) int {
+	if acquire == nil {
+		acquire = acquireInitializationRestoreLock
+	}
+	lock, err := acquire(ctx, backend)
+	if err != nil {
+		log.Error("acquire cleanup exclusion lock for initialization: %v", err)
+		return 1
+	}
+	if lock == nil {
+		log.Error(
+			"acquire cleanup exclusion lock for initialization: no lock returned",
+		)
+		return 1
+	}
+	var mutationErr error
+	if mutation == nil {
+		mutationErr = fmt.Errorf("dataset initialization mutation is unavailable")
+	} else {
+		mutationErr = mutation()
+	}
+	releaseErr := lock.Release()
+	if mutationErr != nil {
+		log.Error("initialize dataset: %v", mutationErr)
+	}
+	if releaseErr != nil {
+		log.Error(
+			"release cleanup exclusion lock after initialization: %v",
+			releaseErr,
+		)
+	}
+	if mutationErr != nil || releaseErr != nil {
+		return 1
+	}
+	return 0
+}
+
+func finishInitializationPlanLock(
+	release func() error,
+	log *RunLog,
+	exitCode *int,
+) {
+	if release == nil {
+		log.Error("release plan baseline lock after initialization: release is unavailable")
+		if exitCode != nil {
+			*exitCode = 1
+		}
+		return
+	}
+	if err := release(); err != nil {
+		log.Error("release plan baseline lock after initialization: %v", err)
+		if exitCode != nil {
+			*exitCode = 1
+		}
+	}
 }
 
 func logDatasetPlan(log *RunLog, cfg BenchConfig, plan DatasetPlan, source string) {
@@ -465,6 +612,120 @@ func commandRun(
 		log.Info("run SUCCESS (dry run, no database mutations)")
 		return 0
 	}
+	exitCode, lockErr := withPlanScenarioDatabaseLock(
+		parent,
+		db,
+		cfg,
+		AcquireDatabaseRunLock,
+		func() int {
+			return commandRunCore(
+				parent,
+				db,
+				cfg,
+				environment,
+				caps,
+				allowRisk,
+				log,
+				runID,
+				quotedSchema,
+			)
+		},
+	)
+	if lockErr != nil {
+		log.Error("plan-change session lock: %v", lockErr)
+		return 1
+	}
+	return exitCode
+}
+
+type databaseRunLockAcquirer func(
+	context.Context,
+	*Database,
+	string,
+) (func() error, error)
+
+func withPlanScenarioDatabaseLock(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	acquire databaseRunLockAcquirer,
+	work func() int,
+) (exitCode int, err error) {
+	if work == nil {
+		return 1, fmt.Errorf("plan-change run callback is unavailable")
+	}
+	if !scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes) {
+		return work(), nil
+	}
+	return withPlanDatabaseLock(ctx, db, cfg, acquire, work)
+}
+
+func withPlanDatabaseLock(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	acquire databaseRunLockAcquirer,
+	work func() int,
+) (exitCode int, err error) {
+	if work == nil {
+		return 1, fmt.Errorf("plan baseline callback is unavailable")
+	}
+	if acquire == nil {
+		return 1, fmt.Errorf("plan baseline lock acquirer is unavailable")
+	}
+	identity := planDatabaseLockIdentity(cfg)
+	release, err := acquire(ctx, db, identity)
+	if err != nil {
+		return 1, fmt.Errorf("acquire plan baseline lock: %w", err)
+	}
+	if release == nil {
+		return 1, fmt.Errorf("plan baseline lock release is unavailable")
+	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil {
+			exitCode = 1
+			err = fmt.Errorf("release plan baseline lock: %w", releaseErr)
+		}
+	}()
+	return work(), nil
+}
+
+func planDatabaseLockIdentity(cfg BenchConfig) string {
+	return fmt.Sprintf(
+		"gsbench:plan:%s:%s",
+		cfg.Database.Database,
+		cfg.Data.Schema,
+	)
+}
+
+func withPlanRunPreparationDatabaseLock(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	alreadyHeld bool,
+	acquire databaseRunLockAcquirer,
+	work func() int,
+) (int, error) {
+	if alreadyHeld {
+		if work == nil {
+			return 1, fmt.Errorf("plan baseline callback is unavailable")
+		}
+		return work(), nil
+	}
+	return withPlanDatabaseLock(ctx, db, cfg, acquire, work)
+}
+
+func commandRunCore(
+	parent context.Context,
+	db *Database,
+	cfg BenchConfig,
+	environment Environment,
+	caps Capabilities,
+	allowRisk RiskLevel,
+	log *RunLog,
+	runID string,
+	quotedSchema string,
+) int {
 	journal := NewSQLJournalWithValidation(
 		db,
 		cfg.Data.Schema,
@@ -476,47 +737,82 @@ func commandRun(
 		log,
 		DefaultFaultProviderRegistry(),
 	)
-	staleSummary := NewRestoreCoordinatorWithValidation(
-		backend,
-		cfg.Run.ValidationEnabled,
-	).Restore(
+	// Run preparation always executes under the outer plan/schema lock.
+	// The restore backend must not try to reacquire that session lock.
+	backend.requirePlanLock = false
+	var staleSummary RestoreSummary
+	prepareRun := func() int {
+		staleSummary = NewRestoreCoordinatorWithValidation(
+			backend,
+			cfg.Run.ValidationEnabled,
+		).Restore(
+			parent,
+			RestoreRequest{afterSuccess: func(
+				ctx context.Context,
+				_ RestoreLock,
+			) error {
+				if scenarioCodesContainPlanChange(
+					cfg.Run.ScenarioCodes,
+				) {
+					activeRunID, err := findActivePlanRun(
+						ctx,
+						db,
+						cfg.Data.Schema,
+					)
+					if err != nil {
+						return fmt.Errorf(
+							"check active plan-change run: %w",
+							err,
+						)
+					}
+					if activeRunID != "" {
+						return fmt.Errorf(
+							"plan-change run %s is already active; "+
+								"stop or restore it first",
+							activeRunID,
+						)
+					}
+					if err := preparePlanRunBaseline(
+						ctx,
+						db,
+						cfg,
+						log,
+						RepairPlanBaseline,
+						VerifyPlanBaseline,
+					); err != nil {
+						return err
+					}
+				}
+				return startRun(ctx, db, cfg, runID)
+			}},
+		)
+		if staleSummary.Failed {
+			log.Error("recover stale state and record run: %v", staleSummary.Err)
+			return 1
+		}
+		if len(staleSummary.RunIDs) != 0 {
+			log.Info(
+				"stale recovery SUCCESS runs=%d actions=%d",
+				len(staleSummary.RunIDs),
+				len(staleSummary.PlannedActions),
+			)
+		}
+		return 0
+	}
+	prepareCode, prepareLockErr := withPlanRunPreparationDatabaseLock(
 		parent,
-		RestoreRequest{afterSuccess: func(ctx context.Context) error {
-			if scenarioCodesContainPlanChange(
-				cfg.Run.ScenarioCodes,
-			) {
-				activeRunID, err := findActivePlanRun(
-					ctx,
-					db,
-					cfg.Data.Schema,
-				)
-				if err != nil {
-					return fmt.Errorf(
-						"check active plan-change run: %w",
-						err,
-					)
-				}
-				if activeRunID != "" {
-					return fmt.Errorf(
-						"plan-change run %s is already active; "+
-							"stop or restore it first",
-						activeRunID,
-					)
-				}
-			}
-			return startRun(ctx, db, cfg, runID)
-		}},
+		db,
+		cfg,
+		scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes),
+		AcquireDatabaseRunLock,
+		prepareRun,
 	)
-	if staleSummary.Failed {
-		log.Error("recover stale state and record run: %v", staleSummary.Err)
+	if prepareLockErr != nil {
+		log.Error("plan baseline lock for stale recovery: %v", prepareLockErr)
 		return 1
 	}
-	if len(staleSummary.RunIDs) != 0 {
-		log.Info(
-			"stale recovery SUCCESS runs=%d actions=%d",
-			len(staleSummary.RunIDs),
-			len(staleSummary.PlannedActions),
-		)
+	if prepareCode != 0 {
+		return prepareCode
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -527,6 +823,10 @@ func commandRun(
 		log,
 		DefaultFaultProviderRegistry(),
 	)
+	// Plan scenarios keep the outer plan/schema lock through Runner restore.
+	// A non-plan run cannot journal plan baseline actions, so requiring the
+	// plan lock here would only make unrelated cleanup conflict with a plan run.
+	restoreBackend.requirePlanLock = false
 	runtime := &Runtime{
 		Config: cfg, Database: db, Capabilities: caps, Journal: journal,
 		Environment: environment, Catalog: DefaultScenarioCatalog(),
@@ -570,6 +870,48 @@ func commandRun(
 		}
 	}
 	return exitCodeForOutcome(summary.Outcome)
+}
+
+type planBaselineRepairFunc func(
+	context.Context,
+	*Database,
+	string,
+) ([]BaselineRepairResult, error)
+
+type planBaselineVerifyFunc func(context.Context, *Database, string) error
+
+func preparePlanRunBaseline(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	log *RunLog,
+	repair planBaselineRepairFunc,
+	verify planBaselineVerifyFunc,
+) error {
+	if repair == nil {
+		return fmt.Errorf("plan baseline repair is unavailable")
+	}
+	results, err := repair(ctx, db, cfg.Data.Schema)
+	for _, result := range results {
+		log.Info(
+			"pre-run plan baseline target=%s status=%s",
+			result.Target,
+			result.Status,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("repair pre-run plan baseline: %w", err)
+	}
+	if !cfg.Run.ValidationEnabled {
+		return nil
+	}
+	if verify == nil {
+		return fmt.Errorf("plan baseline verification is unavailable")
+	}
+	if err := verify(ctx, db, cfg.Data.Schema); err != nil {
+		return fmt.Errorf("verify pre-run plan baseline: %w", err)
+	}
+	return nil
 }
 
 func exitCodeForOutcome(outcome Outcome) int {
@@ -679,37 +1021,115 @@ func commandStatus(ctx context.Context, db *Database, cfg BenchConfig, log *RunL
 }
 
 func commandStop(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string) int {
+	return commandRestoreOperation(ctx, db, cfg, log, runID, "stop", true, nil)
+}
+
+func commandRestoreOperation(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	log *RunLog,
+	runID string,
+	commandName string,
+	requirePlanLock bool,
+	afterSuccess func(context.Context, RestoreLock) error,
+) int {
 	backend := newDatabaseRestoreBackend(
 		db,
 		cfg,
 		log,
 		DefaultFaultProviderRegistry(),
 	)
+	backend.requirePlanLock = requirePlanLock
+	if requirePlanLock && !cfg.Run.DryRun {
+		requestStop := func(requestCtx context.Context) error {
+			return requestRestoreRunsStop(
+				requestCtx,
+				dbDatasetExecutor{db: db, schema: cfg.Data.Schema},
+				cfg.Data.Schema,
+				runID,
+			)
+		}
+		backend.requestPlanLockOwnerStop = requestStop
+		if err := requestStop(ctx); err != nil {
+			log.Info(
+				"%s: initial stop request deferred until database recovery: %v",
+				commandName,
+				err,
+			)
+		}
+	}
 	return executeRestoreService(
 		ctx,
 		NewRestoreCoordinatorWithValidation(
 			backend,
 			cfg.Run.ValidationEnabled,
 		),
-		RestoreRequest{RunID: runID, DryRun: cfg.Run.DryRun},
-		"stop",
+		RestoreRequest{
+			RunID: runID, DryRun: cfg.Run.DryRun,
+			afterSuccess: afterSuccess,
+		},
+		commandName,
 		log,
 	)
 }
 
+type restoreStopRequestExecutor interface {
+	Exec(context.Context, string, ...any) error
+}
+
+func requestRestoreRunsStop(
+	ctx context.Context,
+	executor restoreStopRequestExecutor,
+	schema string,
+	runID string,
+) error {
+	if executor == nil {
+		return fmt.Errorf("restore stop-request executor is unavailable")
+	}
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+	query := "UPDATE " + quotedSchema +
+		".meta_runs SET status='stop_requested'," +
+		"detail='stop requested',updated_at=current_timestamp"
+	ownershipGate := " EXISTS (SELECT 1 FROM " + quotedSchema +
+		".meta_dataset WHERE key='dataset_version'" +
+		" AND value IN ('1','2','3','4'))"
+	if runID == "" {
+		return executor.Exec(
+			ctx,
+			query+" WHERE status='running' AND"+ownershipGate,
+		)
+	}
+	if err := validateTagComponent("run ID", runID); err != nil {
+		return err
+	}
+	return executor.Exec(
+		ctx,
+		query+" WHERE run_id=$1 AND status='running' AND"+ownershipGate,
+		runID,
+	)
+}
+
 type databaseRestoreBackend struct {
-	db          *Database
-	cfg         BenchConfig
-	log         *RunLog
-	store       ActionStore
-	ledger      RecoveryLedger
-	provider    FaultProvider
-	providerErr error
-	environment Environment
-	executor    *restoreDispatchExecutor
-	actionStore *coordinatorActionStore
-	journal     *Journal
-	health      restoreHealthVerifier
+	db                       *Database
+	cfg                      BenchConfig
+	log                      *RunLog
+	store                    ActionStore
+	ledger                   RecoveryLedger
+	provider                 FaultProvider
+	providerErr              error
+	environment              Environment
+	executor                 *restoreDispatchExecutor
+	actionStore              *coordinatorActionStore
+	journal                  *Journal
+	health                   restoreHealthVerifier
+	requirePlanLock          bool
+	requestPlanLockOwnerStop func(context.Context) error
+	acquirePlanRunLock       databaseRunLockAcquirer
+	acquireLocalRestoreLock  func(context.Context, string) (RestoreLock, error)
 
 	databaseActions []Action
 	localActions    []Action
@@ -735,7 +1155,187 @@ type databaseRestoreBackend struct {
 	) error
 }
 
+func (b *databaseRestoreBackend) ValidateRestoreOwnership(
+	ctx context.Context,
+) error {
+	if b.db == nil {
+		// Unit-test restore backends may inject every mutation boundary without
+		// constructing a SQL pool. Production backends always carry b.db.
+		return nil
+	}
+	return validateDatasetOwnership(
+		ctx,
+		dbDatasetExecutor{db: b.db, schema: b.cfg.Data.Schema},
+		b.cfg.Data.Schema,
+	)
+}
+
 var errRestoreBusy = errors.New("restore is busy")
+
+type planFirstRestoreLock struct {
+	once        sync.Once
+	restore     RestoreLock
+	releasePlan func() error
+	err         error
+}
+
+func (l *planFirstRestoreLock) Release() error {
+	if l == nil {
+		return nil
+	}
+	l.once.Do(func() {
+		var errs []error
+		if l.restore != nil {
+			errs = append(errs, l.restore.Release())
+			l.restore = nil
+		}
+		if l.releasePlan != nil {
+			errs = append(errs, l.releasePlan())
+			l.releasePlan = nil
+		}
+		l.err = errors.Join(errs...)
+	})
+	return l.err
+}
+
+func (l *planFirstRestoreLock) DatasetVersion(
+	ctx context.Context,
+	schema string,
+) (string, error) {
+	executor, ok := l.restore.(cleanupDatasetExecutor)
+	if !ok {
+		return "", fmt.Errorf(
+			"restore lock does not expose its protected database session",
+		)
+	}
+	return executor.DatasetVersion(ctx, schema)
+}
+
+func (l *planFirstRestoreLock) Exec(
+	ctx context.Context,
+	query string,
+	args ...any,
+) error {
+	executor, ok := l.restore.(cleanupDatasetExecutor)
+	if !ok {
+		return fmt.Errorf(
+			"restore lock does not expose its protected database session",
+		)
+	}
+	return executor.Exec(ctx, query, args...)
+}
+
+func (b *databaseRestoreBackend) acquirePlanLockForRestore(
+	ctx context.Context,
+) (func() error, error) {
+	acquire := b.acquirePlanRunLock
+	if acquire == nil {
+		acquire = AcquireDatabaseRunLock
+	}
+	identity := planDatabaseLockIdentity(b.cfg)
+	interval := b.restorePollInterval
+	if interval <= 0 {
+		interval = 200 * time.Millisecond
+	}
+	for {
+		if b.requestPlanLockOwnerStop != nil {
+			if err := b.requestPlanLockOwnerStop(ctx); err != nil {
+				requestErr := fmt.Errorf(
+					"request active runs to stop before plan lock: %w",
+					err,
+				)
+				if b.db == nil || b.db.Ping(ctx) != nil {
+					return nil, newRestoreDatabaseConnectivityError(requestErr)
+				}
+				return nil, requestErr
+			}
+		}
+		release, err := acquire(ctx, b.db, identity)
+		if err == nil {
+			if release == nil {
+				return nil, fmt.Errorf("plan restore lock release is unavailable")
+			}
+			return release, nil
+		}
+		if ctx.Err() != nil {
+			return nil, errors.Join(
+				fmt.Errorf("acquire plan restore lock: %w", err),
+				ctx.Err(),
+			)
+		}
+		if b.db == nil {
+			return nil, newRestoreDatabaseConnectivityError(err)
+		}
+		if pingErr := b.db.Ping(ctx); pingErr != nil {
+			return nil, newRestoreDatabaseConnectivityError(
+				errors.Join(err, pingErr),
+			)
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, errors.Join(
+				fmt.Errorf("acquire plan restore lock: %w", err),
+				ctx.Err(),
+			)
+		case <-timer.C:
+		}
+	}
+}
+
+func (b *databaseRestoreBackend) acquirePlanFirstRestoreLock(
+	ctx context.Context,
+) (RestoreLock, error) {
+	releasePlan, err := b.acquirePlanLockForRestore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	acquireLocal := b.acquireLocalRestoreLock
+	if acquireLocal == nil {
+		acquireLocal = acquireLocalRestoreLock
+	}
+	local, err := acquireLocal(ctx, b.cfg.FaultProvider.LedgerPath)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("acquire local restore mutex: %w", err),
+			wrapRestoreError("release plan restore lock", releasePlan()),
+		)
+	}
+	acquireDatabase := b.acquireDatabaseRestoreLock
+	if acquireDatabase == nil {
+		acquireDatabase = func(
+			acquireCtx context.Context,
+			local RestoreLock,
+		) (RestoreLock, error) {
+			return b.acquireDatabaseLockWithPlanRequirement(
+				acquireCtx,
+				local,
+				false,
+			)
+		}
+	}
+	restoreLock, err := acquireDatabase(ctx, local)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("acquire database restore lock: %w", err),
+			wrapRestoreError("release local restore mutex", local.Release()),
+			wrapRestoreError("release plan restore lock", releasePlan()),
+		)
+	}
+	if restoreLock == nil {
+		return nil, errors.Join(
+			fmt.Errorf("acquire database restore lock: no lock returned"),
+			wrapRestoreError("release local restore mutex", local.Release()),
+			wrapRestoreError("release plan restore lock", releasePlan()),
+		)
+	}
+	return &planFirstRestoreLock{
+		restore: restoreLock, releasePlan: releasePlan,
+	}, nil
+}
 
 type restoreDatabaseConnectivityError struct {
 	err error
@@ -871,6 +1471,7 @@ func newDatabaseRestoreBackend(
 		ledger:   NewFileRecoveryLedger(cfg.FaultProvider.LedgerPath),
 		provider: provider, providerErr: providerErr,
 		environment: environment, executor: executor,
+		requirePlanLock:     true,
 		cancelTagged:        db.CancelTagged,
 		terminateTagged:     db.TerminateTagged,
 		taggedSessionState:  db.TaggedSessionState,
@@ -891,9 +1492,49 @@ type databaseRestoreLock struct {
 	once  sync.Once
 	db    *Database
 	conn  *sql.Conn
-	key   string
+	keys  []string
 	local RestoreLock
 	err   error
+}
+
+func (l *databaseRestoreLock) DatasetVersion(
+	ctx context.Context,
+	schema string,
+) (string, error) {
+	if l == nil || l.db == nil || l.conn == nil {
+		return "", fmt.Errorf("protected restore database session is unavailable")
+	}
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return "", fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+	opCtx, cancel := l.db.operationContext(ctx)
+	defer cancel()
+	var version string
+	err := l.conn.QueryRowContext(
+		opCtx,
+		"SELECT value FROM "+quotedSchema+
+			".meta_dataset WHERE key=$1",
+		"dataset_version",
+	).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return version, err
+}
+
+func (l *databaseRestoreLock) Exec(
+	ctx context.Context,
+	query string,
+	args ...any,
+) error {
+	if l == nil || l.db == nil || l.conn == nil {
+		return fmt.Errorf("protected restore database session is unavailable")
+	}
+	opCtx, cancel := l.db.operationContext(ctx)
+	defer cancel()
+	_, err := l.conn.ExecContext(opCtx, query, args...)
+	return err
 }
 
 func (l *databaseRestoreLock) Release() error {
@@ -903,23 +1544,10 @@ func (l *databaseRestoreLock) Release() error {
 	l.once.Do(func() {
 		var errs []error
 		if l.conn != nil {
-			ctx, cancel := l.db.operationContext(context.Background())
-			var unlocked bool
-			err := l.conn.QueryRowContext(
-				ctx,
-				"SELECT pg_advisory_unlock(hashtext($1))",
-				l.key,
-			).Scan(&unlocked)
-			cancel()
-			if err != nil {
-				errs = append(errs, fmt.Errorf(
-					"release database advisory lock: %w", err,
-				))
-			} else if !unlocked {
-				errs = append(errs, fmt.Errorf(
-					"database advisory lock was not held",
-				))
-			}
+			errs = append(
+				errs,
+				releaseDatabaseAdvisoryKeys(l.db, l.conn, l.keys),
+			)
 			if err := l.conn.Close(); err != nil {
 				errs = append(errs, fmt.Errorf(
 					"close restore lock connection: %w", err,
@@ -938,13 +1566,129 @@ func (l *databaseRestoreLock) Release() error {
 	return l.err
 }
 
+func releaseDatabaseAdvisoryKeys(
+	db *Database,
+	conn *sql.Conn,
+	keys []string,
+) error {
+	var errs []error
+	discard := false
+	for index := len(keys) - 1; index >= 0; index-- {
+		key := keys[index]
+		ctx, cancel := db.operationContext(context.Background())
+		var unlocked bool
+		err := conn.QueryRowContext(
+			ctx,
+			"SELECT pg_advisory_unlock(hashtext($1))",
+			key,
+		).Scan(&unlocked)
+		cancel()
+		if err != nil {
+			discard = true
+			errs = append(errs, fmt.Errorf(
+				"release database advisory lock %q: %w",
+				key,
+				err,
+			))
+		} else if !unlocked {
+			discard = true
+			errs = append(errs, fmt.Errorf(
+				"database advisory lock %q was not held",
+				key,
+			))
+		}
+	}
+	if discard {
+		if err := discardDatabaseAdvisoryConnection(conn); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func discardDatabaseAdvisoryConnection(conn *sql.Conn) error {
+	if conn == nil {
+		return fmt.Errorf("discard advisory-lock connection: connection is unavailable")
+	}
+	err := conn.Raw(func(any) error { return driver.ErrBadConn })
+	if err == nil || errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, sql.ErrConnDone) {
+		return nil
+	}
+	return fmt.Errorf("discard advisory-lock connection: %w", err)
+}
+
 func (b *databaseRestoreBackend) AcquireRestoreLock(
 	ctx context.Context,
 ) (RestoreLock, error) {
-	local, err := acquireLocalRestoreLock(
+	if b.requirePlanLock {
+		return b.acquireRestoreLockPlanFirst(ctx)
+	}
+	return b.acquireRestoreLockLocalFirst(ctx)
+}
+
+func (b *databaseRestoreBackend) acquireRestoreLockPlanFirst(
+	ctx context.Context,
+) (RestoreLock, error) {
+	lock, initialErr := b.acquirePlanFirstRestoreLock(ctx)
+	if initialErr == nil {
+		b.mutating = true
+		return lock, nil
+	}
+	if !isRestoreDatabaseConnectivityError(initialErr) {
+		return nil, initialErr
+	}
+
+	acquireLocal := b.acquireLocalRestoreLock
+	if acquireLocal == nil {
+		acquireLocal = acquireLocalRestoreLock
+	}
+	local, localAcquireErr := acquireLocal(
 		ctx,
 		b.cfg.FaultProvider.LedgerPath,
 	)
+	if localAcquireErr != nil {
+		return nil, errors.Join(
+			fmt.Errorf("initial plan restore lock: %w", initialErr),
+			fmt.Errorf(
+				"acquire local control-plane recovery mutex: %w",
+				localAcquireErr,
+			),
+		)
+	}
+	localErr := b.restoreLocalControlPlane(ctx)
+	releaseLocalErr := local.Release()
+
+	waitForDatabase := b.waitForDatabaseFn
+	if waitForDatabase == nil {
+		waitForDatabase = b.waitForDatabase
+	}
+	waitErr := waitForDatabase(ctx)
+	var retryErr error
+	if waitErr == nil {
+		lock, retryErr = b.acquirePlanFirstRestoreLock(ctx)
+		if retryErr == nil {
+			b.mutating = true
+			return lock, nil
+		}
+	}
+	return nil, errors.Join(
+		fmt.Errorf("initial plan restore lock: %w", initialErr),
+		wrapRestoreError("restore local control-plane actions", localErr),
+		wrapRestoreError("release local control-plane recovery mutex", releaseLocalErr),
+		wrapRestoreError("reconnect restore database", waitErr),
+		wrapRestoreError("retry plan-first restore lock", retryErr),
+	)
+}
+
+func (b *databaseRestoreBackend) acquireRestoreLockLocalFirst(
+	ctx context.Context,
+) (RestoreLock, error) {
+	acquireLocal := b.acquireLocalRestoreLock
+	if acquireLocal == nil {
+		acquireLocal = acquireLocalRestoreLock
+	}
+	local, err := acquireLocal(ctx, b.cfg.FaultProvider.LedgerPath)
 	if err != nil {
 		return nil, err
 	}
@@ -996,15 +1740,41 @@ func (b *databaseRestoreBackend) acquireDatabaseLock(
 	ctx context.Context,
 	local RestoreLock,
 ) (RestoreLock, error) {
+	return b.acquireDatabaseLockWithPlanRequirement(
+		ctx,
+		local,
+		b.requirePlanLock,
+	)
+}
+
+func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
+	ctx context.Context,
+	local RestoreLock,
+	requirePlanLock bool,
+) (RestoreLock, error) {
 	if b.db == nil || b.db.pool == nil {
 		return nil, newRestoreDatabaseConnectivityError(
 			errors.New("database restore connection is unavailable"),
 		)
 	}
-	opCtx, cancel := b.db.operationContext(ctx)
-	conn, err := b.db.pool.Conn(opCtx)
+	if requirePlanLock && b.requestPlanLockOwnerStop != nil {
+		if err := b.requestPlanLockOwnerStop(ctx); err != nil {
+			requestErr := fmt.Errorf(
+				"request active runs to stop before plan lock: %w",
+				err,
+			)
+			if pingErr := b.db.Ping(ctx); pingErr != nil {
+				return nil, newRestoreDatabaseConnectivityError(
+					errors.Join(requestErr, pingErr),
+				)
+			}
+			return nil, requestErr
+		}
+	}
+	openCtx, cancelOpen := b.db.operationContext(ctx)
+	conn, err := b.db.pool.Conn(openCtx)
+	cancelOpen()
 	if err != nil {
-		cancel()
 		sessionErr := fmt.Errorf(
 			"open database restore lock session: %w",
 			err,
@@ -1014,32 +1784,147 @@ func (b *databaseRestoreBackend) acquireDatabaseLock(
 		}
 		return nil, newRestoreDatabaseConnectivityError(sessionErr)
 	}
-	key := "gsbench/restore/" + b.cfg.Database.Database + "/" +
-		b.cfg.Data.Schema
-	var acquired bool
-	err = conn.QueryRowContext(
-		opCtx,
-		"SELECT pg_try_advisory_lock(hashtext($1))",
-		key,
-	).Scan(&acquired)
-	cancel()
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("acquire database advisory lock: %w", err)
-	}
-	if !acquired {
-		_ = conn.Close()
-		return nil, newRestoreBusyError(
-			fmt.Sprintf(
-				"database %s schema %s",
-				b.cfg.Database.Database,
-				b.cfg.Data.Schema,
-			),
-		)
+	keys := restoreDatabaseAdvisoryKeys(b.cfg, requirePlanLock)
+	acquiredKeys := make([]string, 0, len(keys))
+	for _, key := range keys {
+		for {
+			queryCtx, cancelQuery := b.db.operationContext(ctx)
+			var acquired bool
+			err = conn.QueryRowContext(
+				queryCtx,
+				"SELECT pg_try_advisory_lock(hashtext($1))",
+				key,
+			).Scan(&acquired)
+			cancelQuery()
+			if err != nil {
+				acquireErr := fmt.Errorf(
+					"acquire database advisory lock %q: %w",
+					key,
+					err,
+				)
+				releaseErr := releaseDatabaseAdvisoryKeys(
+					b.db,
+					conn,
+					acquiredKeys,
+				)
+				discardErr := discardDatabaseAdvisoryConnection(conn)
+				return nil, errors.Join(
+					acquireErr,
+					wrapRestoreError(
+						"release partially acquired database advisory locks",
+						releaseErr,
+					),
+					wrapRestoreError(
+						"discard uncertain database advisory-lock session",
+						discardErr,
+					),
+					wrapRestoreError(
+						"close database restore lock session",
+						conn.Close(),
+					),
+				)
+			}
+			if acquired {
+				break
+			}
+			busyErr := newRestoreBusyError(
+				fmt.Sprintf(
+					"database %s schema %s lock %s",
+					b.cfg.Database.Database,
+					b.cfg.Data.Schema,
+					key,
+				),
+			)
+			if !requirePlanLock || key != planDatabaseLockIdentity(b.cfg) {
+				return nil, errors.Join(
+					busyErr,
+					wrapRestoreError(
+						"release partially acquired database advisory locks",
+						releaseDatabaseAdvisoryKeys(
+							b.db,
+							conn,
+							acquiredKeys,
+						),
+					),
+					wrapRestoreError(
+						"close database restore lock session",
+						conn.Close(),
+					),
+				)
+			}
+			// The plan owner can insert meta_runs after the initial stop request
+			// but before its first mutation. Repeat the request on every busy
+			// observation so that a late row is still seen by watchStop.
+			if b.requestPlanLockOwnerStop != nil {
+				if requestErr := b.requestPlanLockOwnerStop(ctx); requestErr != nil {
+					return nil, errors.Join(
+						fmt.Errorf(
+							"repeat stop request while plan lock is busy: %w",
+							requestErr,
+						),
+						wrapRestoreError(
+							"release partially acquired database advisory locks",
+							releaseDatabaseAdvisoryKeys(
+								b.db,
+								conn,
+								acquiredKeys,
+							),
+						),
+						wrapRestoreError(
+							"close database restore lock session",
+							conn.Close(),
+						),
+					)
+				}
+			}
+			interval := b.restorePollInterval
+			if interval <= 0 {
+				interval = 200 * time.Millisecond
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return nil, errors.Join(
+					busyErr,
+					ctx.Err(),
+					wrapRestoreError(
+						"release partially acquired database advisory locks",
+						releaseDatabaseAdvisoryKeys(
+							b.db,
+							conn,
+							acquiredKeys,
+						),
+					),
+					wrapRestoreError(
+						"close database restore lock session",
+						conn.Close(),
+					),
+				)
+			case <-timer.C:
+			}
+		}
+		acquiredKeys = append(acquiredKeys, key)
 	}
 	return &databaseRestoreLock{
-		db: b.db, conn: conn, key: key, local: local,
+		db: b.db, conn: conn, keys: keys, local: local,
 	}, nil
+}
+
+func restoreDatabaseAdvisoryKeys(
+	cfg BenchConfig,
+	requirePlanLock bool,
+) []string {
+	keys := make([]string, 0, 2)
+	if requirePlanLock {
+		keys = append(keys, planDatabaseLockIdentity(cfg))
+	}
+	return append(
+		keys,
+		"gsbench/restore/"+cfg.Database.Database+"/"+cfg.Data.Schema,
+	)
 }
 
 func (b *databaseRestoreBackend) restoreLocalControlPlane(
@@ -1106,6 +1991,7 @@ func (b *databaseRestoreBackend) restoreLocalControlPlane(
 func (b *databaseRestoreBackend) DiscoverRestore(
 	ctx context.Context,
 	requested string,
+	readOnly bool,
 ) (RestoreDiscovery, error) {
 	var discovery RestoreDiscovery
 	allLocal, localErr := b.localActionSnapshot(ctx, requested)
@@ -1124,6 +2010,12 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 	if requested == "" {
 		staleRuns, err := b.store.StaleRuns(ctx)
 		if err != nil {
+			if readOnly {
+				return discovery, fmt.Errorf(
+					"discover pending database runs: %w",
+					err,
+				)
+			}
 			return discovery, errors.Join(
 				fmt.Errorf("discover pending database runs: %w", err),
 				wrapRestoreError(
@@ -1140,6 +2032,13 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 		}
 		actions, err := b.store.Pending(ctx, runID)
 		if err != nil {
+			if readOnly {
+				return discovery, fmt.Errorf(
+					"discover database actions for run %s: %w",
+					runID,
+					err,
+				)
+			}
 			return discovery, errors.Join(
 				fmt.Errorf(
 					"discover database actions for run %s: %w",
@@ -1157,7 +2056,7 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 			actions...,
 		)
 	}
-	if b.mutating {
+	if b.mutating && !readOnly {
 		var err error
 		discovery.DatabaseActions, err = b.syncRestoredLocalMirrors(
 			ctx,
@@ -1571,15 +2470,8 @@ func (b *databaseRestoreBackend) VerifyRestore(
 			))
 		}
 	}
-	exists, err := b.planBaselineExists(ctx)
-	if err != nil {
+	if err := b.verifyPlanBaselineForActions(ctx, actions); err != nil {
 		errs = append(errs, err)
-	} else if exists {
-		if err := VerifyPlanBaseline(ctx, b.db, b.cfg.Data.Schema); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"verify benchmark baseline: %w", err,
-			))
-		}
 	}
 	if !b.environment.Supported {
 		errs = append(errs, fmt.Errorf(
@@ -1596,6 +2488,26 @@ func (b *databaseRestoreBackend) VerifyRestore(
 		errs = append(errs, fmt.Errorf("verify topology health: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+func (b *databaseRestoreBackend) verifyPlanBaselineForActions(
+	ctx context.Context,
+	actions []Action,
+) error {
+	if !restoreActionsContainPlanChange(actions) {
+		return nil
+	}
+	exists, err := b.planBaselineExists(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if err := VerifyPlanBaseline(ctx, b.db, b.cfg.Data.Schema); err != nil {
+		return fmt.Errorf("verify benchmark baseline: %w", err)
+	}
+	return nil
 }
 
 func (b *databaseRestoreBackend) planBaselineExists(
@@ -1655,41 +2567,159 @@ func (b *databaseRestoreBackend) MarkRestoreOutcome(
 }
 
 func commandRestore(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string) int {
-	backend := newDatabaseRestoreBackend(
-		db,
-		cfg,
-		log,
-		DefaultFaultProviderRegistry(),
-	)
-	return executeRestoreService(
-		ctx,
-		NewRestoreCoordinatorWithValidation(
-			backend,
-			cfg.Run.ValidationEnabled,
-		),
-		RestoreRequest{RunID: runID, DryRun: cfg.Run.DryRun},
-		"restore",
-		log,
+	return commandRestoreOperation(
+		ctx, db, cfg, log, runID, "restore", true, nil,
 	)
 }
 
 func commandCleanup(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string, withData bool) int {
-	if code := commandStop(ctx, db, cfg, log, runID); code != 0 {
+	if withData && strings.TrimSpace(runID) != "" {
+		log.Error("cleanup --data cannot be combined with --run-id")
+		return 1
+	}
+	if !withData {
+		if code := commandStop(ctx, db, cfg, log, runID); code != 0 {
+			return code
+		}
+		log.Info("cleanup SUCCESS")
+		return 0
+	}
+	if cfg.Run.DryRun {
+		if code := commandRestoreOperation(
+			ctx, db, cfg, log, runID, "stop", true, nil,
+		); code != 0 {
+			return code
+		}
+		if code := cleanupData(ctx, db, cfg, log); code != 0 {
+			return code
+		}
+		log.Info("cleanup SUCCESS")
+		return 0
+	}
+	// RestoreCoordinator invokes afterSuccess before releasing restore/local/
+	// plan locks. Keeping ownership verification and DROP in this callback
+	// closes the gap in which a new run could otherwise start.
+	afterSuccess := func(
+		callbackCtx context.Context,
+		lock RestoreLock,
+	) error {
+		return cleanupDataAfterRestore(callbackCtx, lock, cfg, log)
+	}
+	code := commandRestoreOperation(
+		ctx, db, cfg, log, runID, "stop", true, afterSuccess,
+	)
+	if code != 0 {
 		return code
 	}
-	if withData {
-		quotedSchema, ok := quoteDatasetSchema(cfg.Data.Schema)
-		if !ok {
-			log.Error("unsafe dataset schema %q", cfg.Data.Schema)
-			return 1
-		}
-		if _, err := db.Exec(ctx, "DROP SCHEMA "+quotedSchema+" CASCADE"); err != nil {
-			log.Error("drop benchmark schema: %v", err)
-			return 1
-		}
-		log.Info("removed schema=%s (not recoverable except by gsbench init)", cfg.Data.Schema)
-	}
 	log.Info("cleanup SUCCESS")
+	return 0
+}
+
+func cleanupDataAfterRestore(
+	ctx context.Context,
+	lock RestoreLock,
+	cfg BenchConfig,
+	log *RunLog,
+) error {
+	executor, ok := lock.(cleanupDatasetExecutor)
+	if !ok {
+		return fmt.Errorf(
+			"protected restore lock does not expose its database session",
+		)
+	}
+	if code := cleanupDataWithExecutor(ctx, executor, cfg, log); code != 0 {
+		return fmt.Errorf("drop benchmark schema after restore")
+	}
+	return nil
+}
+
+func cleanupData(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	log *RunLog,
+) int {
+	return cleanupDataWithExecutor(
+		ctx,
+		dbDatasetExecutor{db: db, schema: cfg.Data.Schema},
+		cfg,
+		log,
+	)
+}
+
+type cleanupDatasetExecutor interface {
+	DatasetVersion(context.Context, string) (string, error)
+	Exec(context.Context, string, ...any) error
+}
+
+type datasetOwnershipCatalog interface {
+	DatasetVersion(context.Context, string) (string, error)
+}
+
+func validateDatasetOwnership(
+	ctx context.Context,
+	catalog datasetOwnershipCatalog,
+	schema string,
+) error {
+	if catalog == nil {
+		return fmt.Errorf("dataset ownership catalog is unavailable")
+	}
+	version, err := catalog.DatasetVersion(ctx, schema)
+	if err != nil {
+		return fmt.Errorf("read dataset_version ownership marker: %w", err)
+	}
+	switch version {
+	case "1", "2", "3", datasetVersion:
+		return nil
+	case "":
+		return fmt.Errorf("missing gsbench dataset_version ownership marker")
+	default:
+		return fmt.Errorf(
+			"unsupported gsbench dataset_version %q",
+			version,
+		)
+	}
+}
+
+func cleanupDataWithExecutor(
+	ctx context.Context,
+	executor cleanupDatasetExecutor,
+	cfg BenchConfig,
+	log *RunLog,
+) int {
+	quotedSchema, ok := quoteDatasetSchema(cfg.Data.Schema)
+	if !ok {
+		log.Error("unsafe dataset schema %q", cfg.Data.Schema)
+		return 1
+	}
+	if cfg.Run.DryRun {
+		log.Info("DRY-RUN DROP SCHEMA %s CASCADE", quotedSchema)
+		return 0
+	}
+	if executor == nil {
+		log.Error("verify benchmark schema ownership: dataset executor is unavailable")
+		return 1
+	}
+	if err := validateDatasetOwnership(
+		ctx,
+		executor,
+		cfg.Data.Schema,
+	); err != nil {
+		log.Error(
+			"refuse to drop schema=%s: %v",
+			cfg.Data.Schema,
+			err,
+		)
+		return 1
+	}
+	if err := executor.Exec(ctx, "DROP SCHEMA "+quotedSchema+" CASCADE"); err != nil {
+		log.Error("drop benchmark schema: %v", err)
+		return 1
+	}
+	log.Info(
+		"removed schema=%s (not recoverable except by gsbench init)",
+		cfg.Data.Schema,
+	)
 	return 0
 }
 

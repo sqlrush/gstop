@@ -2,12 +2,16 @@ package gsbench
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type RunLog struct {
@@ -15,6 +19,29 @@ type RunLog struct {
 	screen io.Writer
 	file   *os.File
 	now    func() time.Time
+}
+
+func runLogPath(configDir, identity string) (string, error) {
+	identity = strings.TrimSpace(identity)
+	if err := validateTagComponent("run ID", identity); err != nil {
+		return "", err
+	}
+	configDir = strings.TrimSpace(configDir)
+	if configDir == "" {
+		return "", fmt.Errorf("config directory is required for run log")
+	}
+	absoluteDir, err := filepath.Abs(filepath.Clean(configDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve config directory for run log: %w", err)
+	}
+	logDir := filepath.Join(absoluteDir, "logs")
+	path := filepath.Join(logDir, "gsbench_"+identity+".log")
+	relative, err := filepath.Rel(logDir, path)
+	if err != nil || relative == ".." ||
+		strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe run ID %q for log path", identity)
+	}
+	return filepath.Clean(path), nil
 }
 
 func NewRunLog(screen io.Writer, path, version string) (*RunLog, error) {
@@ -28,10 +55,7 @@ func NewRunLog(screen io.Writer, path, version string) (*RunLog, error) {
 	if path == "" {
 		return logger, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create log directory: %w", err)
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	file, err := openRunLogFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open run log: %w", err)
 	}
@@ -48,6 +72,54 @@ func NewRunLog(screen io.Writer, path, version string) (*RunLog, error) {
 	}
 	logger.file = file
 	return logger, nil
+}
+
+func openRunLogFile(path string) (*os.File, error) {
+	absolute, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("resolve path: %w", err)
+	}
+	absolute = canonicalDarwinSystemPath(absolute)
+
+	// Reuse the recovery ledger's descriptor-pinned directory walk so no
+	// ancestor can redirect log creation through a symbolic link.
+	directory := &fileRecoveryLedger{}
+	parent, err := directory.openPinnedParent(absolute, true)
+	if err != nil {
+		return nil, fmt.Errorf("open trusted directory: %w", err)
+	}
+	defer unix.Close(parent.descriptor)
+
+	descriptor, err := unix.Openat(
+		parent.descriptor,
+		parent.targetName,
+		unix.O_CREAT|unix.O_WRONLY|unix.O_APPEND|
+			unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK,
+		0o640,
+	)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return nil, fmt.Errorf(
+				"run log %q must not be a symlink",
+				parent.targetName,
+			)
+		}
+		return nil, fmt.Errorf("open %q: %w", parent.targetName, err)
+	}
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(descriptor, &stat); err != nil {
+		_ = unix.Close(descriptor)
+		return nil, fmt.Errorf("inspect %q: %w", parent.targetName, err)
+	}
+	if uint32(stat.Mode)&unix.S_IFMT != unix.S_IFREG {
+		_ = unix.Close(descriptor)
+		return nil, fmt.Errorf(
+			"run log %q must be a regular file",
+			parent.targetName,
+		)
+	}
+	return os.NewFile(uintptr(descriptor), absolute), nil
 }
 
 func (l *RunLog) Info(format string, args ...any) {

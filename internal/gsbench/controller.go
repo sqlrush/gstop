@@ -2,6 +2,7 @@ package gsbench
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 )
@@ -11,6 +12,7 @@ type Sample struct {
 	Available  bool
 	Errors     int64
 	Throughput float64
+	Err        error
 }
 
 type Actuator interface {
@@ -34,6 +36,7 @@ type ControlResult struct {
 	Ceiling        bool
 	Actual         float64
 	LastSuccessful float64
+	ReachableMax   float64
 	Workers        int
 	Samples        int
 	Err            error
@@ -46,12 +49,27 @@ type Controller struct {
 }
 
 func (c Controller) Run(ctx context.Context) ControlResult {
+	return c.run(ctx, false)
+}
+
+// RunUntil continuously regulates the actuator until the context completes,
+// an execution dependency fails, or repeated samples confirm that the worker
+// ceiling cannot reach the target. Entering the target band is retained as
+// evidence but does not stop regulation.
+func (c Controller) RunUntil(ctx context.Context) ControlResult {
+	return c.run(ctx, true)
+}
+
+func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 	cfg := c.Config
-	if cfg.Step <= 0 {
-		cfg.Step = 1
-	}
 	if cfg.MinWorkers <= 0 {
 		cfg.MinWorkers = 1
+	}
+	if cfg.MaxWorkers < cfg.MinWorkers {
+		cfg.MaxWorkers = cfg.MinWorkers
+	}
+	if cfg.Step <= 0 {
+		cfg.Step = max(1, (cfg.MaxWorkers-cfg.MinWorkers+9)/10)
 	}
 	if cfg.RequiredSamples <= 0 {
 		cfg.RequiredSamples = 3
@@ -65,72 +83,123 @@ func (c Controller) Run(ctx context.Context) ControlResult {
 	if cfg.Tolerance <= 0 {
 		cfg.Tolerance = 2
 	}
+	if c.Actuator == nil {
+		return ControlResult{Err: fmt.Errorf("controller actuator is unavailable")}
+	}
+	if c.Sample == nil {
+		return ControlResult{Err: fmt.Errorf("controller sampler is unavailable")}
+	}
 	if err := c.Actuator.SetTarget(cfg.MinWorkers); err != nil {
 		return ControlResult{Err: err}
 	}
-	var result ControlResult
+	result := ControlResult{Workers: c.Actuator.Target()}
 	var inBand int
-	var previousErrors int64
+	var ceilingSamples int
+	var haveReachable bool
 	for {
-		if err := waitContext(ctx, cfg.Interval); err != nil {
-			result.Err = err
+		if err := ctx.Err(); err != nil {
+			if !continuous {
+				result.Err = err
+			}
 			result.Workers = c.Actuator.Target()
 			return result
 		}
 		sample := c.Sample(ctx)
 		result.Samples++
 		current := c.Actuator.Target()
-		if result.Samples >= cfg.MaxSamples && !(sample.Available && math.Abs(sample.Value-cfg.Target) <= cfg.Tolerance && inBand+1 >= cfg.RequiredSamples) {
-			result.Workers = current
+		result.Workers = current
+		if sample.Err != nil {
+			result.Err = sample.Err
+			return result
+		}
+		if sample.Errors > 0 {
+			result.Err = fmt.Errorf("workload execution errors=%d", sample.Errors)
 			return result
 		}
 		if !sample.Available {
-			if current >= cfg.MaxWorkers {
-				result.Ceiling = true
-				result.Workers = current
-				return result
-			}
-			if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+cfg.Step)); err != nil {
-				result.Err = err
-				return result
-			}
-			continue
-		}
-		result.Actual = sample.Value
-		result.LastSuccessful = sample.Value
-		if sample.Errors > previousErrors && current > cfg.MinWorkers {
-			_ = c.Actuator.SetTarget(max(cfg.MinWorkers, current-cfg.Step))
-			previousErrors = sample.Errors
 			inBand = 0
-			continue
-		}
-		previousErrors = sample.Errors
-		if math.Abs(sample.Value-cfg.Target) <= cfg.Tolerance {
-			inBand++
-			if inBand >= cfg.RequiredSamples {
-				result.Reached = true
-				result.Workers = current
-				return result
+			if continuous {
+				result.Reached = false
 			}
-			continue
-		}
-		inBand = 0
-		switch {
-		case sample.Value < cfg.Target:
 			if current >= cfg.MaxWorkers {
-				result.Ceiling = true
-				result.Workers = current
-				return result
+				ceilingSamples++
+				if ceilingSamples >= cfg.RequiredSamples {
+					result.Ceiling = true
+					return result
+				}
+			} else {
+				ceilingSamples = 0
+				if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+cfg.Step)); err != nil {
+					result.Err = err
+					return result
+				}
+				result.Workers = c.Actuator.Target()
 			}
-			if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+cfg.Step)); err != nil {
+		} else {
+			result.Actual = sample.Value
+			result.LastSuccessful = sample.Value
+			if !haveReachable || sample.Value > result.ReachableMax {
+				result.ReachableMax = sample.Value
+				haveReachable = true
+			}
+			if math.Abs(sample.Value-cfg.Target) <= cfg.Tolerance {
+				inBand++
+				ceilingSamples = 0
+				if inBand >= cfg.RequiredSamples {
+					result.Reached = true
+					if !continuous {
+						return result
+					}
+				}
+			} else {
+				inBand = 0
+				if continuous {
+					result.Reached = false
+				}
+				switch {
+				case sample.Value < cfg.Target:
+					if current >= cfg.MaxWorkers {
+						ceilingSamples++
+						if ceilingSamples >= cfg.RequiredSamples {
+							result.Ceiling = true
+							return result
+						}
+					} else {
+						ceilingSamples = 0
+						if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+cfg.Step)); err != nil {
+							result.Err = err
+							return result
+						}
+						result.Workers = c.Actuator.Target()
+					}
+				case sample.Value > cfg.Target && current > cfg.MinWorkers:
+					ceilingSamples = 0
+					if err := c.Actuator.SetTarget(max(cfg.MinWorkers, current-cfg.Step)); err != nil {
+						result.Err = err
+						return result
+					}
+					result.Workers = c.Actuator.Target()
+				default:
+					ceilingSamples = 0
+				}
+			}
+		}
+		if !continuous && result.Samples >= cfg.MaxSamples {
+			return result
+		}
+		if err := ctx.Err(); err != nil {
+			if !continuous {
 				result.Err = err
-				return result
 			}
-		case sample.Value > cfg.Target && current > cfg.MinWorkers:
-			if err := c.Actuator.SetTarget(max(cfg.MinWorkers, current-cfg.Step)); err != nil {
+			result.Workers = c.Actuator.Target()
+			return result
+		}
+		if err := waitContext(ctx, cfg.Interval); err != nil {
+			if !continuous {
 				result.Err = err
-				return result
 			}
+			result.Workers = c.Actuator.Target()
+			return result
 		}
 	}
 }

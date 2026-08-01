@@ -791,6 +791,188 @@ func TestFormalJournalMigrationFailsClosedWhenLegacyScenarioNameWasLost(t *testi
 	}
 }
 
+func TestLegacyPlanCacheMigrationConvergesScenarioCodeContract(t *testing.T) {
+	statements, err := legacyPlanCacheMigrationStatements(
+		"gsbench",
+		map[string]bool{
+			"signature": true, "scenario": true, "sql_text": true,
+			"plan_text": true, "updated_at": true,
+		},
+		"meta_plan_cache_pkey",
+		"PRIMARY KEY (signature, scenario)",
+		"HASH (signature)",
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := strings.Join(statements, "\n")
+	for _, token := range []string{
+		`ALTER TABLE "gsbench".meta_plan_cache ADD COLUMN scenario_code integer`,
+		"scenario_code=CASE scenario",
+		"WHEN 'memory_workmem_sort' THEN 201",
+		"WHEN 'plan_stats_target' THEN 601",
+		"ELSE NULL END",
+		"ALTER COLUMN scenario_code SET NOT NULL",
+		`DROP CONSTRAINT "meta_plan_cache_pkey"`,
+		"ADD PRIMARY KEY (signature,scenario_code)",
+		"DROP COLUMN scenario",
+		"DISTRIBUTE BY HASH (signature)",
+	} {
+		if !strings.Contains(sqlText, token) {
+			t.Errorf("plan cache migration missing %q:\n%s", token, sqlText)
+		}
+	}
+	if strings.Contains(sqlText, "ELSE 0") {
+		t.Fatalf("plan cache migration silently maps scenarios to zero:\n%s", sqlText)
+	}
+	update := strings.Index(sqlText, "scenario_code=CASE scenario")
+	notNull := strings.Index(sqlText, "ALTER COLUMN scenario_code SET NOT NULL")
+	dropScenario := strings.Index(sqlText, "DROP COLUMN scenario")
+	if update < 0 || notNull < update || dropScenario < notNull {
+		t.Fatalf("plan cache migration order is unsafe:\n%s", sqlText)
+	}
+}
+
+func TestFormalPlanCacheMigrationIsIdempotent(t *testing.T) {
+	statements, err := legacyPlanCacheMigrationStatements(
+		"gsbench",
+		map[string]bool{
+			"signature": true, "scenario_code": true, "sql_text": true,
+			"plan_text": true, "updated_at": true,
+		},
+		"meta_plan_cache_pkey",
+		"PRIMARY KEY (signature, scenario_code)",
+		"HASH (signature)",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := strings.Join(statements, "\n")
+	for _, forbidden := range []string{
+		"ADD COLUMN", "DROP CONSTRAINT", "ADD PRIMARY KEY",
+		"DROP COLUMN", "DISTRIBUTE BY",
+	} {
+		if strings.Contains(sqlText, forbidden) {
+			t.Fatalf(
+				"formal plan cache migration contains %q:\n%s",
+				forbidden,
+				sqlText,
+			)
+		}
+	}
+}
+
+type fakePlanCacheScreenDatabase struct {
+	invalidRows   int64
+	collisionRows int64
+	queries       []string
+	execCalls     int
+}
+
+func (d *fakePlanCacheScreenDatabase) Scan(
+	_ context.Context,
+	query string,
+	_ []any,
+	dest ...any,
+) error {
+	d.queries = append(d.queries, query)
+	value := d.invalidRows
+	if strings.Contains(query, "HAVING count(*)>1") {
+		value = d.collisionRows
+	}
+	*(dest[0].(*int64)) = value
+	return nil
+}
+
+func (d *fakePlanCacheScreenDatabase) Exec(
+	context.Context,
+	string,
+	...any,
+) (sql.Result, error) {
+	d.execCalls++
+	return nil, errors.New("destructive DDL reached plan-cache preflight")
+}
+
+func (*fakePlanCacheScreenDatabase) Query(
+	context.Context,
+	string,
+	...any,
+) (journalRows, error) {
+	return nil, errors.New("unexpected plan-cache query")
+}
+
+func TestLegacyPlanCacheScreenRejectsUnknownScenarioBeforeDDL(t *testing.T) {
+	db := &fakePlanCacheScreenDatabase{invalidRows: 1}
+	err := screenLegacyPlanCacheRows(
+		context.Background(),
+		db,
+		"gsbench",
+		map[string]bool{"scenario": true},
+	)
+	if err == nil || !strings.Contains(err.Error(), "unknown scenario") {
+		t.Fatalf("screenLegacyPlanCacheRows() error=%v", err)
+	}
+	if db.execCalls != 0 || len(db.queries) != 1 {
+		t.Fatalf("screen queries=%v exec_calls=%d", db.queries, db.execCalls)
+	}
+	if !strings.Contains(db.queries[0], "ELSE NULL END") ||
+		strings.Contains(db.queries[0], "ELSE 0") {
+		t.Fatalf("unknown-scenario screen is not fail-closed: %s", db.queries[0])
+	}
+}
+
+func TestLegacyPlanCacheScreenRejectsAliasCollisionBeforeDDL(t *testing.T) {
+	db := &fakePlanCacheScreenDatabase{collisionRows: 1}
+	err := screenLegacyPlanCacheRows(
+		context.Background(),
+		db,
+		"gsbench",
+		map[string]bool{"scenario": true},
+	)
+	if err == nil || !strings.Contains(err.Error(), "scenario-code collision") {
+		t.Fatalf("screenLegacyPlanCacheRows() error=%v", err)
+	}
+	if db.execCalls != 0 || len(db.queries) != 2 ||
+		!strings.Contains(db.queries[1], "HAVING count(*)>1") {
+		t.Fatalf("screen queries=%v exec_calls=%d", db.queries, db.execCalls)
+	}
+}
+
+func TestFormalPlanCacheScreenRejectsUnmappableCodeBeforeDDL(t *testing.T) {
+	db := &fakePlanCacheScreenDatabase{invalidRows: 1}
+	err := screenLegacyPlanCacheRows(
+		context.Background(),
+		db,
+		"gsbench",
+		map[string]bool{"scenario_code": true},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid scenario code") {
+		t.Fatalf("screenLegacyPlanCacheRows() error=%v", err)
+	}
+	if db.execCalls != 0 || len(db.queries) != 1 ||
+		!strings.Contains(db.queries[0], "scenario_code NOT IN") {
+		t.Fatalf("screen queries=%v exec_calls=%d", db.queries, db.execCalls)
+	}
+}
+
+func TestPlanCacheMigrationRejectsRowsWithoutScenarioIdentity(t *testing.T) {
+	db := &fakePlanCacheScreenDatabase{}
+	err := screenLegacyPlanCacheRows(
+		context.Background(),
+		db,
+		"gsbench",
+		map[string]bool{"signature": true},
+	)
+	if err == nil || !strings.Contains(err.Error(), "scenario identity") {
+		t.Fatalf("screenLegacyPlanCacheRows() error=%v", err)
+	}
+	if db.execCalls != 0 || len(db.queries) != 0 {
+		t.Fatalf("screen queries=%v exec_calls=%d", db.queries, db.execCalls)
+	}
+}
+
 func TestMigratedLegacyJournalRowsLoadAndRestoreThroughTypedEngine(t *testing.T) {
 	db := &fakeJournalDatabase{queryRows: [][]any{
 		{
@@ -1266,6 +1448,7 @@ func TestDatasetDistributionMatchesExactCanonicalStrategyAndKeys(t *testing.T) {
 }
 
 var (
+	_ DatasetExecutor             = dbDatasetExecutor{}
 	_ DatasetObjectCatalog        = dbDatasetExecutor{}
 	_ DatasetVersionCatalog       = dbDatasetExecutor{}
 	_ DatasetAtomicBatchExecutor  = dbDatasetExecutor{}

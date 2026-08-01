@@ -1,8 +1,12 @@
 package gsbench
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResourceWorkloadSQLUsesQuotedAllowlistedSchema(t *testing.T) {
@@ -28,6 +32,27 @@ func TestDistributedStreamScenariosRequireTheirNamedStreamEvidence(t *testing.T)
 	})
 	if verified.Outcome != OutcomeSuccess {
 		t.Fatalf("shuffle with direct stream evidence failed: %+v", verified)
+	}
+}
+
+func TestObserveRequiredStreamSupportsMultiColumnExplainRows(t *testing.T) {
+	pool := sql.OpenDB(&explainRowsTestConnector{rows: &explainRowsTestRows{
+		columns: []string{"id", "operation", "detail"},
+		values:  [][]driver.Value{{int64(1), "Streaming", "type: REDISTRIBUTE"}},
+	}})
+	t.Cleanup(func() { _ = pool.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	scenario := &resourceScenario{workload: ResourceWorkload{Statement: "SELECT 1", RequiredStream: "REDISTRIBUTE"}}
+	err := scenario.observeRequiredStream(ctx, &Runtime{
+		Database:    &Database{pool: pool, ctx: ctx, cancel: cancel},
+		Environment: Environment{Nodes: []Node{{Name: "dn_1", Role: NodeRoleDNPrimary}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(scenario.evidence.plan, "Streaming\ttype: REDISTRIBUTE") {
+		t.Fatalf("multi-column plan was not retained: %q", scenario.evidence.plan)
 	}
 }
 
@@ -98,5 +123,79 @@ func TestApprovedResourceWorkloadsHaveBoundedSQLAndOwnedSessionCleanup(t *testin
 	ingress, _ := ResourceWorkloadFor(322, "gsbench", centralizedFixture())
 	if !strings.Contains(ingress.Statement, "network_ingress(run_id,dist_key,seq,payload)") {
 		t.Fatalf("ingress is not a client parameterized insert: %s", ingress.Statement)
+	}
+}
+
+func TestTotalMemoryScenarioUsesBoundedWorkerStrategy(t *testing.T) {
+	scenario := newTotalMemoryScenario("memory_total_pressure")
+	if got := scenario.Strategy(); got != "memory_pressure_workers" {
+		t.Fatalf("strategy=%q want memory_pressure_workers", got)
+	}
+}
+
+func TestTotalMemoryScenarioUsesConfiguredWorkerBudgetAndRejectsUnsafeTarget(t *testing.T) {
+	defaults, err := LoadConfig(writeTestConfig(t, minimalConfig()), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultScenario := newTotalMemoryScenario("memory_total_pressure")
+	if err := defaultScenario.Prepare(context.Background(), &Runtime{Config: defaults, Database: &Database{}}); err != nil {
+		t.Fatal(err)
+	}
+	if defaultScenario.target != 4 {
+		t.Fatalf("default memory workers=%d want=4", defaultScenario.target)
+	}
+	if err := defaultScenario.Stop(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	configured, err := LoadConfig(writeTestConfig(t, minimalConfig()+`
+[scenario.memory_total_pressure]
+workers = 3
+
+[safety]
+max_workers = 4
+`), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scenario := newTotalMemoryScenario("memory_total_pressure")
+	if err := scenario.Prepare(context.Background(), &Runtime{Config: configured, Database: &Database{}}); err != nil {
+		t.Fatal(err)
+	}
+	if scenario.target != 3 {
+		t.Fatalf("configured memory workers=%d want=3", scenario.target)
+	}
+	if err := scenario.Stop(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	unsafe, err := LoadConfig(writeTestConfig(t, minimalConfig()+`
+[scenario.memory_total_pressure]
+workers = 3
+
+[safety]
+max_workers = 2
+`), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newTotalMemoryScenario("memory_total_pressure").Prepare(context.Background(), &Runtime{Config: unsafe, Database: &Database{}}); err == nil {
+		t.Fatal("memory worker target exceeding the safety maximum was accepted")
+	}
+}
+
+func TestTotalMemoryScenarioHoldReturnsWorkerErrorsImmediately(t *testing.T) {
+	group := &WorkerGroup{}
+	group.errors.Store(1)
+	group.firstError = "memory worker failed"
+	scenario := &totalMemoryScenario{composite: memoryComposite{scenarios: []*resourceScenario{{workers: &sqlWorkload{group: group}}}}}
+	started := time.Now()
+	err := scenario.Hold(context.Background(), &Runtime{Config: BenchConfig{Run: RunConfig{Duration: 100 * time.Millisecond}}})
+	if err == nil || !strings.Contains(err.Error(), "memory worker failed") {
+		t.Fatalf("hold error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 50*time.Millisecond {
+		t.Fatalf("hold waited %s after a known worker error", elapsed)
 	}
 }

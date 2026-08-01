@@ -2,6 +2,7 @@ package gsbench
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.1.0"
+const Version = "v1.1.1"
 
 const ConfigEnv = "GSBENCH_CONFIG"
 
@@ -66,7 +67,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	}
 	command := strings.ToLower(args[0])
 	if command == "help" || command == "-h" || command == "--help" || command == "version" || command == "--version" || command == "-version" {
-		return CLIOptions{Command: command, ConfigPath: defaultBenchConfigPath()}, nil
+		return CLIOptions{Command: command}, nil
 	}
 	if _, ok := lifecycleCommands[command]; !ok {
 		return CLIOptions{}, fmt.Errorf("unknown command %q", command)
@@ -124,6 +125,12 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 			scenarios = flags.Arg(0)
 		}
 	}
+	if command == "cleanup" && options.WithData &&
+		strings.TrimSpace(options.RunID) != "" {
+		return CLIOptions{}, fmt.Errorf(
+			"cleanup --data cannot be combined with --run-id",
+		)
+	}
 	if allowRiskSet {
 		options.AllowRisk = RiskLevel(allowRiskText)
 		if riskLevelRank(options.AllowRisk) == 0 {
@@ -131,7 +138,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 		}
 	}
 	if configPath == "" {
-		configPath = defaultBenchConfigPath()
+		configPath = strings.TrimSpace(os.Getenv(ConfigEnv))
 	}
 	options.ConfigPath = configPath
 	if durationText != "" {
@@ -170,14 +177,82 @@ func resolveScenarioInputs(inputs []string) ([]ScenarioDefinition, error) {
 	return definitions, nil
 }
 
-func defaultBenchConfigPath() string {
-	if path := strings.TrimSpace(os.Getenv(ConfigEnv)); path != "" {
-		return path
+func resolveConfigPath(explicit string, executable string, cwd string) (string, error) {
+	cwd, err := filepath.Abs(filepath.Clean(cwd))
+	if err != nil {
+		return "", fmt.Errorf("resolve current directory for config discovery: %w", err)
 	}
-	if _, err := os.Stat("gsbench.cfg"); err == nil {
-		return "gsbench.cfg"
+	resolve := func(path string) (string, error) {
+		path = strings.TrimSpace(path)
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(cwd, path)
+		}
+		absolute, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			return "", err
+		}
+		return filepath.Clean(absolute), nil
 	}
-	return filepath.Join("configs", "gsbench.cfg")
+	regularConfig := func(path string) (bool, error) {
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return info.Mode().IsRegular(), nil
+	}
+
+	if strings.TrimSpace(explicit) != "" {
+		path, err := resolve(explicit)
+		if err != nil {
+			return "", fmt.Errorf("resolve configured config path: %w", err)
+		}
+		regular, err := regularConfig(path)
+		if err != nil {
+			return "", fmt.Errorf("inspect configured config path %q: %w", path, err)
+		}
+		if !regular {
+			return "", fmt.Errorf("configured config path %q does not exist or is not a regular file", path)
+		}
+		return path, nil
+	}
+
+	candidates := []string{
+		filepath.Join(cwd, "gsbench.cfg"),
+		filepath.Join(cwd, "configs", "gsbench.cfg"),
+	}
+	if strings.TrimSpace(executable) != "" {
+		executablePath, err := resolve(executable)
+		if err != nil {
+			return "", fmt.Errorf("resolve executable for config discovery: %w", err)
+		}
+		executableDir := filepath.Dir(executablePath)
+		candidates = append(
+			candidates,
+			filepath.Join(executableDir, "gsbench.cfg"),
+			filepath.Join(filepath.Dir(executableDir), "configs", "gsbench.cfg"),
+		)
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	searched := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if _, duplicate := seen[candidate]; duplicate {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		searched = append(searched, candidate)
+		regular, err := regularConfig(candidate)
+		if err != nil {
+			return "", fmt.Errorf("inspect config candidate %q: %w", candidate, err)
+		}
+		if regular {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("gsbench config not found; searched %s", strings.Join(searched, ", "))
 }
 
 func RunCLI(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -206,9 +281,27 @@ func RunCLI(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "scenarios":
 		printScenarios(stdout)
 		return 0
-	default:
-		return executeCommand(ctx, options, stdout, stderr)
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(stderr, "resolve config: current directory:", err)
+		return 1
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(stderr, "resolve config: executable:", err)
+		return 1
+	}
+	options.ConfigPath, err = resolveConfigPath(
+		options.ConfigPath,
+		executable,
+		cwd,
+	)
+	if err != nil {
+		fmt.Fprintln(stderr, "resolve config:", err)
+		return 1
+	}
+	return executeCommand(ctx, options, stdout, stderr)
 }
 
 func printUsage(w io.Writer) {
@@ -217,6 +310,7 @@ func printUsage(w io.Writer) {
   gsbench run [-s LIST] [-d DURATION]
   gsbench run SCENARIO[,SCENARIO...]
   gsbench restore [--run-id RUN_ID]
+	gsbench cleanup [--data]
   gsbench init --size 100GB
 
 Options:
@@ -225,13 +319,14 @@ Options:
   -d, --duration VALUE   total ramp+hold duration, for example 30s or 5m
       --profile VALUE    data profile: quick or stress
       --dry-run          validate and show actions without workload mutation
-      --run-id ID        select one run for status, stop, or cleanup
+      --run-id ID        select one run for status, stop, or restore; cannot combine with cleanup --data
       --data             also remove benchmark data during cleanup
       --size VALUE       init target data size, for example 100GB or 1.5TB (maximum 2TB)
       --allow-risk A|B|C explicitly authorize the maximum permitted scenario risk
 
 Configuration:
   -c/--config > GSBENCH_CONFIG > ./gsbench.cfg > ./configs/gsbench.cfg
+  > executable-dir/gsbench.cfg > executable-parent/configs/gsbench.cfg
 
 Scenarios:
 `)

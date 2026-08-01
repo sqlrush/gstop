@@ -18,7 +18,7 @@ type RestoreRequest struct {
 	RunID  string
 	DryRun bool
 
-	afterSuccess     func(context.Context) error
+	afterSuccess     func(context.Context, RestoreLock) error
 	completedOutcome Outcome
 }
 
@@ -153,7 +153,7 @@ func (l *localRestoreLock) Release() error {
 
 type RestoreCoordinatorBackend interface {
 	AcquireRestoreLock(context.Context) (RestoreLock, error)
-	DiscoverRestore(context.Context, string) (RestoreDiscovery, error)
+	DiscoverRestore(context.Context, string, bool) (RestoreDiscovery, error)
 	MarkRestoreRequested(context.Context, string) error
 	StopTaggedSessions(context.Context, string) error
 	RestoreActionGroup(context.Context, []Action) error
@@ -161,6 +161,10 @@ type RestoreCoordinatorBackend interface {
 	RedetectTopology(context.Context) error
 	VerifyRestore(context.Context, []string, []Action) error
 	MarkRestoreOutcome(context.Context, string, Outcome) error
+}
+
+type restoreOwnershipValidator interface {
+	ValidateRestoreOwnership(context.Context) error
 }
 
 type restoreDeadlineBackend interface {
@@ -215,7 +219,11 @@ func (r *RestoreCoordinator) Restore(
 	}
 
 	if request.DryRun {
-		discovery, err := r.backend.DiscoverRestore(ctx, request.RunID)
+		discovery, err := r.backend.DiscoverRestore(
+			ctx,
+			request.RunID,
+			true,
+		)
 		runs, actions, mergeErr := prepareRestorePlan(discovery, request.RunID)
 		err = errors.Join(err, mergeErr)
 		if err != nil {
@@ -247,8 +255,25 @@ func (r *RestoreCoordinator) Restore(
 			nil, nil, fmt.Errorf("acquire restore mutex: no lock returned"),
 		)
 	}
+	if validator, ok := r.backend.(restoreOwnershipValidator); ok {
+		if err := validator.ValidateRestoreOwnership(ctx); err != nil {
+			releaseErr := lock.Release()
+			return failedRestoreSummary(
+				nil,
+				nil,
+				errors.Join(
+					fmt.Errorf("validate restore schema ownership: %w", err),
+					wrapRestoreError("release restore mutex", releaseErr),
+				),
+			)
+		}
+	}
 
-	discovery, discoverErr := r.backend.DiscoverRestore(ctx, request.RunID)
+	discovery, discoverErr := r.backend.DiscoverRestore(
+		ctx,
+		request.RunID,
+		false,
+	)
 	runs, actions, planErr := prepareRestorePlan(discovery, request.RunID)
 	if err := errors.Join(discoverErr, planErr); err != nil {
 		releaseErr := lock.Release()
@@ -290,8 +315,10 @@ func (r *RestoreCoordinator) Restore(
 		}
 	}
 
-	if err := r.backend.RepairBaseline(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("repair benchmark baseline: %w", err))
+	if restoreActionsContainPlanChange(actions) {
+		if err := r.backend.RepairBaseline(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("repair benchmark baseline: %w", err))
+		}
 	}
 	if err := r.backend.RedetectTopology(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("re-detect topology: %w", err))
@@ -328,7 +355,7 @@ func (r *RestoreCoordinator) Restore(
 	)
 	cancelFinalization()
 	if len(errs) == 0 && request.afterSuccess != nil {
-		if err := request.afterSuccess(ctx); err != nil {
+		if err := request.afterSuccess(ctx, lock); err != nil {
 			errs = append(errs, fmt.Errorf(
 				"complete restore-protected operation: %w",
 				err,
@@ -350,6 +377,15 @@ func (r *RestoreCoordinator) Restore(
 		Failed:         err != nil,
 		Err:            err,
 	}
+}
+
+func restoreActionsContainPlanChange(actions []Action) bool {
+	for _, action := range actions {
+		if isPlanChangeCode(action.ScenarioCode) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *RestoreCoordinator) markTerminalRestoreOutcomes(
@@ -1100,6 +1136,12 @@ func restoreActionOrder(action Action) (restoreStage, int) {
 	case ActionNodeRole:
 		return restoreStageConfiguration, 1
 	case ActionSQLMutation, ActionDataBaseline:
+		if statement, ok := sqlStatementFromActionPayload(action.Inverse); ok {
+			fields := strings.Fields(statement)
+			if len(fields) > 0 && strings.EqualFold(fields[0], "ANALYZE") {
+				return restoreStageDatabase, 1
+			}
+		}
 		return restoreStageDatabase, 0
 	default:
 		return restoreStageDatabase, 1

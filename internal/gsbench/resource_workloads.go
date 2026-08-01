@@ -250,18 +250,11 @@ func (s *resourceScenario) observeRequiredStream(ctx context.Context, rt *Runtim
 		return err
 	}
 	defer rows.Close()
-	var lines []string
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
-			return err
-		}
-		lines = append(lines, line)
-	}
-	if err := rows.Err(); err != nil {
+	plan, err := scanExplainRows(rows.Rows)
+	if err != nil {
 		return err
 	}
-	s.evidence.plan = strings.Join(lines, "\n")
+	s.evidence.plan = plan
 	if !strings.Contains(strings.ToUpper(s.evidence.plan), s.workload.RequiredStream) {
 		return fmt.Errorf("required %s stream was not present in EXPLAIN", s.workload.RequiredStream)
 	}
@@ -507,15 +500,18 @@ func resourcePressureTarget(code ScenarioCode, capacity, safetyMaximum int) (int
 	}
 	target := capacity + 1
 	if target > safetyMaximum {
-		return 0, fmt.Errorf("safety maximum %d cannot exceed resource capacity %d", safetyMaximum, capacity)
+		return 0, fmt.Errorf("thread queue target is unreachable: actual workers=%d require=%d session ceiling=%d", capacity, target, safetyMaximum)
 	}
 	return target, nil
 }
 
 type resourcePressureScenario struct {
 	*resourceScenario
-	target   int
-	capacity int
+	target         int
+	status         ThreadPoolStatus
+	sessionCeiling int
+	established    int
+	peakPending    int
 }
 
 func newResourcePressureScenario(code ScenarioCode, name string) *resourcePressureScenario {
@@ -523,35 +519,138 @@ func newResourcePressureScenario(code ScenarioCode, name string) *resourcePressu
 }
 
 func (s *resourcePressureScenario) Strategy() string {
-	return "thread_pool_queue_multi_session_pressure"
+	return "thread_pool_queue_observed_pending"
 }
 
 func (s *resourcePressureScenario) Prepare(ctx context.Context, rt *Runtime) error {
+	if rt == nil || rt.Database == nil {
+		return sql.ErrConnDone
+	}
+	status, err := sampleThreadPoolStatus(ctx, rt)
+	if err != nil {
+		return fmt.Errorf("thread queue actual worker status is unavailable: %w", err)
+	}
+	facts, err := probeConnectionCapacity(ctx, rt)
+	if err != nil {
+		return err
+	}
+	sessionCeiling := threadSessionCapacity(facts.InstanceMax, facts.Reserved, facts.Existing, rt.Config.Safety.MaxWorkers, rt.Config.Safety.MaxConnections)
+	target, err := resourcePressureTarget(s.code, status.Actual, sessionCeiling)
+	if err != nil {
+		return err
+	}
 	if err := s.resourceScenario.Prepare(ctx, rt); err != nil {
 		return err
 	}
-	capacity := runtimeInt(rt, "scenario.threadpool_queue.worker_capacity", max(1, rt.Config.Safety.MaxWorkers/2))
-	target, err := resourcePressureTarget(s.code, capacity, rt.Config.Safety.MaxWorkers)
-	if err != nil {
-		return err
-	}
-	s.capacity, s.target = capacity, target
+	s.status, s.sessionCeiling, s.target = status, sessionCeiling, target
 	return nil
 }
 
-func (s *resourcePressureScenario) Ramp(context.Context, *Runtime) error {
-	return s.workers.SetTarget(s.target)
+func (s *resourcePressureScenario) Ramp(ctx context.Context, rt *Runtime) error {
+	if s.workers == nil {
+		return fmt.Errorf("thread queue workload is unavailable")
+	}
+	if err := s.workers.SetTarget(s.target); err != nil {
+		return err
+	}
+	return s.waitForSessions(ctx, rt)
 }
 
-func (s *resourcePressureScenario) Verify(ctx context.Context, rt *Runtime) (Result, error) {
-	result, err := s.resourceScenario.Verify(ctx, rt)
-	if err != nil {
-		return result, err
+func (s *resourcePressureScenario) waitForSessions(ctx context.Context, rt *Runtime) error {
+	timeout := 5 * time.Second
+	if rt != nil && rt.Config.Safety.QueryTimeout > 0 {
+		timeout = rt.Config.Safety.QueryTimeout
 	}
-	result.Evidence = append(result.Evidence,
-		Evidence{Metric: "configured_resource_capacity", Actual: float64(s.capacity), Available: true},
-		Evidence{Metric: "concurrent_pressure_sessions", Target: float64(s.target), Actual: float64(s.workers.Snapshot().Target), Available: true},
-	)
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		snapshot := s.workers.Snapshot()
+		if err := workerSnapshotError(snapshot); err != nil {
+			return fmt.Errorf("thread queue target is unreachable while establishing %d sessions: %w", s.target, err)
+		}
+		s.workers.mu.Lock()
+		established := len(s.workers.sessions)
+		s.workers.mu.Unlock()
+		if established >= s.target {
+			s.established = established
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("thread queue target is unreachable: established sessions=%d require=%d actual workers=%d session ceiling=%d", established, s.target, s.status.Actual, s.sessionCeiling)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *resourcePressureScenario) Hold(ctx context.Context, rt *Runtime) error {
+	if s.workers == nil {
+		return fmt.Errorf("thread queue workload is unavailable")
+	}
+	if err := workerSnapshotError(s.workers.Snapshot()); err != nil {
+		return err
+	}
+	if rt == nil || rt.Database == nil {
+		return sql.ErrConnDone
+	}
+	interval := rt.Config.Run.RampInterval
+	if interval <= 0 {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	timer := time.NewTimer(rt.Config.Run.Duration)
+	defer timer.Stop()
+	for {
+		if err := workerSnapshotError(s.workers.Snapshot()); err != nil {
+			return err
+		}
+		status, err := sampleThreadPoolStatus(ctx, rt)
+		if err != nil {
+			return err
+		}
+		s.status = status
+		if status.Pending > s.peakPending {
+			s.peakPending = status.Pending
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *resourcePressureScenario) Verify(context.Context, *Runtime) (Result, error) {
+	if s.workers == nil {
+		return Result{}, fmt.Errorf("thread queue workload is unavailable")
+	}
+	snapshot := s.workers.Snapshot()
+	result := Result{Scenario: s.name, Outcome: OutcomeFailed, Evidence: []Evidence{
+		{Metric: "operations", Actual: float64(snapshot.Operations), Available: true},
+		{Metric: "thread_pool_actual_workers", Actual: float64(s.status.Actual), Available: s.status.Actual > 0},
+		{Metric: "thread_pool_idle_workers", Actual: float64(s.status.Idle), Available: s.status.Actual > 0},
+		{Metric: "thread_pool_pending_sessions", Actual: float64(s.peakPending), Available: s.status.Actual > 0},
+		{Metric: "thread_queue_session_ceiling", Target: float64(s.target), Actual: float64(s.sessionCeiling), Available: s.sessionCeiling > 0},
+	}}
+	switch {
+	case snapshot.Errors > 0:
+		result.Message = workerSnapshotError(snapshot).Error()
+	case s.established < s.target:
+		result.Message = fmt.Sprintf("thread queue established %d sessions; require %d", s.established, s.target)
+	case s.peakPending <= 0:
+		result.Message = "thread queue produced no observed pending work"
+	default:
+		result.Outcome = OutcomeSuccess
+		result.Message = "thread queue pending work observed with established workload sessions"
+	}
 	return result, nil
 }
 
@@ -627,7 +726,7 @@ func (c *memoryComposite) Stop(ctx context.Context) error {
 type totalMemoryScenario struct {
 	name      string
 	composite memoryComposite
-	control   ControlResult
+	target    int
 }
 
 func newTotalMemoryScenario(name string) *totalMemoryScenario {
@@ -635,9 +734,16 @@ func newTotalMemoryScenario(name string) *totalMemoryScenario {
 }
 func (s *totalMemoryScenario) Code() ScenarioCode { return 207 }
 func (s *totalMemoryScenario) Name() string       { return s.name }
-func (s *totalMemoryScenario) Strategy() string   { return "composite_total_memory_controller" }
+func (s *totalMemoryScenario) Strategy() string   { return "memory_pressure_workers" }
 
 func (s *totalMemoryScenario) Prepare(ctx context.Context, rt *Runtime) error {
+	if rt == nil {
+		return sql.ErrConnDone
+	}
+	target := runtimeInt(rt, "scenario.memory_total_pressure.workers", 4)
+	if target < 1 || target > rt.Config.Safety.MaxWorkers {
+		return fmt.Errorf("memory pressure workers %d exceed safety maximum %d", target, rt.Config.Safety.MaxWorkers)
+	}
 	plan, err := memoryLifecycleFor(s.Code())
 	if err != nil {
 		return err
@@ -650,25 +756,40 @@ func (s *totalMemoryScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		}
 		s.composite.scenarios = append(s.composite.scenarios, child)
 	}
+	s.target = target
 	return nil
 }
 
-func (s *totalMemoryScenario) Ramp(ctx context.Context, rt *Runtime) error {
-	minimum := len(s.composite.scenarios)
-	if rt.Config.Safety.MaxWorkers < minimum {
-		return fmt.Errorf("total memory requires at least %d safe workers", minimum)
+func (s *totalMemoryScenario) Ramp(context.Context, *Runtime) error {
+	if len(s.composite.scenarios) == 0 {
+		return fmt.Errorf("memory pressure workload is unavailable")
 	}
-	s.control = (Controller{Config: ControllerConfig{Target: float64(runtimeInt(rt, "scenario.memory_total_pressure.target_percent", 90)), MinWorkers: minimum, MaxWorkers: minimum, Step: 1, RequiredSamples: 1, Interval: rt.Config.Run.RampInterval}, Actuator: &s.composite, Sample: func(context.Context) Sample {
-		return Sample{Available: false, Errors: s.composite.Snapshot().Errors}
-	}}).Run(ctx)
-	return s.control.Err
+	return s.composite.SetTarget(s.target)
 }
 func (s *totalMemoryScenario) Hold(ctx context.Context, rt *Runtime) error {
-	return waitContext(ctx, rt.Config.Run.Duration)
+	if err := workerSnapshotError(s.composite.Snapshot()); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(rt.Config.Run.Duration)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			if err := workerSnapshotError(s.composite.Snapshot()); err != nil {
+				return err
+			}
+		}
+	}
 }
 func (s *totalMemoryScenario) Verify(context.Context, *Runtime) (Result, error) {
 	result := verifyResourceWorkload(s.Code(), s.composite.Snapshot(), resourceEvidence{})
-	result.Evidence = append(result.Evidence, Evidence{Metric: "composed_memory_mechanisms", Target: 4, Actual: float64(len(s.composite.scenarios)), Available: len(s.composite.scenarios) == 4})
+	result.Evidence = append(result.Evidence, Evidence{Metric: "memory_pressure_workers", Target: float64(s.target), Actual: float64(s.composite.Target()), Available: true})
 	return result, nil
 }
 func (s *totalMemoryScenario) ExecutionSnapshot() WorkerSnapshot {

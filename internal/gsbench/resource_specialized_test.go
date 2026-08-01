@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeChurnConnection struct {
@@ -73,12 +74,67 @@ func TestPressureTargetsExceedConfiguredCapacityWithinSafetyCap(t *testing.T) {
 	if err != nil || target != 5 {
 		t.Fatalf("thread target=%d err=%v", target, err)
 	}
-	if _, err := resourcePressureTarget(404, 4, 4); err == nil {
-		t.Fatal("thread queue accepted a safety cap that cannot exceed capacity")
+	if _, err := resourcePressureTarget(404, 4, 4); err == nil || !strings.Contains(err.Error(), "unreachable") {
+		t.Fatalf("thread queue capacity error=%v", err)
 	}
 	if _, err := resourcePressureTarget(405, 2, 6); err == nil {
 		t.Fatal("deferred pooler scenario still has a reachable pressure target")
 	}
+}
+
+func TestThreadQueueRequiresObservedPendingWorkForSuccess(t *testing.T) {
+	group := &WorkerGroup{target: 5}
+	scenario := &resourcePressureScenario{
+		resourceScenario: &resourceScenario{code: 404, name: "threadpool_queue", workers: &sqlWorkload{group: group}},
+		target:           5,
+		status:           ThreadPoolStatus{Actual: 4, Idle: 0},
+		sessionCeiling:   5,
+		established:      5,
+		peakPending:      1,
+	}
+	result, err := scenario.Verify(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeSuccess {
+		t.Fatalf("pending queue result=%+v", result)
+	}
+	if !evidenceMetricAvailable(result.Evidence, "thread_pool_actual_workers") || !evidenceMetricAvailable(result.Evidence, "thread_pool_pending_sessions") || !evidenceMetricAvailable(result.Evidence, "thread_queue_session_ceiling") {
+		t.Fatalf("missing real queue evidence: %+v", result.Evidence)
+	}
+
+	scenario.peakPending = 0
+	result, err = scenario.Verify(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeFailed {
+		t.Fatalf("no-pending queue result=%+v", result)
+	}
+}
+
+func TestThreadQueueHoldReturnsWorkerErrorsImmediately(t *testing.T) {
+	group := &WorkerGroup{}
+	group.errors.Store(1)
+	group.firstError = "queue worker failed"
+	scenario := &resourcePressureScenario{resourceScenario: &resourceScenario{workers: &sqlWorkload{group: group}}}
+	started := time.Now()
+	err := scenario.Hold(context.Background(), &Runtime{Config: BenchConfig{Run: RunConfig{Duration: 100 * time.Millisecond}}})
+	if err == nil || !strings.Contains(err.Error(), "queue worker failed") {
+		t.Fatalf("hold error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 50*time.Millisecond {
+		t.Fatalf("hold waited %s after a known worker error", elapsed)
+	}
+}
+
+func evidenceMetricAvailable(evidence []Evidence, metric string) bool {
+	for _, item := range evidence {
+		if item.Metric == metric && item.Available {
+			return true
+		}
+	}
+	return false
 }
 
 func TestTotalMemoryAndRetentionHaveDifferentLifecyclePlans(t *testing.T) {

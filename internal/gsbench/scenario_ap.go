@@ -53,6 +53,7 @@ func APStatements(schema string, scanRows int) ([]string, error) {
 type APScenario struct {
 	workload  *sqlWorkload
 	control   ControlResult
+	loop      continuousControl
 	available bool
 	policy    APSafety
 }
@@ -104,25 +105,26 @@ func (s *APScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	controller := Controller{
 		Config: ControllerConfig{
 			Target: float64(s.policy.CPUTargetPercent), Tolerance: 3,
-			MinWorkers: 1, MaxWorkers: s.policy.MaxWorkers, Step: 1,
+			MinWorkers: 1, MaxWorkers: s.policy.MaxWorkers,
 			RequiredSamples: 3, Interval: rt.Config.Run.RampInterval,
 		},
 		Actuator: s.workload,
 		Sample: func(ctx context.Context) Sample {
-			if s.available {
-				if value, ok := rt.CPU.SampleCPU(ctx); ok {
-					return Sample{Value: value, Available: true, Errors: s.workload.Snapshot().Errors}
-				}
+			snapshot := s.workload.Snapshot()
+			if !s.available {
+				return sampleCPU(ctx, nil, snapshot)
 			}
-			return Sample{Available: false, Errors: s.workload.Snapshot().Errors}
+			return sampleCPU(ctx, rt.CPU, snapshot)
 		},
 	}
-	s.control = controller.Run(ctx)
-	return s.control.Err
+	s.loop.Start(ctx, controller)
+	return nil
 }
 
 func (s *APScenario) Hold(ctx context.Context, rt *Runtime) error {
-	return waitContext(ctx, rt.Config.Run.Duration)
+	var err error
+	s.control, err = s.loop.Wait(ctx, rt.Config.Run.Duration)
+	return err
 }
 
 func (s *APScenario) Verify(context.Context, *Runtime) (Result, error) {
@@ -136,6 +138,7 @@ func (s *APScenario) ExecutionSnapshot() WorkerSnapshot {
 }
 
 func (s *APScenario) Stop(ctx context.Context, _ *Runtime) error {
+	s.control = s.loop.Stop()
 	if s.workload == nil {
 		return nil
 	}
@@ -150,6 +153,7 @@ type cpuWorkloadScenario struct {
 	build     func(context.Context, *Runtime, string) *sqlWorkload
 	workload  *sqlWorkload
 	control   ControlResult
+	loop      continuousControl
 	available bool
 	target    float64
 }
@@ -168,22 +172,23 @@ func (s *cpuWorkloadScenario) Prepare(ctx context.Context, rt *Runtime) error {
 func (s *cpuWorkloadScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	s.target = float64(rt.Config.Safety.CPUTargetPercent)
 	controller := Controller{
-		Config:   ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: rt.Config.Safety.MaxWorkers, Step: 1, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval},
+		Config:   ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: rt.Config.Safety.MaxWorkers, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval},
 		Actuator: s.workload,
 		Sample: func(ctx context.Context) Sample {
-			if s.available {
-				if value, ok := rt.CPU.SampleCPU(ctx); ok {
-					return Sample{Value: value, Available: true, Errors: s.workload.Snapshot().Errors}
-				}
+			snapshot := s.workload.Snapshot()
+			if !s.available {
+				return sampleCPU(ctx, nil, snapshot)
 			}
-			return Sample{Available: false, Errors: s.workload.Snapshot().Errors}
+			return sampleCPU(ctx, rt.CPU, snapshot)
 		},
 	}
-	s.control = controller.Run(ctx)
-	return s.control.Err
+	s.loop.Start(ctx, controller)
+	return nil
 }
 func (s *cpuWorkloadScenario) Hold(ctx context.Context, rt *Runtime) error {
-	return waitContext(ctx, rt.Config.Run.Duration)
+	var err error
+	s.control, err = s.loop.Wait(ctx, rt.Config.Run.Duration)
+	return err
 }
 func (s *cpuWorkloadScenario) Verify(context.Context, *Runtime) (Result, error) {
 	return verifyCPUResult(s.name, s.target, s.available, s.control, s.workload.Snapshot()), nil
@@ -195,6 +200,7 @@ func (s *cpuWorkloadScenario) ExecutionSnapshot() WorkerSnapshot {
 	return s.workload.Snapshot()
 }
 func (s *cpuWorkloadScenario) Stop(ctx context.Context, _ *Runtime) error {
+	s.control = s.loop.Stop()
 	if s.workload == nil {
 		return nil
 	}

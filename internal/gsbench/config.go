@@ -83,6 +83,7 @@ type FaultProviderConfig struct {
 
 type BenchConfig struct {
 	Path          string
+	ConfigDir     string
 	Database      DatabaseConfig
 	Run           RunConfig
 	Data          DataConfig
@@ -92,6 +93,15 @@ type BenchConfig struct {
 }
 
 func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return BenchConfig{}, fmt.Errorf("config path is required")
+	}
+	absolutePath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return BenchConfig{}, fmt.Errorf("resolve config path %q: %w", path, err)
+	}
+	path = filepath.Clean(absolutePath)
 	if _, err := os.Stat(path); err != nil {
 		return BenchConfig{}, fmt.Errorf("open config %q: %w", path, err)
 	}
@@ -141,7 +151,8 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 		return BenchConfig{}, err
 	}
 	cfg := BenchConfig{
-		Path: path,
+		Path:      path,
+		ConfigDir: filepath.Dir(path),
 		Database: DatabaseConfig{
 			Host:            raw.GetString("database.host", "127.0.0.1"),
 			Port:            raw.GetInt("database.port", 5432),
@@ -275,6 +286,7 @@ func (c BenchConfig) Validate() error {
 	}
 	catalog := DefaultScenarioCatalog()
 	seen := map[ScenarioCode]struct{}{}
+	planChangeCount := 0
 	for _, code := range c.Run.ScenarioCodes {
 		definition, err := catalog.LookupCode(code)
 		if err != nil {
@@ -284,6 +296,14 @@ func (c BenchConfig) Validate() error {
 			return fmt.Errorf("duplicate scenario %q", definition.Name)
 		}
 		seen[code] = struct{}{}
+		if definition.Category == CategoryPlan && code >= 601 && code <= 606 {
+			planChangeCount++
+		}
+	}
+	if planChangeCount > 1 {
+		return fmt.Errorf(
+			"plan-change scenarios 601-606 must be run individually and serially",
+		)
 	}
 	if c.Safety.CPUTargetPercent < 1 || c.Safety.CPUTargetPercent > 100 {
 		return fmt.Errorf("cpu_target_percent must be between 1 and 100")
@@ -383,25 +403,20 @@ func resolveFaultProviderConfig(
 }
 
 func defaultRecoveryLedgerPath(configPath string) (string, error) {
-	identity, err := filepath.Abs(configPath)
+	configPath, err := filepath.Abs(filepath.Clean(configPath))
 	if err != nil {
 		return "", fmt.Errorf(
 			"fault_provider.ledger_path default cannot resolve config identity",
 		)
 	}
+	identity := configPath
 	if evaluated, evalErr := filepath.EvalSymlinks(identity); evalErr == nil {
 		identity = evaluated
 	}
 	identity = filepath.Clean(identity)
 	digest := sha256.Sum256([]byte(identity))
-	workingDirectory, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf(
-			"fault_provider.ledger_path default cannot resolve logs directory",
-		)
-	}
 	return filepath.Join(
-		workingDirectory,
+		filepath.Dir(configPath),
 		"logs",
 		fmt.Sprintf("gsbench_%x_recovery.json", digest[:8]),
 	), nil

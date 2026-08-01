@@ -3,8 +3,20 @@ package gsbench
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+type sequenceCPUSampler struct{ calls atomic.Int64 }
+
+func (s *sequenceCPUSampler) SampleCPU(context.Context) (float64, bool) {
+	call := s.calls.Add(1)
+	if call <= 3 || call >= 5 {
+		return 50, true
+	}
+	return 10, true
+}
 
 func TestTPStatementsUseIndexedReadsWritesAndInserts(t *testing.T) {
 	statements := TPStatements("gsbench", 42, 9001, 12.34)
@@ -113,8 +125,37 @@ func TestCPUVerificationRequiresMeasuredTargetForSuccess(t *testing.T) {
 	if result.Outcome != OutcomeDegraded {
 		t.Fatalf("fallback result=%+v", result)
 	}
-	result = verifyCPUResult("tp_cpu", 95, true, ControlResult{Ceiling: true, Actual: 50, Workers: 8}, WorkerSnapshot{})
-	if result.Outcome != OutcomeFailed {
+	result = verifyCPUResult("tp_cpu", 95, true, ControlResult{Ceiling: true, Actual: 50, ReachableMax: 60, Workers: 8}, WorkerSnapshot{})
+	if result.Outcome != OutcomeFailed || !strings.Contains(result.Message, "ceiling 60.0%") {
 		t.Fatalf("failure result=%+v", result)
+	}
+}
+
+func TestCPUWorkloadScenarioContinuesRegulatingThroughHold(t *testing.T) {
+	workload := &sqlWorkload{group: NewWorkerGroup(context.Background(), 8, func(ctx context.Context, _ int) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})}
+	scenario := &cpuWorkloadScenario{
+		code: 101, name: "tp_cpu", workload: workload, available: true,
+	}
+	runtime := &Runtime{
+		Config: BenchConfig{
+			Run:    RunConfig{Duration: 5 * time.Millisecond, RampInterval: time.Nanosecond},
+			Safety: SafetyConfig{CPUTargetPercent: 50, MaxWorkers: 8},
+		},
+		CPU: &sequenceCPUSampler{},
+	}
+	if err := scenario.Ramp(context.Background(), runtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := scenario.Hold(context.Background(), runtime); err != nil {
+		t.Fatal(err)
+	}
+	if scenario.workload.Target() <= 1 {
+		t.Fatalf("worker target froze after first entering the band: control=%+v target=%d", scenario.control, scenario.workload.Target())
+	}
+	if err := scenario.Stop(context.Background(), runtime); err != nil {
+		t.Fatal(err)
 	}
 }

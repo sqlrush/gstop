@@ -3,6 +3,7 @@ package gsbench
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -25,43 +26,167 @@ func NewDatabaseCPUSampler(db *Database) *DatabaseCPUSampler {
 }
 
 func (s *DatabaseCPUSampler) SampleCPU(ctx context.Context) (float64, bool) {
+	value, available, _ := s.SampleCPUResult(ctx)
+	return value, available
+}
+
+// SampleCPUResult preserves real database/scan failures for continuous
+// controllers while SampleCPU keeps the legacy two-result interface usable by
+// callers that only distinguish available from unavailable metrics.
+func (s *DatabaseCPUSampler) SampleCPUResult(ctx context.Context) (float64, bool, error) {
 	rows, err := s.db.Query(ctx, `SELECT name,value FROM dbe_perf.os_runtime WHERE name IN ('BUSY_TIME','IDLE_TIME')`)
 	if err != nil {
-		return 0, false
+		return 0, false, err
 	}
 	defer rows.Close()
 	var busy, idle float64
-	var found int
+	var haveBusy, haveIdle bool
 	for rows.Next() {
 		var name string
 		var value float64
 		if err := rows.Scan(&name, &value); err != nil {
-			return 0, false
+			return 0, false, err
 		}
 		switch name {
 		case "BUSY_TIME":
 			busy = value
-			found++
+			haveBusy = true
 		case "IDLE_TIME":
 			idle = value
-			found++
+			haveIdle = true
 		}
 	}
-	if found != 2 {
-		return 0, false
+	if err := rows.Err(); err != nil {
+		return 0, false, err
+	}
+	if !haveBusy || !haveIdle {
+		return 0, false, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.have {
 		s.busy, s.idle, s.have = busy, idle, true
-		return 0, false
+		return 0, false, nil
 	}
 	deltaBusy, deltaIdle := busy-s.busy, idle-s.idle
 	s.busy, s.idle = busy, idle
 	if deltaBusy < 0 || deltaIdle < 0 || deltaBusy+deltaIdle <= 0 {
-		return 0, false
+		return 0, false, nil
 	}
-	return deltaBusy / (deltaBusy + deltaIdle) * 100, true
+	return deltaBusy / (deltaBusy + deltaIdle) * 100, true, nil
+}
+
+type cpuResultSampler interface {
+	SampleCPUResult(context.Context) (float64, bool, error)
+}
+
+func sampleCPU(ctx context.Context, sampler CPUSampler, snapshot WorkerSnapshot) Sample {
+	sample := Sample{Errors: snapshot.Errors}
+	if snapshot.Errors > 0 {
+		sample.Err = workerSnapshotError(snapshot)
+		return sample
+	}
+	if sampler == nil {
+		return sample
+	}
+	if detailed, ok := sampler.(cpuResultSampler); ok {
+		value, available, err := detailed.SampleCPUResult(ctx)
+		sample.Value, sample.Available, sample.Err = value, available, err
+		return sample
+	}
+	sample.Value, sample.Available = sampler.SampleCPU(ctx)
+	return sample
+}
+
+func workerSnapshotError(snapshot WorkerSnapshot) error {
+	if snapshot.Errors <= 0 {
+		return nil
+	}
+	if snapshot.FirstError == "" {
+		return fmt.Errorf("workload execution errors=%d", snapshot.Errors)
+	}
+	return fmt.Errorf(
+		"workload execution errors=%d first_error=%s",
+		snapshot.Errors,
+		snapshot.FirstError,
+	)
+}
+
+// continuousControl owns a single Controller.RunUntil goroutine. Wait and Stop
+// always join it, so scenario workers can only be stopped after sampling and
+// actuation have ceased.
+type continuousControl struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	final  ControlResult
+}
+
+func (c *continuousControl) Start(parent context.Context, controller Controller) {
+	controlCtx, cancel := context.WithCancel(parent)
+	c.cancel = cancel
+	c.done = make(chan struct{})
+	go func() {
+		c.final = controller.RunUntil(controlCtx)
+		close(c.done)
+	}()
+}
+
+func (c *continuousControl) Wait(ctx context.Context, duration time.Duration) (ControlResult, error) {
+	if c.done == nil {
+		return c.final, fmt.Errorf("continuous controller is not running")
+	}
+	var timer *time.Timer
+	var durationDone <-chan time.Time
+	if duration > 0 {
+		timer = time.NewTimer(duration)
+		durationDone = timer.C
+		defer timer.Stop()
+	}
+	select {
+	case <-c.done:
+		if err := nonContextControlError(c.final.Err); err != nil {
+			return c.final, err
+		}
+		if err := ctx.Err(); err != nil {
+			return c.final, err
+		}
+		return c.final, c.final.Err
+	case <-ctx.Done():
+		c.cancel()
+		<-c.done
+		if err := nonContextControlError(c.final.Err); err != nil {
+			return c.final, err
+		}
+		return c.final, ctx.Err()
+	case <-durationDone:
+		c.cancel()
+		<-c.done
+		if err := nonContextControlError(c.final.Err); err != nil {
+			return c.final, err
+		}
+		if err := ctx.Err(); err != nil {
+			return c.final, err
+		}
+		return c.final, nil
+	}
+}
+
+func (c *continuousControl) Stop() ControlResult {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.done == nil {
+		return c.final
+	}
+	<-c.done
+	return c.final
+}
+
+func nonContextControlError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	return err
 }
 
 type SQLWorkerOp func(context.Context, *sql.Conn, int) error
@@ -169,7 +294,13 @@ func consumeRows(rows *sql.Rows) error {
 
 func verifyCPUResult(name string, target float64, available bool, control ControlResult, snapshot WorkerSnapshot) Result {
 	result := Result{Scenario: name, Outcome: OutcomeFailed}
+	reachable := control.ReachableMax
+	if control.Actual > reachable {
+		reachable = control.Actual
+	}
 	result.Evidence = []Evidence{{Metric: "db_host_cpu_percent", Target: target, Actual: control.Actual, Available: available}, {
+		Metric: "reachable_max_percent", Target: target, Actual: reachable, Available: available,
+	}, {
 		Metric: "operations", Actual: float64(snapshot.Operations), Available: true,
 	}}
 	switch {
@@ -179,6 +310,8 @@ func verifyCPUResult(name string, target float64, available bool, control Contro
 	case !available && control.Ceiling && snapshot.Operations > 0:
 		result.Outcome = OutcomeDegraded
 		result.Message = "CPU metric unavailable; workload reached the configured worker ceiling"
+	case available && control.Ceiling:
+		result.Message = fmt.Sprintf("CPU target %.1f%% is unreachable; measured ceiling %.1f%%", target, reachable)
 	default:
 		result.Message = fmt.Sprintf("CPU target %.1f%% was not reached", target)
 	}
@@ -186,18 +319,32 @@ func verifyCPUResult(name string, target float64, available bool, control Contro
 }
 
 func verifyCapacityResult(name string, target, actual float64, real bool, operations int64) Result {
+	return verifyControlledCapacityResult(name, target, real, ControlResult{
+		Reached: actual >= target, Actual: actual, ReachableMax: actual,
+	}, operations)
+}
+
+func verifyControlledCapacityResult(name string, target float64, real bool, control ControlResult, operations int64) Result {
+	reachable := control.ReachableMax
+	if control.Actual > reachable {
+		reachable = control.Actual
+	}
 	result := Result{Scenario: name, Outcome: OutcomeFailed, Evidence: []Evidence{{
-		Metric: name + "_percent", Target: target, Actual: actual, Available: real,
+		Metric: name + "_percent", Target: target, Actual: control.Actual, Available: real,
+	}, {
+		Metric: "reachable_max_percent", Target: target, Actual: reachable, Available: real,
 	}}}
 	switch {
-	case real && actual >= target:
+	case real && control.Reached:
 		result.Outcome = OutcomeSuccess
-		result.Message = fmt.Sprintf("%s reached %.1f%%", name, actual)
+		result.Message = fmt.Sprintf("%s reached %.1f%%", name, control.Actual)
 	case !real && operations > 0:
 		result.Outcome = OutcomeDegraded
 		result.Message = fmt.Sprintf("%s real metric unavailable; fallback workload is active", name)
+	case real && control.Ceiling:
+		result.Message = fmt.Sprintf("%s target %.1f%% is unreachable; measured capacity ceiling %.1f%%", name, target, reachable)
 	default:
-		result.Message = fmt.Sprintf("%s target %.1f%% was not reached; actual %.1f%%", name, target, actual)
+		result.Message = fmt.Sprintf("%s target %.1f%% was not reached; actual %.1f%%", name, target, control.Actual)
 	}
 	return result
 }

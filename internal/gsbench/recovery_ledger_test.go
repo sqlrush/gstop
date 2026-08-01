@@ -54,6 +54,36 @@ func TestFileRecoveryLedgerPersistsPendingAction(t *testing.T) {
 	}
 }
 
+func TestFileRecoveryLedgerBindsRelativePathBeforeCWDChanges(t *testing.T) {
+	root := t.TempDir()
+	creationCWD := filepath.Join(root, "create")
+	useCWD := filepath.Join(root, "use")
+	for _, directory := range []string{creationCWD, useCWD} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(creationCWD)
+	ledger := NewFileRecoveryLedger(filepath.Join("logs", "recovery.json"))
+	t.Chdir(useCWD)
+	if err := ledger.Put(
+		context.Background(),
+		validLedgerAction("run-1", "target-1"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	wantPath := filepath.Join(creationCWD, "logs", "recovery.json")
+	for _, path := range []string{wantPath, wantPath + ".lock"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("bound ledger state %q: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(useCWD, "logs")); !os.IsNotExist(err) {
+		t.Fatalf("ledger followed later cwd and created state there: %v", err)
+	}
+}
+
 func TestFileRecoveryLedgerPendingExistingLedgerDoesNotCreateMissingLock(
 	t *testing.T,
 ) {

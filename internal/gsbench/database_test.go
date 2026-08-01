@@ -1,11 +1,15 @@
 package gsbench
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestApplicationNameUsesExactRunOwnershipTag(t *testing.T) {
@@ -294,4 +298,224 @@ func TestNormalizeConnectionCloseErrorIgnoresAlreadyClosedResources(t *testing.T
 	if got := normalizeConnectionCloseError(unexpected); !errors.Is(got, unexpected) {
 		t.Fatalf("normalizeConnectionCloseError(%v)=%v", unexpected, got)
 	}
+}
+
+type sessionCleanupTestConnector struct {
+	state *sessionCleanupTestState
+}
+
+func (c *sessionCleanupTestConnector) Connect(context.Context) (driver.Conn, error) {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	c.state.connections++
+	return &sessionCleanupTestConn{
+		id:    c.state.connections,
+		state: c.state,
+	}, nil
+}
+
+func (c *sessionCleanupTestConnector) Driver() driver.Driver {
+	return sessionCleanupTestDriver{state: c.state}
+}
+
+type sessionCleanupTestDriver struct {
+	state *sessionCleanupTestState
+}
+
+func (d sessionCleanupTestDriver) Open(string) (driver.Conn, error) {
+	return (&sessionCleanupTestConnector{state: d.state}).Connect(
+		context.Background(),
+	)
+}
+
+type sessionCleanupTestState struct {
+	mu                sync.Mutex
+	connections       int
+	dirty             map[int]bool
+	closed            map[int]bool
+	statements        map[int][]string
+	failRollback      bool
+	failResetAll      bool
+	cancelOnWorkError context.CancelFunc
+}
+
+type sessionCleanupTestConn struct {
+	id    int
+	state *sessionCleanupTestState
+}
+
+func (*sessionCleanupTestConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not supported")
+}
+
+func (c *sessionCleanupTestConn) Close() error {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	c.state.closed[c.id] = true
+	return nil
+}
+
+func (*sessionCleanupTestConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not supported")
+}
+
+func (c *sessionCleanupTestConn) ExecContext(
+	_ context.Context,
+	statement string,
+	_ []driver.NamedValue,
+) (driver.Result, error) {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	c.state.statements[c.id] = append(c.state.statements[c.id], statement)
+	switch statement {
+	case "SET default_statistics_target=-2":
+		c.state.dirty[c.id] = true
+	case "ANALYZE broken":
+		if c.state.cancelOnWorkError != nil {
+			c.state.cancelOnWorkError()
+		}
+		return nil, errors.New("analyze failed")
+	case "ROLLBACK":
+		if c.state.failRollback {
+			return nil, errors.New("rollback failed")
+		}
+	case "RESET ALL":
+		if c.state.failResetAll {
+			return nil, errors.New("reset failed")
+		}
+		c.state.dirty[c.id] = false
+	case "ASSERT SESSION CLEAN":
+		if c.state.dirty[c.id] {
+			return nil, errors.New("session is dirty")
+		}
+	}
+	return driver.RowsAffected(1), nil
+}
+
+func newSessionCleanupTestDatabase(
+	t *testing.T,
+	state *sessionCleanupTestState,
+) *Database {
+	t.Helper()
+	state.dirty = make(map[int]bool)
+	state.closed = make(map[int]bool)
+	state.statements = make(map[int][]string)
+	pool := sql.OpenDB(&sessionCleanupTestConnector{state: state})
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	databaseContext, cancel := context.WithCancel(context.Background())
+	database := &Database{
+		cfg: BenchConfig{Safety: SafetyConfig{QueryTimeout: time.Second}},
+		ctx: databaseContext, cancel: cancel, pool: pool,
+		tagged: map[*TaggedConn]struct{}{},
+	}
+	t.Cleanup(func() {
+		cancel()
+		if err := pool.Close(); err != nil {
+			t.Errorf("close session cleanup test pool: %v", err)
+		}
+	})
+	return database
+}
+
+func TestExecSessionCleansFailedSessionBeforeReturningItToPool(t *testing.T) {
+	state := &sessionCleanupTestState{}
+	database := newSessionCleanupTestDatabase(t, state)
+	parent, cancel := context.WithCancel(context.Background())
+	state.cancelOnWorkError = cancel
+
+	err := database.ExecSession(
+		parent,
+		"SET default_statistics_target=-2",
+		"ANALYZE broken",
+		"RESET default_statistics_target",
+	)
+	if err == nil || !strings.Contains(err.Error(), "analyze failed") {
+		t.Fatalf("ExecSession() error=%v", err)
+	}
+	if _, err := database.Exec(
+		context.Background(), "ASSERT SESSION CLEAN",
+	); err != nil {
+		t.Fatalf("connection returned to pool with dirty session: %v", err)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.connections != 1 {
+		t.Fatalf("connections=%d, want cleaned connection reused", state.connections)
+	}
+	want := []string{
+		"SET default_statistics_target=-2",
+		"ANALYZE broken",
+		"ROLLBACK",
+		"RESET ALL",
+		"ASSERT SESSION CLEAN",
+	}
+	if got := state.statements[1]; !equalStringSlices(got, want) {
+		t.Fatalf("session statements=%v, want %v", got, want)
+	}
+}
+
+func TestExecSessionDiscardsConnectionWhenFailureCleanupFails(t *testing.T) {
+	state := &sessionCleanupTestState{
+		failRollback: true,
+		failResetAll: true,
+	}
+	database := newSessionCleanupTestDatabase(t, state)
+
+	err := database.ExecSession(
+		context.Background(),
+		"SET default_statistics_target=-2",
+		"ANALYZE broken",
+		"RESET default_statistics_target",
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "rollback failed") ||
+		!strings.Contains(err.Error(), "reset failed") {
+		t.Fatalf("ExecSession() error=%v", err)
+	}
+	state.mu.Lock()
+	state.failRollback = false
+	state.failResetAll = false
+	state.mu.Unlock()
+	if _, err := database.Exec(
+		context.Background(), "ASSERT SESSION CLEAN",
+	); err != nil {
+		t.Fatalf("replacement connection is not clean: %v", err)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.connections != 2 {
+		t.Fatalf("connections=%d, want dirty connection replaced", state.connections)
+	}
+	if !state.closed[1] {
+		t.Fatal("dirty physical connection was not closed")
+	}
+	wantFailedSession := []string{
+		"SET default_statistics_target=-2",
+		"ANALYZE broken",
+		"ROLLBACK",
+		"RESET ALL",
+	}
+	if got := state.statements[1]; !equalStringSlices(got, wantFailedSession) {
+		t.Fatalf("failed session statements=%v, want %v", got, wantFailedSession)
+	}
+	if got := state.statements[2]; !equalStringSlices(
+		got, []string{"ASSERT SESSION CLEAN"},
+	) {
+		t.Fatalf("replacement session statements=%v", got)
+	}
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

@@ -23,3 +23,31 @@ func TestLockScenarioFactoriesRegisterImplementedCodesOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanChangeFactoriesShareOneCoordinator(t *testing.T) {
+	factories := LockScenarioFactories()
+	var shared *PlanCoordinator
+	for code := ScenarioCode(601); code <= 606; code++ {
+		definition := DefaultScenarioCatalog().MustCode(code)
+		scenario, err := factories[code](definition, Environment{})
+		if err != nil {
+			t.Fatalf("factory %d: %v", code, err)
+		}
+		planScenario, ok := scenario.(*PlanChangeScenario)
+		if !ok {
+			t.Fatalf("factory %d returned %T", code, scenario)
+		}
+		if shared == nil {
+			shared = planScenario.coordinator
+			continue
+		}
+		if planScenario.coordinator != shared {
+			t.Fatalf(
+				"factory %d coordinator=%p want shared=%p",
+				code,
+				planScenario.coordinator,
+				shared,
+			)
+		}
+	}
+}

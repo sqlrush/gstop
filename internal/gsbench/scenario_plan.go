@@ -15,13 +15,37 @@ func explainLiteral(ctx context.Context, db *Database, sqlText string) (string, 
 		return "", err
 	}
 	defer rows.Close()
+	return scanExplainRows(rows.Rows)
+}
+
+func scanExplainRows(rows *sql.Rows) (string, error) {
+	columns, err := rows.Columns()
+	if err != nil {
+		return "", err
+	}
+	values := make([]any, len(columns))
+	destinations := make([]any, len(columns))
+	for index := range values {
+		destinations[index] = &values[index]
+	}
+
 	var lines []string
 	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
+		if err := rows.Scan(destinations...); err != nil {
 			return "", err
 		}
-		lines = append(lines, line)
+		fields := make([]string, len(values))
+		for index, value := range values {
+			switch value := value.(type) {
+			case nil:
+				fields[index] = "NULL"
+			case []byte:
+				fields[index] = string(value)
+			default:
+				fields[index] = fmt.Sprint(value)
+			}
+		}
+		lines = append(lines, strings.Join(fields, "\t"))
 	}
 	if err := rows.Err(); err != nil {
 		return "", err
@@ -96,6 +120,10 @@ func NewPlanChangeScenario(def PlanScenarioDefinition, coordinator *PlanCoordina
 func (s *PlanChangeScenario) Code() ScenarioCode { return s.def.Code }
 func (s *PlanChangeScenario) Name() string       { return s.def.Name }
 
+func minimumPlanDataRows(string) int64 {
+	return planDataMinRows
+}
+
 func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if err := validatePlanCapability(s.Name(), rt.Capabilities); err != nil {
 		return err
@@ -114,13 +142,14 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		s.workers = maximum
 	}
 
-	minimumRows := int64(2_500_000)
-	if rt.Config.Run.Profile == "stress" {
-		minimumRows = 10_000_000
+	minimumRows := minimumPlanDataRows(rt.Config.Run.Profile)
+	quotedSchema, ok := quoteDatasetSchema(rt.Config.Data.Schema)
+	if !ok {
+		return fmt.Errorf("unsafe schema %q", rt.Config.Data.Schema)
 	}
 	var rows int64
 	if err := rt.Database.Scan(ctx,
-		"SELECT high_water FROM "+rt.Config.Data.Schema+
+		"SELECT high_water FROM "+quotedSchema+
 			".meta_batches WHERE table_name='plan_data'",
 		nil, &rows); err != nil {
 		return fmt.Errorf("read plan_data high-water: %w", err)

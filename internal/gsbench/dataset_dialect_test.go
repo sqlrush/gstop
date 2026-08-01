@@ -60,6 +60,41 @@ func TestDatasetDialectContainsEveryDesignedObject(t *testing.T) {
 	}
 }
 
+func TestDatasetDialectPlanIndexesMatchCanonicalCatalogExactlyOnce(t *testing.T) {
+	statements := DatasetDialectFor(Environment{
+		Product:  ProductGaussDB,
+		Topology: TopologyDistributed,
+	}).TableDDL("Bench")
+	actual := make(map[string][]string)
+	for _, statement := range statements {
+		object, err := parseDatasetObject(statement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if object.Kind == DatasetObjectIndex {
+			actual[object.Name] = append(actual[object.Name], statement)
+		}
+	}
+	for _, definition := range planIndexDefinitions() {
+		expected, err := planIndexDDL("Bench", definition, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := actual[definition.Name]
+		if len(got) != 1 {
+			t.Fatalf("plan index %s count=%d want=1", definition.Name, len(got))
+		}
+		if !datasetIndexMatches(got[0], expected) {
+			t.Fatalf(
+				"plan index %s definition=%q want=%q",
+				definition.Name,
+				got[0],
+				expected,
+			)
+		}
+	}
+}
+
 func TestDistributedDatasetUsesExplicitDistribution(t *testing.T) {
 	dialect := DatasetDialectFor(Environment{
 		Product:  ProductGaussDB,

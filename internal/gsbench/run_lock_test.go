@@ -14,6 +14,7 @@ type fakeRunLockSession struct {
 	unlockErr    error
 	keys         []string
 	closed       int
+	discarded    int
 }
 
 func (s *fakeRunLockSession) TryLock(_ context.Context, key string) (bool, error) {
@@ -27,6 +28,12 @@ func (s *fakeRunLockSession) Unlock(_ context.Context, key string) (bool, error)
 }
 
 func (s *fakeRunLockSession) Close() error {
+	s.closed++
+	return nil
+}
+
+func (s *fakeRunLockSession) Discard() error {
+	s.discarded++
 	s.closed++
 	return nil
 }
@@ -51,8 +58,14 @@ func TestDatabaseRunLockUsesOneSessionForAcquireAndRelease(t *testing.T) {
 		"try:gsbench:init:postgres:gsbench_e2e_20260801",
 		"unlock:gsbench:init:postgres:gsbench_e2e_20260801",
 	}
-	if strings.Join(session.keys, ",") != strings.Join(want, ",") || session.closed != 1 {
-		t.Fatalf("keys=%v closed=%d", session.keys, session.closed)
+	if strings.Join(session.keys, ",") != strings.Join(want, ",") ||
+		session.closed != 1 || session.discarded != 0 {
+		t.Fatalf(
+			"keys=%v closed=%d discarded=%d",
+			session.keys,
+			session.closed,
+			session.discarded,
+		)
 	}
 }
 
@@ -69,24 +82,73 @@ func TestDatabaseRunLockFailsClearlyWhenBusy(t *testing.T) {
 	if session.closed != 1 {
 		t.Fatalf("busy session close count=%d", session.closed)
 	}
+	if session.discarded != 0 {
+		t.Fatalf("busy session discard count=%d", session.discarded)
+	}
 }
 
-func TestDatabaseRunLockReturnsReleaseErrorsAndStillCloses(t *testing.T) {
-	session := &fakeRunLockSession{
-		tryResult: true, unlockErr: errors.New("unlock failed"),
-	}
-	release, err := acquireDatabaseRunLock(
+func TestDatabaseRunLockDiscardsSessionWhenAcquireResultIsUncertain(t *testing.T) {
+	session := &fakeRunLockSession{tryErr: errors.New("try query failed")}
+	_, err := acquireDatabaseRunLock(
 		context.Background(),
 		"gsbench:init:postgres:gsbench_e2e_20260801",
 		func(context.Context) (runLockSession, error) { return session, nil },
 	)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "try query failed") {
+		t.Fatalf("acquire error=%v", err)
 	}
-	if err := release(); err == nil || !strings.Contains(err.Error(), "unlock failed") {
-		t.Fatalf("release error=%v", err)
+	if session.closed != 1 || session.discarded != 1 {
+		t.Fatalf(
+			"uncertain acquire closed=%d discarded=%d want closed=1 discarded=1",
+			session.closed,
+			session.discarded,
+		)
 	}
-	if session.closed != 1 {
-		t.Fatalf("release close count=%d", session.closed)
+}
+
+func TestDatabaseRunLockDiscardsSessionWhenReleaseResultIsUncertain(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		unlockResult bool
+		unlockErr    error
+		wantError    string
+	}{
+		{
+			name:      "unlock query error",
+			unlockErr: errors.New("unlock failed"),
+			wantError: "unlock failed",
+		},
+		{
+			name:         "lock not held",
+			unlockResult: false,
+			wantError:    "was not held",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := &fakeRunLockSession{
+				tryResult:    true,
+				unlockResult: test.unlockResult,
+				unlockErr:    test.unlockErr,
+			}
+			release, err := acquireDatabaseRunLock(
+				context.Background(),
+				"gsbench:init:postgres:gsbench_e2e_20260801",
+				func(context.Context) (runLockSession, error) { return session, nil },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := release(); err == nil ||
+				!strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("release error=%v", err)
+			}
+			if session.closed != 1 || session.discarded != 1 {
+				t.Fatalf(
+					"uncertain release closed=%d discarded=%d want closed=1 discarded=1",
+					session.closed,
+					session.discarded,
+				)
+			}
+		})
 	}
 }

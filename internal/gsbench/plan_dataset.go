@@ -24,6 +24,77 @@ type TableColumn struct {
 	Declaration string
 }
 
+type planIndexDefinition struct {
+	Name    string
+	Table   string
+	Columns []string
+}
+
+var canonicalPlanIndexDefinitions = [...]planIndexDefinition{
+	{Name: "plan_data_lookup_idx", Table: "plan_data", Columns: []string{"lookup_key", "dist_key", "id"}},
+	{Name: "plan_stats_target_idx", Table: "plan_data", Columns: []string{"stats_target_key", "dist_key", "id"}},
+	{Name: "plan_stats_ndistinct_idx", Table: "plan_data", Columns: []string{"stats_ndistinct_key", "dist_key", "id"}},
+	{Name: "plan_stats_corr_idx", Table: "plan_data", Columns: []string{"stats_corr_a", "stats_corr_b", "dist_key", "id"}},
+	{Name: "plan_index_unusable_idx", Table: "plan_data", Columns: []string{"index_unusable_key", "dist_key", "id"}},
+	{Name: "plan_index_drop_idx", Table: "plan_data", Columns: []string{"index_drop_key", "dist_key", "id"}},
+	{Name: "plan_index_shape_good_idx", Table: "plan_data", Columns: []string{"index_shape_lead", "index_shape_tail", "dist_key", "id"}},
+}
+
+func planIndexDefinitions() []planIndexDefinition {
+	definitions := make([]planIndexDefinition, len(canonicalPlanIndexDefinitions))
+	for index, definition := range canonicalPlanIndexDefinitions {
+		definitions[index] = definition
+		definitions[index].Columns = append([]string(nil), definition.Columns...)
+	}
+	return definitions
+}
+
+func planIndexDefinitionByName(name string) (planIndexDefinition, bool) {
+	for _, definition := range planIndexDefinitions() {
+		if definition.Name == name {
+			return definition, true
+		}
+	}
+	return planIndexDefinition{}, false
+}
+
+func planIndexDDL(
+	schema string,
+	definition planIndexDefinition,
+	ifNotExists bool,
+) (string, error) {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return "", fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+	if !identifierRE.MatchString(definition.Name) ||
+		!identifierRE.MatchString(definition.Table) ||
+		len(definition.Columns) == 0 {
+		return "", fmt.Errorf("invalid plan index definition %+v", definition)
+	}
+	for _, column := range definition.Columns {
+		if !identifierRE.MatchString(column) {
+			return "", fmt.Errorf(
+				"invalid plan index column %q for %s",
+				column,
+				definition.Name,
+			)
+		}
+	}
+	existenceClause := ""
+	if ifNotExists {
+		existenceClause = " IF NOT EXISTS"
+	}
+	return fmt.Sprintf(
+		"CREATE INDEX%s %s ON %s.%s (%s)",
+		existenceClause,
+		definition.Name,
+		quotedSchema,
+		definition.Table,
+		strings.Join(definition.Columns, ","),
+	), nil
+}
+
 func planDataDDL(schema string) []string {
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {
@@ -56,33 +127,24 @@ func planDataColumns() []TableColumn {
 }
 
 func planDataPostMigrationDDL(schema string) []string {
-	quotedSchema, ok := quoteDatasetSchema(schema)
-	if !ok {
-		return nil
+	definitions := planIndexDefinitions()
+	statements := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		statement, err := planIndexDDL(schema, definition, false)
+		if err != nil {
+			return nil
+		}
+		statements = append(statements, statement)
 	}
-	table := quotedSchema + ".plan_data"
-	return []string{
-		fmt.Sprintf(`CREATE INDEX plan_data_lookup_idx ON %s (lookup_key,dist_key,id)`, table),
-		fmt.Sprintf(`CREATE INDEX plan_stats_target_idx ON %s (stats_target_key,dist_key,id)`, table),
-		fmt.Sprintf(`CREATE INDEX plan_stats_ndistinct_idx ON %s (stats_ndistinct_key,dist_key,id)`, table),
-		fmt.Sprintf(`CREATE INDEX plan_stats_corr_idx ON %s (stats_corr_a,stats_corr_b,dist_key,id)`, table),
-		fmt.Sprintf(`CREATE INDEX plan_index_unusable_idx ON %s (index_unusable_key,dist_key,id)`, table),
-		fmt.Sprintf(`CREATE INDEX plan_index_drop_idx ON %s (index_drop_key,dist_key,id)`, table),
-		fmt.Sprintf(`CREATE INDEX plan_index_shape_good_idx ON %s (index_shape_lead,index_shape_tail,dist_key,id)`, table),
-	}
+	return statements
 }
 
 func isPlanDataIndexDDL(statement string) bool {
-	for _, name := range []string{
-		"plan_data_lookup_idx",
-		"plan_stats_target_idx",
-		"plan_stats_ndistinct_idx",
-		"plan_stats_corr_idx",
-		"plan_index_unusable_idx",
-		"plan_index_drop_idx",
-		"plan_index_shape_good_idx",
-	} {
-		if strings.HasPrefix(statement, "CREATE INDEX "+name+" ") {
+	for _, definition := range planIndexDefinitions() {
+		if strings.HasPrefix(
+			statement,
+			"CREATE INDEX "+definition.Name+" ",
+		) {
 			return true
 		}
 	}

@@ -3,9 +3,32 @@ package gsbench
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestPlanIndexDefinitionsReturnImmutableCanonicalCatalog(t *testing.T) {
+	want := []planIndexDefinition{
+		{Name: "plan_data_lookup_idx", Table: "plan_data", Columns: []string{"lookup_key", "dist_key", "id"}},
+		{Name: "plan_stats_target_idx", Table: "plan_data", Columns: []string{"stats_target_key", "dist_key", "id"}},
+		{Name: "plan_stats_ndistinct_idx", Table: "plan_data", Columns: []string{"stats_ndistinct_key", "dist_key", "id"}},
+		{Name: "plan_stats_corr_idx", Table: "plan_data", Columns: []string{"stats_corr_a", "stats_corr_b", "dist_key", "id"}},
+		{Name: "plan_index_unusable_idx", Table: "plan_data", Columns: []string{"index_unusable_key", "dist_key", "id"}},
+		{Name: "plan_index_drop_idx", Table: "plan_data", Columns: []string{"index_drop_key", "dist_key", "id"}},
+		{Name: "plan_index_shape_good_idx", Table: "plan_data", Columns: []string{"index_shape_lead", "index_shape_tail", "dist_key", "id"}},
+	}
+
+	first := planIndexDefinitions()
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("plan index definitions=%+v want=%+v", first, want)
+	}
+	first[0].Name = "mutated"
+	first[0].Columns[0] = "mutated"
+	if second := planIndexDefinitions(); !reflect.DeepEqual(second, want) {
+		t.Fatalf("catalog was mutated through getter: %+v", second)
+	}
+}
 
 func TestPlanDataUsesDesignedTwelvePercentBudget(t *testing.T) {
 	quick := planDataBatch("gsbench", 5<<30)

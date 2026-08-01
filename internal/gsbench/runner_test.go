@@ -316,6 +316,7 @@ func (b *cancellationRejectingRestoreBackend) AcquireRestoreLock(
 func (b *cancellationRejectingRestoreBackend) DiscoverRestore(
 	ctx context.Context,
 	_ string,
+	_ bool,
 ) (RestoreDiscovery, error) {
 	if err := b.checkContext(ctx, "discover"); err != nil {
 		return RestoreDiscovery{}, err

@@ -24,12 +24,18 @@ func TestReadOnlyCLICommandsDoNotCreateLogsOrDirectories(t *testing.T) {
 		dryRun  bool
 	}{
 		{name: "restore dry run", command: "restore", dryRun: true},
+		{name: "cleanup dry run", command: "cleanup", dryRun: true},
 		{name: "doctor", command: "doctor"},
 		{name: "status", command: "status"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			working := t.TempDir()
 			t.Chdir(working)
+			configDir := filepath.Dir(configPath)
+			before, err := os.ReadDir(configDir)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var stdout, stderr bytes.Buffer
 			_ = executeCommand(
 				context.Background(),
@@ -54,6 +60,18 @@ func TestReadOnlyCLICommandsDoNotCreateLogsOrDirectories(t *testing.T) {
 					"read-only %s created filesystem entries %v",
 					test.command,
 					names,
+				)
+			}
+			after, err := os.ReadDir(configDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf(
+					"read-only %s changed config directory entries: before=%v after=%v",
+					test.command,
+					before,
+					after,
 				)
 			}
 		})
@@ -158,7 +176,7 @@ func TestCLIVersionPrintsAuthor(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Author: WangYingJie <sqlrush@gmail.com>") {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.0\n") {
+	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.1\n") {
 		t.Fatalf("version=%q", stdout.String())
 	}
 }
@@ -232,6 +250,16 @@ func TestParseCLIArgsSupportsScenarioDurationAndDryRun(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsRejectsCleanupDataWithRunID(t *testing.T) {
+	_, err := ParseCLIArgs([]string{
+		"cleanup", "--data", "--run-id", "run-1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--data") ||
+		!strings.Contains(err.Error(), "--run-id") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestParseCLIArgsRequiresExplicitValidRiskAuthorization(t *testing.T) {
 	options, err := ParseCLIArgs([]string{"run", "--allow-risk", "C", "343"})
 	if err != nil {
@@ -298,6 +326,192 @@ func TestParseCLIArgsExplicitConfigOverridesEnvironment(t *testing.T) {
 	}
 	if options.ConfigPath != "explicit.cfg" {
 		t.Fatalf("config path=%q", options.ConfigPath)
+	}
+}
+
+func TestResolveConfigPathUsesDeterministicPrecedence(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "work")
+	executable := filepath.Join(root, "release", "bin", "gsbench")
+	candidates := []string{
+		filepath.Join(cwd, "gsbench.cfg"),
+		filepath.Join(cwd, "configs", "gsbench.cfg"),
+		filepath.Join(filepath.Dir(executable), "gsbench.cfg"),
+		filepath.Join(filepath.Dir(filepath.Dir(executable)), "configs", "gsbench.cfg"),
+	}
+	for _, path := range candidates {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("candidate"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	explicit := filepath.Join(cwd, "explicit.cfg")
+	if err := os.WriteFile(explicit, []byte("explicit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveConfigPath("./explicit.cfg", executable, cwd)
+	if err != nil || got != explicit {
+		t.Fatalf("explicit path=%q err=%v want=%q", got, err, explicit)
+	}
+	for index, want := range candidates {
+		got, err = resolveConfigPath("", executable, cwd)
+		if err != nil || got != want {
+			t.Fatalf("candidate %d path=%q err=%v want=%q", index, got, err, want)
+		}
+		if err := os.Remove(want); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := resolveConfigPath("", executable, cwd); err == nil {
+		t.Fatal("missing discovered config did not fail")
+	}
+}
+
+func TestResolveConfigPathRejectsMissingExplicitWithoutFallback(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "work")
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fallback := filepath.Join(cwd, "gsbench.cfg")
+	if err := os.WriteFile(fallback, []byte("fallback"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	missing := filepath.Join(cwd, "missing.cfg")
+	if _, err := resolveConfigPath(missing, filepath.Join(root, "bin", "gsbench"), cwd); err == nil ||
+		!strings.Contains(err.Error(), "missing.cfg") {
+		t.Fatalf("missing explicit path error=%v", err)
+	}
+}
+
+func TestExecuteCommandRejectsUnsafeRunIDBeforeCreatingLog(t *testing.T) {
+	workingDirectory := t.TempDir()
+	t.Chdir(workingDirectory)
+	configPath := writeTestConfig(t, minimalConfig())
+	var stdout, stderr bytes.Buffer
+
+	code := executeCommand(
+		context.Background(),
+		CLIOptions{
+			Command:    "run",
+			ConfigPath: configPath,
+			RunID:      " ../../escape ",
+		},
+		&stdout,
+		&stderr,
+	)
+	if code != 1 || !strings.Contains(stderr.String(), "unsafe run ID") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	for _, directory := range []string{
+		filepath.Join(workingDirectory, "logs"),
+		filepath.Join(filepath.Dir(configPath), "logs"),
+	} {
+		if _, err := os.Lstat(directory); !os.IsNotExist(err) {
+			t.Fatalf("unsafe run ID created log directory %q: %v", directory, err)
+		}
+	}
+}
+
+func TestExecuteCommandCreatesDefaultLogUnderConfigDirectory(t *testing.T) {
+	workingDirectory := t.TempDir()
+	t.Chdir(workingDirectory)
+	configPath := writeTestConfig(
+		t,
+		strings.Replace(
+			minimalConfig(),
+			"password_env = GSBENCH_TEST_PASSWORD",
+			"password_env = GSBENCH_TEST_PASSWORD\nconnect_timeout = 1ms",
+			1,
+		),
+	)
+	var stdout, stderr bytes.Buffer
+
+	code := executeCommand(
+		context.Background(),
+		CLIOptions{
+			Command:    "run",
+			ConfigPath: configPath,
+			RunID:      "run-log-anchor",
+		},
+		&stdout,
+		&stderr,
+	)
+	if code != 1 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	wantPath := filepath.Join(
+		filepath.Dir(configPath),
+		"logs",
+		"gsbench_run-log-anchor.log",
+	)
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("config-anchored run log %q: %v", wantPath, err)
+	}
+	if _, err := os.Lstat(filepath.Join(workingDirectory, "logs")); !os.IsNotExist(err) {
+		t.Fatalf("run log used process cwd: %v", err)
+	}
+}
+
+func TestPreparePlanRunBaselineAlwaysRepairsAndOnlyStrictlyVerifies(t *testing.T) {
+	for _, validationEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("validation_%v", validationEnabled), func(t *testing.T) {
+			var output bytes.Buffer
+			log, err := NewRunLog(&output, "", Version)
+			if err != nil {
+				t.Fatal(err)
+			}
+			repairCalls := 0
+			verifyCalls := 0
+			err = preparePlanRunBaseline(
+				context.Background(),
+				nil,
+				BenchConfig{
+					Run:  RunConfig{ValidationEnabled: validationEnabled},
+					Data: DataConfig{Schema: "bench"},
+				},
+				log,
+				func(context.Context, *Database, string) ([]BaselineRepairResult, error) {
+					repairCalls++
+					return []BaselineRepairResult{{
+						Target: "plan_index",
+						Status: "RESTORED",
+					}}, nil
+				},
+				func(context.Context, *Database, string) error {
+					verifyCalls++
+					return nil
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantVerifyCalls := 0
+			if validationEnabled {
+				wantVerifyCalls = 1
+			}
+			if repairCalls != 1 || verifyCalls != wantVerifyCalls {
+				t.Fatalf("repair calls=%d verify calls=%d want=1/%d", repairCalls, verifyCalls, wantVerifyCalls)
+			}
+			if !strings.Contains(output.String(), "target=plan_index status=RESTORED") {
+				t.Fatalf("baseline repair result was not logged: %q", output.String())
+			}
+		})
+	}
+}
+
+func TestVerifyRestorePlanBaselineSkipsNonPlanActions(t *testing.T) {
+	backend := &databaseRestoreBackend{}
+	action := Action{ScenarioCode: 101}
+	if err := backend.verifyPlanBaselineForActions(
+		context.Background(),
+		[]Action{action},
+	); err != nil {
+		t.Fatalf("non-plan restore checked plan baseline: %v", err)
 	}
 }
 

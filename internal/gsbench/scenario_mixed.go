@@ -66,6 +66,7 @@ type MixedScenario struct {
 	tp, ap    *sqlWorkload
 	actuator  *mixedActuator
 	control   ControlResult
+	loop      continuousControl
 	available bool
 	target    float64
 	maximum   int
@@ -111,23 +112,23 @@ func (s *MixedScenario) Prepare(ctx context.Context, rt *Runtime) error {
 }
 func (s *MixedScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	c := Controller{
-		Config:   ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: s.maximum, Step: 1, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval},
+		Config:   ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: s.maximum, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval},
 		Actuator: s.actuator,
 		Sample: func(ctx context.Context) Sample {
-			errors := s.tp.Snapshot().Errors + s.ap.Snapshot().Errors
-			if s.available {
-				if value, ok := rt.CPU.SampleCPU(ctx); ok {
-					return Sample{Available: true, Value: value, Errors: errors}
-				}
+			snapshot := s.ExecutionSnapshot()
+			if !s.available {
+				return sampleCPU(ctx, nil, snapshot)
 			}
-			return Sample{Errors: errors}
+			return sampleCPU(ctx, rt.CPU, snapshot)
 		},
 	}
-	s.control = c.Run(ctx)
-	return s.control.Err
+	s.loop.Start(ctx, c)
+	return nil
 }
 func (s *MixedScenario) Hold(ctx context.Context, rt *Runtime) error {
-	return waitContext(ctx, rt.Config.Run.Duration)
+	var err error
+	s.control, err = s.loop.Wait(ctx, rt.Config.Run.Duration)
+	return err
 }
 func (s *MixedScenario) Verify(context.Context, *Runtime) (Result, error) {
 	return verifyCPUResult(s.Name(), s.target, s.available, s.control, s.ExecutionSnapshot()), nil
@@ -148,6 +149,10 @@ func (s *MixedScenario) ExecutionSnapshot() WorkerSnapshot {
 	}
 }
 func (s *MixedScenario) Stop(ctx context.Context, _ *Runtime) error {
+	s.control = s.loop.Stop()
+	if s.tp == nil || s.ap == nil {
+		return nil
+	}
 	err := s.tp.Stop(ctx)
 	if apErr := s.ap.Stop(ctx); err == nil {
 		err = apErr

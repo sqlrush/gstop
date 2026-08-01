@@ -13,6 +13,7 @@ type runLockSession interface {
 	TryLock(context.Context, string) (bool, error)
 	Unlock(context.Context, string) (bool, error)
 	Close() error
+	Discard() error
 }
 
 type sqlRunLockSession struct {
@@ -45,6 +46,14 @@ func (s *sqlRunLockSession) Unlock(ctx context.Context, key string) (bool, error
 }
 
 func (s *sqlRunLockSession) Close() error { return s.conn.Close() }
+
+func (s *sqlRunLockSession) Discard() error {
+	// Mark the physical connection bad before closing the sql.Conn wrapper, so
+	// a session whose lock state is uncertain can never return to the pool.
+	discardErr := discardSessionConnection(s.conn)
+	closeErr := normalizeConnectionCloseError(s.conn.Close())
+	return errors.Join(discardErr, closeErr)
+}
 
 func AcquireDatabaseRunLock(
 	ctx context.Context,
@@ -92,7 +101,7 @@ func acquireDatabaseRunLock(
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("acquire database advisory lock: %w", err),
-			session.Close(),
+			session.Discard(),
 		)
 	}
 	if !acquired {
@@ -110,7 +119,11 @@ func acquireDatabaseRunLock(
 			if unlockErr == nil && !released {
 				unlockErr = fmt.Errorf("database advisory lock %q was not held", identity)
 			}
-			releaseErr = errors.Join(unlockErr, session.Close())
+			if unlockErr != nil {
+				releaseErr = errors.Join(unlockErr, session.Discard())
+				return
+			}
+			releaseErr = session.Close()
 		})
 		return releaseErr
 	}

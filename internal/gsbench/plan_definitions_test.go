@@ -2,10 +2,46 @@ package gsbench
 
 import (
 	"context"
+	"database/sql"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+type planSessionRestoreDatabase struct {
+	execCalls    []string
+	sessionCalls [][]string
+}
+
+func (d *planSessionRestoreDatabase) Exec(
+	_ context.Context,
+	query string,
+	_ ...any,
+) (sql.Result, error) {
+	d.execCalls = append(d.execCalls, query)
+	return nil, nil
+}
+
+func (*planSessionRestoreDatabase) Scan(
+	context.Context,
+	string,
+	[]any,
+	...any,
+) error {
+	return nil
+}
+
+func (d *planSessionRestoreDatabase) ExecSession(
+	_ context.Context,
+	statements ...string,
+) error {
+	d.sessionCalls = append(
+		d.sessionCalls,
+		append([]string(nil), statements...),
+	)
+	return nil
+}
 
 func TestPlanDefinitionsCoverSixScenariosWithLiteralSQL(t *testing.T) {
 	defs, err := PlanScenarioDefinitions("gsbench")
@@ -56,6 +92,35 @@ func TestPlanchangeDefinitionsUseApprovedIdentities(t *testing.T) {
 	}
 }
 
+func TestPlanDefinitionsPreserveMixedCaseSchemaIdentifiers(t *testing.T) {
+	definitions, err := PlanScenarioDefinitions("Bench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, definition := range definitions {
+		for _, candidate := range definition.Candidates {
+			if !strings.Contains(candidate, `"Bench".plan_data`) {
+				t.Fatalf("candidate lost schema case: %s", candidate)
+			}
+		}
+	}
+	mutations, err := PlanMutationSet(
+		"run-1", "Bench", "planchange_index_drop",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(
+		mutations[0].ForwardSQL,
+		`DROP INDEX "Bench".plan_index_drop_idx`,
+	) || !strings.Contains(
+		mutations[0].InverseSQL,
+		`ON "Bench".plan_data`,
+	) {
+		t.Fatalf("mixed-case index mutation=%+v", mutations[0])
+	}
+}
+
 func TestEveryPlanMutationHasInverseAndRestoreVerification(t *testing.T) {
 	for _, name := range []string{
 		"planchange_stats_target", "planchange_index_unusable", "planchange_stats_ndistinct",
@@ -89,6 +154,46 @@ func TestEveryPlanMutationHasInverseAndRestoreVerification(t *testing.T) {
 		!strings.Contains(unusable[0].InverseSQL, "REBUILD") {
 		t.Fatalf("unusable mutation=%+v", unusable)
 	}
+}
+
+func TestIndexPlanMutationsUseCompleteCanonicalDefinitions(t *testing.T) {
+	drop, err := PlanMutationSet(
+		"run-1", "gsbench", "planchange_index_drop",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := compactPlanDDL(drop[0].InverseSQL), compactPlanDDL(
+		"CREATE INDEX plan_index_drop_idx ON gsbench.plan_data (index_drop_key,dist_key,id)",
+	); got != want {
+		t.Fatalf("605 inverse=%q want=%q", drop[0].InverseSQL, want)
+	}
+
+	shape, err := PlanMutationSet(
+		"run-1", "gsbench", "planchange_index_shape",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := compactPlanDDL(shape[0].InverseSQL), compactPlanDDL(
+		"CREATE INDEX plan_index_shape_good_idx ON gsbench.plan_data (index_shape_lead,index_shape_tail,dist_key,id)",
+	); got != want {
+		t.Fatalf("606 good inverse=%q want=%q", shape[0].InverseSQL, want)
+	}
+	if got, want := compactPlanDDL(shape[1].ForwardSQL), compactPlanDDL(
+		"CREATE INDEX plan_index_shape_bad_idx ON gsbench.plan_data (index_shape_tail,index_shape_lead,dist_key,id)",
+	); got != want {
+		t.Fatalf("606 bad forward=%q want=%q", shape[1].ForwardSQL, want)
+	}
+}
+
+func compactPlanDDL(statement string) string {
+	return strings.NewReplacer(
+		" ", "",
+		"\t", "",
+		"\n", "",
+		`"`, "",
+	).Replace(strings.ToLower(statement))
 }
 
 func TestPlanChangeMutationsAreIndependentlyRestorable(t *testing.T) {
@@ -135,5 +240,46 @@ func TestEveryPlanMutationRestoresAfterAnInterruptedAction(t *testing.T) {
 				t.Fatalf("%s %s inverse verification=%d", scenario, mutation.Kind, len(executor.verifyActions))
 			}
 		}
+	}
+}
+
+func TestExtendedStatisticsAnalyzeRestoresOnOneSession(t *testing.T) {
+	mutations, err := PlanMutationSet(
+		"run-1", "gsbench", "planchange_stats_extended",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var analyze Mutation
+	for _, mutation := range mutations {
+		if mutation.Kind == "statistics_extended_analyze" {
+			analyze = mutation
+			break
+		}
+	}
+	want := []string{
+		"SET default_statistics_target=-2",
+		"ANALYZE \"gsbench\".plan_data ((stats_corr_a,stats_corr_b))",
+		"RESET default_statistics_target",
+	}
+	if !reflect.DeepEqual(analyze.InverseSessionSQL, want) {
+		t.Fatalf("inverse session SQL=%v want=%v", analyze.InverseSessionSQL, want)
+	}
+	action := SQLAction(analyze)
+	database := &planSessionRestoreDatabase{}
+	executor := dbActionExecutor{db: database}
+	if err := executor.Preflight(context.Background(), action); err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.Restore(context.Background(), action); err != nil {
+		t.Fatal(err)
+	}
+	if len(database.execCalls) != 0 ||
+		!reflect.DeepEqual(database.sessionCalls, [][]string{want}) {
+		t.Fatalf(
+			"exec=%v session=%v",
+			database.execCalls,
+			database.sessionCalls,
+		)
 	}
 }

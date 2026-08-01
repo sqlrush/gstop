@@ -2,7 +2,9 @@ package gsbench
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -27,15 +29,105 @@ func (s *fakeWorkloadPlanStore) Explain(_ context.Context, sqlText string) (stri
 
 func (s *fakeWorkloadPlanStore) Cache(
 	_ context.Context,
-	scenario, signature, sqlText, planText string,
+	scenarioCode ScenarioCode,
+	signature, sqlText, planText string,
 ) error {
 	if s.cacheErr != nil {
 		return s.cacheErr
 	}
 	s.cached = append(s.cached, cachedWorkloadPlan{
-		Scenario: scenario, Signature: signature, SQLText: sqlText, PlanText: planText,
+		ScenarioCode: scenarioCode,
+		Signature:    signature,
+		SQLText:      sqlText,
+		PlanText:     planText,
 	})
 	return nil
+}
+
+type recordingWorkloadPlanCacheTransaction struct {
+	queries    []string
+	args       [][]any
+	committed  bool
+	rolledBack bool
+}
+
+func (t *recordingWorkloadPlanCacheTransaction) ExecContext(
+	_ context.Context,
+	query string,
+	args ...any,
+) (sql.Result, error) {
+	t.queries = append(t.queries, query)
+	t.args = append(t.args, append([]any(nil), args...))
+	return nil, nil
+}
+
+func (t *recordingWorkloadPlanCacheTransaction) Commit() error {
+	t.committed = true
+	return nil
+}
+
+func (t *recordingWorkloadPlanCacheTransaction) Rollback() error {
+	t.rolledBack = true
+	return nil
+}
+
+type recordingWorkloadPlanCacheBeginner struct {
+	tx *recordingWorkloadPlanCacheTransaction
+}
+
+func (b recordingWorkloadPlanCacheBeginner) BeginDatasetTransaction(
+	context.Context,
+) (datasetSQLTransaction, error) {
+	return b.tx, nil
+}
+
+func TestReplaceCachedWorkloadPlanUsesScenarioCodeSchemaContract(t *testing.T) {
+	mutation, err := planCacheMutationFor("Bench", ScenarioCode(601))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &recordingWorkloadPlanCacheTransaction{}
+	if err := replaceCachedWorkloadPlan(
+		context.Background(),
+		recordingWorkloadPlanCacheBeginner{tx: tx},
+		mutation,
+		"signature-1",
+		"SELECT 1",
+		"Result  (cost=0.00..1.00 rows=1 width=4)",
+	); err != nil {
+		t.Fatal(err)
+	}
+	wantQueries := []string{
+		`DELETE FROM "Bench".meta_plan_cache WHERE signature=$1 AND scenario_code=$2`,
+		`INSERT INTO "Bench".meta_plan_cache(signature,scenario_code,sql_text,plan_text) VALUES($1,$2,$3,$4)`,
+	}
+	if !reflect.DeepEqual(tx.queries, wantQueries) {
+		t.Fatalf("cache queries=%q want=%q", tx.queries, wantQueries)
+	}
+	if len(tx.args) != 2 {
+		t.Fatalf("cache args=%v", tx.args)
+	}
+	for index, args := range tx.args {
+		if len(args) < 2 {
+			t.Fatalf("cache call %d args=%v", index+1, args)
+		}
+		code, ok := args[1].(int)
+		if !ok || code != 601 {
+			t.Fatalf(
+				"cache call %d scenario argument=%#v (%T), want int(601)",
+				index+1,
+				args[1],
+				args[1],
+			)
+		}
+	}
+	if !tx.committed || tx.rolledBack {
+		t.Fatalf(
+			"cache transaction committed=%v rolled_back=%v",
+			tx.committed,
+			tx.rolledBack,
+		)
+	}
 }
 
 func TestEnsureWorkloadPlansCachesEachUniqueSQLShape(t *testing.T) {
@@ -46,7 +138,7 @@ func TestEnsureWorkloadPlansCachesEachUniqueSQLShape(t *testing.T) {
 		second: "Index Scan  (cost=0.00..1.00 rows=1 width=8)",
 	}}
 	if err := ensureWorkloadPlans(
-		context.Background(), store, "tp_cpu", []string{first, first, second},
+		context.Background(), store, ScenarioCode(101), []string{first, first, second},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +147,7 @@ func TestEnsureWorkloadPlansCachesEachUniqueSQLShape(t *testing.T) {
 	}
 	for _, cached := range store.cached {
 		if cached.Signature != sqlshape.Signature(cached.SQLText) ||
-			cached.Scenario != "tp_cpu" {
+			cached.ScenarioCode != 101 {
 			t.Fatalf("cached=%+v", cached)
 		}
 	}
@@ -68,7 +160,7 @@ func TestEnsureWorkloadPlansRejectsEmptyOrUnparseablePlan(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := &fakeWorkloadPlanStore{plans: map[string]string{"SELECT 1": plan}}
 			err := ensureWorkloadPlans(
-				context.Background(), store, "connection_pool", []string{"SELECT 1"},
+				context.Background(), store, ScenarioCode(403), []string{"SELECT 1"},
 			)
 			if err == nil || !strings.Contains(err.Error(), "empty or unparseable plan") {
 				t.Fatalf("err=%v", err)
@@ -88,7 +180,7 @@ func TestEnsureWorkloadPlansRejectsBindMarkersBeforeExplain(t *testing.T) {
 	} {
 		store := &fakeWorkloadPlanStore{}
 		err := ensureWorkloadPlans(
-			context.Background(), store, "tp_cpu", []string{sqlText},
+			context.Background(), store, ScenarioCode(101), []string{sqlText},
 		)
 		if err == nil || !strings.Contains(err.Error(), "bind marker") {
 			t.Fatalf("sql=%s err=%v", sqlText, err)
@@ -102,7 +194,7 @@ func TestEnsureWorkloadPlansRejectsBindMarkersBeforeExplain(t *testing.T) {
 func TestEnsureWorkloadPlansPropagatesExplainAndCacheFailures(t *testing.T) {
 	explainStore := &fakeWorkloadPlanStore{explainErr: errors.New("explain denied")}
 	if err := ensureWorkloadPlans(
-		context.Background(), explainStore, "tp_cpu", []string{"SELECT 1"},
+		context.Background(), explainStore, ScenarioCode(101), []string{"SELECT 1"},
 	); err == nil || !strings.Contains(err.Error(), "explain denied") {
 		t.Fatalf("explain err=%v", err)
 	}
@@ -112,7 +204,7 @@ func TestEnsureWorkloadPlansPropagatesExplainAndCacheFailures(t *testing.T) {
 		cacheErr: errors.New("cache denied"),
 	}
 	if err := ensureWorkloadPlans(
-		context.Background(), cacheStore, "tp_cpu", []string{"SELECT 1"},
+		context.Background(), cacheStore, ScenarioCode(101), []string{"SELECT 1"},
 	); err == nil || !strings.Contains(err.Error(), "cache denied") {
 		t.Fatalf("cache err=%v", err)
 	}

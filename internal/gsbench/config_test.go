@@ -38,6 +38,113 @@ schema = gsbench
 `
 }
 
+func TestLoadConfigStoresAbsoluteCleanIdentityAndDirectory(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "release", "configs")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "gsbench.cfg")
+	if err := os.WriteFile(configPath, []byte(minimalConfig()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+
+	cfg, err := LoadConfig(
+		filepath.Join("release", "configs", "..", "configs", "gsbench.cfg"),
+		Overrides{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Path != configPath || cfg.ConfigDir != configDir {
+		t.Fatalf("config identity path=%q dir=%q want path=%q dir=%q", cfg.Path, cfg.ConfigDir, configPath, configDir)
+	}
+}
+
+func TestConfigStatePathsAndRelativeSecretsAreIndependentOfCWD(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "release", "configs")
+	secretDir := filepath.Join(configDir, "secrets")
+	if err := os.MkdirAll(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "gsbench.cfg")
+	body := strings.Replace(
+		minimalConfig(),
+		"password_env = GSBENCH_TEST_PASSWORD",
+		"password_env = GSBENCH_TEST_PASSWORD\npassword_config = secrets/gstop.cfg",
+		1,
+	)
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(secretDir, "gstop.cfg"),
+		[]byte("[main]\ndb_password = config-relative-secret\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	loadFrom := func(cwd string) BenchConfig {
+		t.Helper()
+		if err := os.MkdirAll(cwd, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(cwd)
+		cfg, err := LoadConfig(configPath, Overrides{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	first := loadFrom(filepath.Join(root, "cwd-a"))
+	second := loadFrom(filepath.Join(root, "cwd-b"))
+	if first.Path != second.Path || first.ConfigDir != second.ConfigDir {
+		t.Fatalf("config identity changed with cwd: first=%q/%q second=%q/%q", first.Path, first.ConfigDir, second.Path, second.ConfigDir)
+	}
+	if first.Database.Password != "config-relative-secret" ||
+		second.Database.Password != "config-relative-secret" {
+		t.Fatalf("relative password config was not anchored to config directory")
+	}
+	if first.FaultProvider.LedgerPath != second.FaultProvider.LedgerPath {
+		t.Fatalf("ledger changed with cwd: %q != %q", first.FaultProvider.LedgerPath, second.FaultProvider.LedgerPath)
+	}
+	wantLedgerDir := filepath.Join(configDir, "logs")
+	if filepath.Dir(first.FaultProvider.LedgerPath) != wantLedgerDir {
+		t.Fatalf("ledger dir=%q want=%q", filepath.Dir(first.FaultProvider.LedgerPath), wantLedgerDir)
+	}
+	firstLog, err := runLogPath(first.ConfigDir, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondLog, err := runLogPath(second.ConfigDir, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstLog != secondLog || filepath.Dir(firstLog) != wantLedgerDir {
+		t.Fatalf("run log changed with cwd: first=%q second=%q", firstLog, secondLog)
+	}
+	if first.FaultProvider.LedgerPath+".lock" != second.FaultProvider.LedgerPath+".lock" {
+		t.Fatalf("ledger lock identity changed with cwd")
+	}
+}
+
+func TestConfigRejectsConcurrentPlanChangeScenarios(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 601,605",
+		1,
+	)
+	_, err := LoadConfig(writeTestConfig(t, body), Overrides{})
+	if err == nil || !strings.Contains(err.Error(), "601-606") ||
+		!strings.Contains(err.Error(), "serial") {
+		t.Fatalf("multiple plan-change scenarios error=%v", err)
+	}
+}
+
 func TestConfigLoadsDefaultsAndDurations(t *testing.T) {
 	cfg, err := LoadConfig(writeTestConfig(t, minimalConfig()), Overrides{})
 	if err != nil {
@@ -466,7 +573,7 @@ func TestConfigDefaultLedgerPathIsStableAndConfigSpecificUnderLogs(t *testing.T)
 		t.Fatalf("different configs share ledger %q", first.FaultProvider.LedgerPath)
 	}
 	if !filepath.IsAbs(first.FaultProvider.LedgerPath) ||
-		filepath.Base(filepath.Dir(first.FaultProvider.LedgerPath)) != "logs" {
+		filepath.Dir(first.FaultProvider.LedgerPath) != filepath.Join(dir, "logs") {
 		t.Fatalf("default ledger is not resolved under logs: %q", first.FaultProvider.LedgerPath)
 	}
 	if matched := regexp.MustCompile(

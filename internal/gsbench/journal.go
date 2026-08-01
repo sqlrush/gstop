@@ -33,14 +33,17 @@ type Mutation struct {
 	VerifyAction   string
 	LastError      string
 
-	Scenario    string
-	Kind        string
-	Target      string
-	Original    string
-	ForwardSQL  string
-	InverseSQL  string
-	VerifySQL   string
-	VerifyValue string
+	Scenario   string
+	Kind       string
+	Target     string
+	Original   string
+	ForwardSQL string
+	InverseSQL string
+	// InverseSessionSQL restores state with statements that must share one
+	// database session. InverseSQL remains the readable primary statement.
+	InverseSessionSQL []string
+	VerifySQL         string
+	VerifyValue       string
 }
 
 // JournalEntry remains as a source-compatibility data shape for callers that

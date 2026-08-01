@@ -335,9 +335,15 @@ func SQLAction(m Mutation) Action {
 		}{SQL: m.ForwardAction})
 	}
 	if m.InverseAction != "" {
-		action.Inverse = marshalActionPayload(struct {
-			SQL string `json:"sql"`
-		}{SQL: m.InverseAction})
+		if len(m.InverseSessionSQL) != 0 {
+			action.Inverse = marshalActionPayload(struct {
+				SessionSQL []string `json:"session_sql"`
+			}{SessionSQL: append([]string(nil), m.InverseSessionSQL...)})
+		} else {
+			action.Inverse = marshalActionPayload(struct {
+				SQL string `json:"sql"`
+			}{SQL: m.InverseAction})
+		}
 	}
 	if m.VerifyAction != "" {
 		action.Verify = marshalActionPayload(struct {
@@ -354,4 +360,31 @@ func marshalActionPayload(value any) json.RawMessage {
 		panic(fmt.Sprintf("marshal internal action payload: %v", err))
 	}
 	return payload
+}
+
+func sqlStatementFromActionPayload(payload json.RawMessage) (string, bool) {
+	var decoded struct {
+		SQL        string   `json:"sql"`
+		SessionSQL []string `json:"session_sql"`
+	}
+	if json.Unmarshal(payload, &decoded) != nil {
+		return "", false
+	}
+	statement := strings.TrimSpace(decoded.SQL)
+	if statement != "" {
+		return statement, true
+	}
+	for _, candidate := range decoded.SessionSQL {
+		candidate = strings.TrimSpace(candidate)
+		fields := strings.Fields(candidate)
+		if len(fields) != 0 && strings.EqualFold(fields[0], "ANALYZE") {
+			return candidate, true
+		}
+	}
+	for _, candidate := range decoded.SessionSQL {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			return candidate, true
+		}
+	}
+	return "", false
 }

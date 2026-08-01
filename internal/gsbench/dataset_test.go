@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -253,6 +254,50 @@ type atomicDatasetExecutor struct {
 	fail    error
 }
 
+type resumableDatasetExecutor struct {
+	catalogDatasetExecutor
+	failCustomerCreate bool
+	recordedVersions   []string
+}
+
+func (e *resumableDatasetExecutor) Exec(
+	_ context.Context,
+	query string,
+	_ ...any,
+) error {
+	e.statements = append(e.statements, query)
+	e.recordingDatasetExecutor.events = append(
+		e.recordingDatasetExecutor.events,
+		"exec:"+query,
+	)
+	switch {
+	case strings.HasPrefix(query, "CREATE SCHEMA "):
+		e.schemaExists = true
+	case strings.HasPrefix(query, `CREATE TABLE "gsbench".meta_dataset`):
+		e.existing["table:meta_dataset"] = true
+	case strings.HasPrefix(query, `CREATE TABLE "gsbench".customers`) &&
+		e.failCustomerCreate:
+		e.failCustomerCreate = false
+		return errors.New("injected customer table failure")
+	}
+	return nil
+}
+
+func (e *resumableDatasetExecutor) RecordDatasetVersion(
+	_ context.Context,
+	_ string,
+	version string,
+) error {
+	e.version = version
+	e.recorded = version
+	e.recordedVersions = append(e.recordedVersions, version)
+	e.recordingDatasetExecutor.events = append(
+		e.recordingDatasetExecutor.events,
+		"record-version:"+version,
+	)
+	return nil
+}
+
 func (e *atomicDatasetExecutor) ApplyDatasetBatch(
 	_ context.Context,
 	schema string,
@@ -454,6 +499,281 @@ func TestDatasetInitRechecksSchemaAfterConcurrentCreate(t *testing.T) {
 	}
 	if exec.schemaChecks != 2 {
 		t.Fatalf("schema checks=%d", exec.schemaChecks)
+	}
+}
+
+func TestDatasetInitRejectsPreexistingSchemaWithoutOwnershipBeforeDDL(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{
+			`CREATE TABLE "gsbench".meta_dataset (
+				key varchar(128) PRIMARY KEY,
+				value text NOT NULL,
+				updated_at timestamp NOT NULL DEFAULT current_timestamp
+			)`,
+			`CREATE TABLE "gsbench".meta_plan_cache (
+				signature varchar(128) NOT NULL,
+				scenario_code integer NOT NULL,
+				sql_text text NOT NULL,
+				plan_text text NOT NULL,
+				updated_at timestamp NOT NULL DEFAULT current_timestamp,
+				PRIMARY KEY(signature,scenario_code)
+			)`,
+		},
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed:    map[string]int64{},
+			schemaExists: true,
+		},
+		existing: map[string]bool{},
+	}
+
+	err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	)
+	if err == nil || !strings.Contains(err.Error(), "not owned by gsbench") {
+		t.Fatalf("Init() error=%v", err)
+	}
+	if len(exec.statements) != 0 || len(exec.migrated) != 0 {
+		t.Fatalf(
+			"unowned schema was mutated: statements=%v migrations=%v",
+			exec.statements,
+			exec.migrated,
+		)
+	}
+}
+
+func TestDatasetInitRejectsPreexistingMetaDatasetWithoutVersionBeforeDDL(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{`CREATE TABLE "gsbench".meta_dataset (
+			key varchar(128) PRIMARY KEY,
+			value text NOT NULL,
+			updated_at timestamp NOT NULL DEFAULT current_timestamp
+		)`},
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed:    map[string]int64{},
+			schemaExists: true,
+		},
+		existing: map[string]bool{"table:meta_dataset": true},
+	}
+
+	err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	)
+	if err == nil || !strings.Contains(err.Error(), "dataset_version ownership marker") {
+		t.Fatalf("Init() error=%v", err)
+	}
+	if len(exec.statements) != 0 || len(exec.migrated) != 0 {
+		t.Fatalf(
+			"untrusted meta_dataset was mutated: statements=%v migrations=%v",
+			exec.statements,
+			exec.migrated,
+		)
+	}
+}
+
+func TestDatasetInitRejectsEmptyExistingSchemaWithoutOwnership(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{`CREATE TABLE "gsbench".meta_dataset (
+			key varchar(128) PRIMARY KEY,
+			value text NOT NULL,
+			updated_at timestamp NOT NULL DEFAULT current_timestamp
+		)`},
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed:    map[string]int64{},
+			schemaExists: true,
+		},
+		existing: map[string]bool{},
+	}
+
+	err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	)
+	if err == nil || !strings.Contains(err.Error(), "not owned by gsbench") {
+		t.Fatalf("Init() error=%v", err)
+	}
+	if len(exec.statements) != 0 || len(exec.migrated) != 0 {
+		t.Fatalf(
+			"pre-existing empty schema was claimed: statements=%v migrations=%v",
+			exec.statements,
+			exec.migrated,
+		)
+	}
+}
+
+func TestDatasetInitBootstrapsSchemaCreatedByCurrentInit(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{`CREATE TABLE "gsbench".meta_dataset (
+			key varchar(128) PRIMARY KEY,
+			value text NOT NULL,
+			updated_at timestamp NOT NULL DEFAULT current_timestamp
+		)`},
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed: map[string]int64{},
+		},
+		existing: map[string]bool{},
+	}
+
+	if err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.statements) < 2 ||
+		exec.statements[0] != `CREATE SCHEMA "gsbench"` ||
+		!strings.HasPrefix(exec.statements[1], `CREATE TABLE "gsbench".meta_dataset`) {
+		t.Fatalf("ownership bootstrap statements=%v", exec.statements)
+	}
+	if exec.recorded != datasetVersion {
+		t.Fatalf("recorded version=%q want=%q", exec.recorded, datasetVersion)
+	}
+}
+
+func TestDatasetInitDoesNotClaimSchemaCreatedConcurrently(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{`CREATE TABLE "gsbench".meta_dataset (
+			key varchar(128) PRIMARY KEY,
+			value text NOT NULL,
+			updated_at timestamp NOT NULL DEFAULT current_timestamp
+		)`},
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed:           map[string]int64{},
+			createSchemaErr:     errors.New("duplicate_schema"),
+			schemaExistsOnRetry: true,
+		},
+		existing: map[string]bool{},
+	}
+
+	err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	)
+	if err == nil || !strings.Contains(err.Error(), "not owned by gsbench") {
+		t.Fatalf("Init() error=%v", err)
+	}
+	for _, statement := range exec.statements {
+		if strings.HasPrefix(statement, "CREATE TABLE") {
+			t.Fatalf("concurrently-created schema was claimed: %s", statement)
+		}
+	}
+	if len(exec.migrated) != 0 {
+		t.Fatalf("concurrently-created schema was migrated: %v", exec.migrated)
+	}
+}
+
+func TestDatasetInitResumesAfterFailureFollowingOwnershipMarker(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{
+			`CREATE TABLE "gsbench".meta_dataset (
+				key varchar(128) PRIMARY KEY,
+				value text NOT NULL,
+				updated_at timestamp NOT NULL DEFAULT current_timestamp
+			)`,
+			`CREATE TABLE "gsbench".customers (
+				dist_key bigint NOT NULL,
+				id bigint NOT NULL,
+				PRIMARY KEY(dist_key,id)
+			)`,
+		},
+	}
+	exec := &resumableDatasetExecutor{
+		catalogDatasetExecutor: catalogDatasetExecutor{
+			recordingDatasetExecutor: recordingDatasetExecutor{
+				completed: map[string]int64{},
+			},
+			existing: map[string]bool{},
+		},
+		failCustomerCreate: true,
+	}
+	manager := NewDatasetManagerWithValidation(exec, false)
+
+	err := manager.Init(context.Background(), plan)
+	if err == nil || !strings.Contains(err.Error(), "injected customer table failure") {
+		t.Fatalf("first Init() error=%v", err)
+	}
+	if !reflect.DeepEqual(exec.recordedVersions, []string{datasetVersion}) {
+		t.Fatalf("versions after interrupted init=%v", exec.recordedVersions)
+	}
+	markerAt, customerAt := -1, -1
+	for index, event := range exec.recordingDatasetExecutor.events {
+		if event == "record-version:"+datasetVersion && markerAt < 0 {
+			markerAt = index
+		}
+		if strings.HasPrefix(event, `exec:CREATE TABLE "gsbench".customers`) &&
+			customerAt < 0 {
+			customerAt = index
+		}
+	}
+	if markerAt < 0 || customerAt < 0 || markerAt >= customerAt {
+		t.Fatalf("ownership marker was not written before other DDL: events=%v",
+			exec.recordingDatasetExecutor.events)
+	}
+
+	if err := manager.Init(context.Background(), plan); err != nil {
+		t.Fatalf("second Init() failed to resume: %v", err)
+	}
+	if exec.schemaChecks != 2 {
+		t.Fatalf("schema checks=%d want=2", exec.schemaChecks)
+	}
+}
+
+func TestDatasetInitMigratesTrustedLegacySchema(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{
+			`CREATE TABLE "gsbench".meta_dataset (
+				key varchar(128) PRIMARY KEY,
+				value text NOT NULL,
+				updated_at timestamp NOT NULL DEFAULT current_timestamp
+			)`,
+			`CREATE TABLE "gsbench".meta_plan_cache (
+				signature varchar(128) NOT NULL,
+				scenario_code integer NOT NULL,
+				sql_text text NOT NULL,
+				plan_text text NOT NULL,
+				updated_at timestamp NOT NULL DEFAULT current_timestamp,
+				PRIMARY KEY(signature,scenario_code)
+			)`,
+		},
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed:    map[string]int64{},
+			schemaExists: true,
+		},
+		existing: map[string]bool{
+			"table:meta_dataset":    true,
+			"table:meta_plan_cache": true,
+		},
+		version: "3",
+	}
+
+	if err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(exec.migrated, "meta_plan_cache") {
+		t.Fatalf("legacy migrations=%v", exec.migrated)
 	}
 }
 
@@ -718,6 +1038,7 @@ func TestDatasetInitCompletesLegacyMigrationsBeforeCatalogValidation(t *testing.
 			schemaExists: true,
 		},
 		existing: map[string]bool{},
+		version:  "3",
 	}
 	for _, statement := range plan.DDL {
 		object, parseErr := parseDatasetObject(statement)

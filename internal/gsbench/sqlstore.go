@@ -178,6 +178,34 @@ func (e dbDatasetExecutor) MigrateLegacyDatasetObject(
 		)
 	case "meta_batches":
 		statements, err = legacyBatchMigrationStatements(e.schema, columns)
+	case "meta_plan_cache":
+		if err := screenLegacyPlanCacheRows(
+			ctx,
+			databaseJournalDB{db: e.db},
+			e.schema,
+			columns,
+		); err != nil {
+			return err
+		}
+		primaryKey, primaryKeyDefinition, keyErr := e.datasetPrimaryKey(
+			ctx, object.Name,
+		)
+		if keyErr != nil && keyErr != sql.ErrNoRows {
+			return keyErr
+		}
+		distribution, distributionMismatch, distributionErr :=
+			e.datasetDistributionMigration(ctx, object)
+		if distributionErr != nil {
+			return distributionErr
+		}
+		statements, err = legacyPlanCacheMigrationStatements(
+			e.schema,
+			columns,
+			primaryKey,
+			primaryKeyDefinition,
+			distribution,
+			distributionMismatch,
+		)
 	}
 	if err != nil {
 		return err
@@ -189,6 +217,7 @@ func (e dbDatasetExecutor) MigrateLegacyDatasetObject(
 	}
 	if object.Distribution != "" &&
 		object.Name != "meta_journal" &&
+		object.Name != "meta_plan_cache" &&
 		object.Name != "plan_data" {
 		distribution, mismatch, distributionErr :=
 			e.datasetDistributionMigration(ctx, object)
@@ -913,6 +942,173 @@ func legacyPlanDataConvergenceStatements(
 	return statements, nil
 }
 
+func legacyPlanCacheMigrationStatements(
+	schema string,
+	columns map[string]bool,
+	primaryKeyName string,
+	primaryKeyDefinition string,
+	distribution string,
+	distributionMismatch bool,
+) ([]string, error) {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return nil, fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+	if !columns["scenario"] && !columns["scenario_code"] {
+		return nil, fmt.Errorf(
+			"meta_plan_cache has no scenario identity column",
+		)
+	}
+	table := quotedSchema + ".meta_plan_cache"
+	var statements []string
+	if !columns["scenario_code"] {
+		statements = append(
+			statements,
+			"ALTER TABLE "+table+" ADD COLUMN scenario_code integer",
+		)
+	}
+	if columns["scenario"] {
+		statements = append(
+			statements,
+			"UPDATE "+table+" SET scenario_code="+
+				legacyJournalScenarioExpression(columns),
+		)
+	}
+	statements = append(
+		statements,
+		"ALTER TABLE "+table+
+			" ALTER COLUMN scenario_code SET NOT NULL",
+	)
+	if distributionMismatch {
+		if normalizeDatasetSQL(distribution) != "hash(signature)" {
+			return nil, fmt.Errorf(
+				"unsafe meta_plan_cache distribution %q",
+				distribution,
+			)
+		}
+		statements = append(
+			statements,
+			"ALTER TABLE "+table+" DISTRIBUTE BY "+distribution,
+		)
+	}
+	if normalizeDatasetSQL(primaryKeyDefinition) !=
+		normalizeDatasetSQL("PRIMARY KEY (signature,scenario_code)") {
+		if primaryKeyName != "" {
+			quotedKey, valid := quoteDatasetIdentifier(primaryKeyName)
+			if !valid {
+				return nil, fmt.Errorf(
+					"unsafe primary-key name %q",
+					primaryKeyName,
+				)
+			}
+			statements = append(
+				statements,
+				"ALTER TABLE "+table+" DROP CONSTRAINT "+quotedKey+
+					", ADD PRIMARY KEY (signature,scenario_code)",
+			)
+		} else {
+			statements = append(
+				statements,
+				"ALTER TABLE "+table+
+					" ADD PRIMARY KEY (signature,scenario_code)",
+			)
+		}
+	}
+	if columns["scenario"] {
+		statements = append(
+			statements,
+			"ALTER TABLE "+table+" DROP COLUMN scenario",
+		)
+	}
+	return statements, nil
+}
+
+func screenLegacyPlanCacheRows(
+	ctx context.Context,
+	db journalDatabase,
+	schema string,
+	columns map[string]bool,
+) error {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return fmt.Errorf("unsafe plan cache schema %q", schema)
+	}
+	table := quotedSchema + ".meta_plan_cache"
+	if columns["scenario"] {
+		expression := legacyJournalScenarioExpression(columns)
+		var invalid int64
+		if err := db.Scan(
+			ctx,
+			"SELECT count(*) FROM "+table+
+				" WHERE ("+expression+") IS NULL",
+			nil,
+			&invalid,
+		); err != nil {
+			return fmt.Errorf("screen legacy plan cache scenarios: %w", err)
+		}
+		if invalid != 0 {
+			return fmt.Errorf(
+				"legacy plan cache contains %d unknown scenario rows",
+				invalid,
+			)
+		}
+		var collisions int64
+		if err := db.Scan(
+			ctx,
+			"SELECT count(*) FROM ("+
+				"SELECT signature,("+expression+") AS mapped_scenario_code "+
+				"FROM "+table+" GROUP BY signature,("+expression+") "+
+				"HAVING count(*)>1) AS conflicts",
+			nil,
+			&collisions,
+		); err != nil {
+			return fmt.Errorf("screen legacy plan cache collisions: %w", err)
+		}
+		if collisions != 0 {
+			return fmt.Errorf(
+				"legacy plan cache contains %d scenario-code collisions",
+				collisions,
+			)
+		}
+		return nil
+	}
+	if !columns["scenario_code"] {
+		return fmt.Errorf("meta_plan_cache has no scenario identity column")
+	}
+	codes := legacyJournalScenarioCodes()
+	validCodes := make(map[ScenarioCode]bool, len(codes))
+	for _, code := range codes {
+		validCodes[code] = true
+	}
+	sortedCodes := make([]int, 0, len(validCodes))
+	for code := range validCodes {
+		sortedCodes = append(sortedCodes, int(code))
+	}
+	sort.Ints(sortedCodes)
+	valid := make([]string, len(sortedCodes))
+	for index, code := range sortedCodes {
+		valid[index] = fmt.Sprint(code)
+	}
+	var invalid int64
+	if err := db.Scan(
+		ctx,
+		"SELECT count(*) FROM "+table+
+			" WHERE scenario_code IS NULL OR scenario_code=0"+
+			" OR scenario_code NOT IN ("+strings.Join(valid, ",")+")",
+		nil,
+		&invalid,
+	); err != nil {
+		return fmt.Errorf("screen formal plan cache scenarios: %w", err)
+	}
+	if invalid != 0 {
+		return fmt.Errorf(
+			"formal plan cache contains %d invalid scenario code rows",
+			invalid,
+		)
+	}
+	return nil
+}
+
 func legacyJournalExpression(columns map[string]bool, legacy, fallback string) string {
 	if columns[legacy] {
 		return legacy
@@ -1518,11 +1714,16 @@ type actionSQLDatabase interface {
 	Scan(context.Context, string, []any, ...any) error
 }
 
+type actionSQLSessionDatabase interface {
+	ExecSession(context.Context, ...string) error
+}
+
 type dbActionExecutor struct{ db actionSQLDatabase }
 
 type sqlActionPayload struct {
-	SQL      string `json:"sql"`
-	Expected string `json:"expected,omitempty"`
+	SQL        string   `json:"sql,omitempty"`
+	SessionSQL []string `json:"session_sql,omitempty"`
+	Expected   string   `json:"expected,omitempty"`
 }
 
 func (e dbActionExecutor) Preflight(_ context.Context, action Action) error {
@@ -1579,6 +1780,9 @@ func (e dbActionExecutor) VerifyRestored(
 	if err != nil {
 		return fmt.Errorf("decode SQL verify action: %w", err)
 	}
+	if len(payload.SessionSQL) != 0 {
+		return fmt.Errorf("SQL verify action does not support session statements")
+	}
 	var actual string
 	if err := e.db.Scan(ctx, payload.SQL, nil, &actual); err != nil {
 		return err
@@ -1605,6 +1809,16 @@ func (e dbActionExecutor) execute(
 	if err != nil {
 		return fmt.Errorf("decode SQL action: %w", err)
 	}
+	if len(payload.SessionSQL) != 0 {
+		if action.LegacySQL {
+			return fmt.Errorf("legacy SQL action does not support session statements")
+		}
+		database, ok := e.db.(actionSQLSessionDatabase)
+		if !ok {
+			return fmt.Errorf("SQL action database does not support session execution")
+		}
+		return database.ExecSession(ctx, payload.SessionSQL...)
+	}
 	if !action.LegacySQL {
 		_, err := e.db.Exec(ctx, payload.SQL)
 		return err
@@ -1630,6 +1844,27 @@ func preflightSQLActionPayload(
 	if err != nil {
 		return fmt.Errorf("%s SQL payload: %w", name, err)
 	}
+	if len(payload.SessionSQL) != 0 {
+		if allowLegacyMultiple {
+			return fmt.Errorf(
+				"%s SQL payload cannot use session statements with legacy provenance",
+				name,
+			)
+		}
+		for _, statement := range payload.SessionSQL {
+			statements, err := legacySQLStatements(statement)
+			if err != nil {
+				return fmt.Errorf("%s SQL payload: %w", name, err)
+			}
+			if len(statements) != 1 {
+				return fmt.Errorf(
+					"%s SQL session payload statements must each contain one executable statement",
+					name,
+				)
+			}
+		}
+		return nil
+	}
 	statements, err := legacySQLStatements(payload.SQL)
 	if err != nil {
 		return fmt.Errorf("%s SQL payload: %w", name, err)
@@ -1651,8 +1886,23 @@ func decodeSQLActionPayload(raw json.RawMessage) (sqlActionPayload, error) {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return sqlActionPayload{}, err
 	}
-	if strings.TrimSpace(payload.SQL) == "" {
-		return sqlActionPayload{}, fmt.Errorf("SQL is required")
+	payload.SQL = strings.TrimSpace(payload.SQL)
+	for index := range payload.SessionSQL {
+		payload.SessionSQL[index] = strings.TrimSpace(payload.SessionSQL[index])
+		if payload.SessionSQL[index] == "" {
+			return sqlActionPayload{}, fmt.Errorf(
+				"session SQL statement %d is empty",
+				index+1,
+			)
+		}
+	}
+	if payload.SQL == "" && len(payload.SessionSQL) == 0 {
+		return sqlActionPayload{}, fmt.Errorf("SQL or session SQL is required")
+	}
+	if payload.SQL != "" && len(payload.SessionSQL) != 0 {
+		return sqlActionPayload{}, fmt.Errorf(
+			"SQL and session SQL are mutually exclusive",
+		)
 	}
 	return payload, nil
 }

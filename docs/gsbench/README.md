@@ -2,6 +2,8 @@
 
 `gsbench` 是面向 openGauss/GaussDB 的轻量故障与压力场景模拟工具。它先只读探测产品、拓扑和能力，再在有限时长内运行负载，并通过统一恢复协调器收尾。
 
+发布使用请先看[Linux ARM64 安装手册](INSTALL.md)和[配置手册](CONFIG.md)；本轮自动化与现场待验证项见[2026-08-01 全场景测试报告](FULL_SCENARIO_REPORT_20260801.md)。
+
 当前轻量发布目录共 90 个场景：**65 个已注册可运行，25 个已编目但刻意延后**。这不是完整故障注入平台。
 
 ## 快速开始
@@ -24,7 +26,9 @@ gsbench restore --dry-run
 gsbench restore
 ```
 
-`help`、`version`、`scenarios` 不读取配置，也不连接数据库。其余命令按 `-c/--config`、`GSBENCH_CONFIG`、`./gsbench.cfg`、`./configs/gsbench.cfg` 的优先级加载配置。
+`help`、`version`、`scenarios` 不读取配置，也不连接数据库。其余命令按 `-c/--config`、`GSBENCH_CONFIG`、当前目录的 `gsbench.cfg`、当前目录的 `configs/gsbench.cfg`、可执行文件同目录的 `gsbench.cfg`、可执行文件父目录下的 `configs/gsbench.cfg` 的固定优先级加载配置。显式路径不存在会直接报错，不会退回其他候选；自动化与生产运行推荐传绝对路径，例如 `gsbench doctor --config "$PWD/configs/gsbench.cfg"`。
+
+配置加载后会固定为绝对路径。默认日志和 recovery ledger 都写入配置文件同目录的 `logs/`；显式相对 `fault_provider.ledger_path` 和 `database.password_config` 也相对配置目录解析，因此从不同工作目录启动仍使用同一组状态文件和锁。
 
 ## 已实现与延后目录
 
@@ -52,9 +56,12 @@ gsbench run -s 501,504 -d 2m
 gsbench run -s 520 -d 2m
 
 # 执行计划变化与硬解析
-gsbench run -s 601,605 -d 2m
+gsbench run -s 601 -d 2m
+gsbench run -s 605 -d 2m
 gsbench run -s 621,624 -d 2m
 ```
+
+601–606 会修改同一组 `plan_data` 计划状态，必须每次只选择一个并逐个串行运行；配置层会拒绝在同一次 run 中组合其中两个或更多场景。
 
 `run` 也接受完整名称和逗号组合，例如 `gsbench run -s memory_workmem_sort,io_sequential_read -d 2m`。
 
@@ -78,14 +85,14 @@ Risk A 无额外开关。Risk B 还要求 `safety.allow_admin_mutation=true` 和
 
 配置只包含实际读取的键：`database.*`、`run.*`、`data.*`、`safety.*`、`fault_provider.*`，以及现有 CPU、连接池、线程池和 vacuum 场景的 `scenario.*` 参数。不要在配置中写密码；使用 `database.password_env=GSBENCH_PASSWORD`，或以 `database.password_config` 引用同发布目录的 gstop 配置。日志会脱敏 DSN 密码，但配置文件仍应限制权限。
 
-`run.validation_enabled=false` 时会跳过容量、数据集结构/版本/物理布局、计划基线、场景结果、动作前置/恢复结果及拓扑健康验证；配置和标识符安全、Risk B/C 授权、真实 DDL/DML/负载错误、恢复逆操作错误、锁与 journal 持久化仍然生效。该模式可能写满磁盘或隐藏结果偏差，仅用于隔离测试。需要原有严格行为时设置：
+`run.validation_enabled=false` 只跳过模型预估、场景结果门槛和数据布局一致性判断。容量检查、物理大小测量、未知数据库版本拒绝、真实 DDL/DML/负载错误，以及恢复锁、journal/ledger 持久化、逆操作和其他恢复安全边界仍然强制执行；关闭验证不能把这些失败降级为成功。需要模型、结果和布局的严格判定时设置：
 
 ```ini
 [run]
 validation_enabled = true
 ```
 
-分布式真实 `init` 在默认关闭验证时不再因容量/物理大小 provider 缺失而中止；启用验证后仍会 fail closed。生产使用前，应启用验证，并在同版本测试环境完成 `doctor`、`init --dry-run`、最短运行和 restore 演练。
+生产使用前，应启用验证，并在同版本测试环境完成 `doctor`、`init --dry-run`、最短运行和 restore 演练。逐场景 live 验证的配置、门禁和判定方式见[完整逐场景验证流程](FULL_SCENARIO_TEST.md)。
 
 ## 结果
 

@@ -10,10 +10,11 @@ type PlanScenarioDefinition struct {
 }
 
 func PlanScenarioDefinitions(schema string) ([]PlanScenarioDefinition, error) {
-	if !identifierRE.MatchString(schema) {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
 		return nil, fmt.Errorf("unsafe schema %q", schema)
 	}
-	table := schema + ".plan_data"
+	table := quotedSchema + ".plan_data"
 	rangeQueries := func(column string, widths ...int) []string {
 		out := make([]string, 0, len(widths))
 		for _, width := range widths {
@@ -74,10 +75,11 @@ func PlanScenarioDefinitions(schema string) ([]PlanScenarioDefinition, error) {
 }
 
 func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
-	if !identifierRE.MatchString(schema) {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
 		return nil, fmt.Errorf("unsafe schema %q", schema)
 	}
-	table := schema + ".plan_data"
+	table := quotedSchema + ".plan_data"
 	code, ok := planChangeCodeForName(scenario)
 	if !ok {
 		return nil, fmt.Errorf("unknown plan scenario %q", scenario)
@@ -111,7 +113,7 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 			),
 		}, nil
 	case "planchange_index_unusable":
-		index := schema + ".plan_index_unusable_idx"
+		index := quotedSchema + ".plan_index_unusable_idx"
 		return []Mutation{base(
 			"index_unusable", index,
 			"ALTER INDEX "+index+" UNUSABLE",
@@ -144,6 +146,17 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 		}, nil
 	case "planchange_stats_extended":
 		verify := `SELECT count(*) FROM pg_statistic_ext WHERE starelid='` + table + `'::regclass`
+		analyze := base(
+			"statistics_extended_analyze", table+".(stats_corr_a,stats_corr_b) analyze",
+			"ANALYZE "+table+"(stats_corr_a,stats_corr_b)",
+			"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
+			"SELECT 1", "1",
+		)
+		analyze.InverseSessionSQL = []string{
+			"SET default_statistics_target=-2",
+			"ANALYZE " + table + " ((stats_corr_a,stats_corr_b))",
+			"RESET default_statistics_target",
+		}
 		return []Mutation{
 			base(
 				"statistics_extended", table+".(stats_corr_a,stats_corr_b)",
@@ -151,36 +164,59 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 				"ALTER TABLE "+table+" ADD STATISTICS ((stats_corr_a,stats_corr_b))",
 				verify, "1",
 			),
-			base(
-				"statistics_extended_analyze", table+".(stats_corr_a,stats_corr_b) analyze",
-				"ANALYZE "+table+"(stats_corr_a,stats_corr_b)",
-				"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
-				"SELECT 1", "1",
-			),
+			analyze,
 		}, nil
 	case "planchange_index_drop":
-		index := schema + ".plan_index_drop_idx"
+		definition, ok := planIndexDefinitionByName("plan_index_drop_idx")
+		if !ok {
+			return nil, fmt.Errorf("canonical plan index plan_index_drop_idx is unavailable")
+		}
+		createIndex, err := planIndexDDL(schema, definition, false)
+		if err != nil {
+			return nil, err
+		}
+		index := quotedSchema + "." + definition.Name
 		return []Mutation{base(
 			"index_drop", index,
 			"DROP INDEX "+index,
-			"CREATE INDEX plan_index_drop_idx ON "+table+" (index_drop_key)",
-			indexExists("plan_index_drop_idx"), "1",
+			createIndex,
+			indexExists(definition.Name), "1",
 		)}, nil
 	case "planchange_index_shape":
-		good := schema + ".plan_index_shape_good_idx"
-		bad := schema + ".plan_index_shape_bad_idx"
+		goodDefinition, ok := planIndexDefinitionByName(
+			"plan_index_shape_good_idx",
+		)
+		if !ok {
+			return nil, fmt.Errorf(
+				"canonical plan index plan_index_shape_good_idx is unavailable",
+			)
+		}
+		goodCreate, err := planIndexDDL(schema, goodDefinition, false)
+		if err != nil {
+			return nil, err
+		}
+		badDefinition := goodDefinition
+		badDefinition.Name = "plan_index_shape_bad_idx"
+		badDefinition.Columns[0], badDefinition.Columns[1] =
+			badDefinition.Columns[1], badDefinition.Columns[0]
+		badCreate, err := planIndexDDL(schema, badDefinition, false)
+		if err != nil {
+			return nil, err
+		}
+		good := quotedSchema + "." + goodDefinition.Name
+		bad := quotedSchema + "." + badDefinition.Name
 		return []Mutation{
 			base(
 				"index_shape_drop_good", good,
 				"DROP INDEX "+good,
-				"CREATE INDEX plan_index_shape_good_idx ON "+table+" (index_shape_lead,index_shape_tail)",
-				indexExists("plan_index_shape_good_idx"), "1",
+				goodCreate,
+				indexExists(goodDefinition.Name), "1",
 			),
 			base(
 				"index_shape_create_bad", bad,
-				"CREATE INDEX plan_index_shape_bad_idx ON "+table+" (index_shape_tail,index_shape_lead)",
+				badCreate,
 				"DROP INDEX IF EXISTS "+bad,
-				indexExists("plan_index_shape_bad_idx"), "0",
+				indexExists(badDefinition.Name), "0",
 			),
 		}, nil
 	}

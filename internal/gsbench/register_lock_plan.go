@@ -19,10 +19,14 @@ func LockScenarioFactories() map[ScenarioCode]ScenarioFactory {
 	for code := ScenarioCode(520); code <= 540; code++ {
 		register(code)
 	}
+	planCoordinator := &PlanCoordinator{}
 	for code := ScenarioCode(601); code <= 606; code++ {
 		code := code
 		factories[code] = func(definition ScenarioDefinition, _ Environment) (Scenario, error) {
-			return NewPlanChangeScenario(PlanScenarioDefinition{Code: code, Name: definition.Name}, nil), nil
+			return NewPlanChangeScenario(
+				PlanScenarioDefinition{Code: code, Name: definition.Name},
+				planCoordinator,
+			), nil
 		}
 	}
 	for code := ScenarioCode(621); code <= 625; code++ {

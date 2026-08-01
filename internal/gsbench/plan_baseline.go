@@ -2,6 +2,7 @@ package gsbench
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,32 +14,38 @@ type BaselineRepairResult struct {
 }
 
 func PlanBaselineRepairSteps(schema string) ([]string, error) {
-	if !identifierRE.MatchString(schema) {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
 		return nil, fmt.Errorf("unsafe schema %q", schema)
 	}
-	table := schema + ".plan_data"
-	return []string{
-		"CREATE INDEX IF NOT EXISTS plan_stats_target_idx ON " + table + " (stats_target_key)",
-		"CREATE INDEX IF NOT EXISTS plan_stats_ndistinct_idx ON " + table + " (stats_ndistinct_key)",
-		"CREATE INDEX IF NOT EXISTS plan_stats_corr_idx ON " + table + " (stats_corr_a,stats_corr_b)",
-		"CREATE INDEX IF NOT EXISTS plan_index_unusable_idx ON " + table + " (index_unusable_key)",
-		"CREATE INDEX IF NOT EXISTS plan_index_drop_idx ON " + table + " (index_drop_key)",
-		"DROP INDEX IF EXISTS " + schema + ".plan_index_shape_bad_idx",
-		"CREATE INDEX IF NOT EXISTS plan_index_shape_good_idx ON " + table + " (index_shape_lead,index_shape_tail)",
-		"ALTER TABLE " + table + " ALTER COLUMN stats_target_key SET STATISTICS -1",
-		"ALTER TABLE " + table + " ALTER COLUMN stats_ndistinct_key RESET (n_distinct)",
-		"ALTER TABLE " + table + " ADD STATISTICS ((stats_corr_a,stats_corr_b))",
-		"ANALYZE " + table + "(stats_target_key)",
-		"ANALYZE " + table + "(stats_ndistinct_key)",
-		"ANALYZE " + table + " ((stats_corr_a,stats_corr_b))",
-	}, nil
+	table := quotedSchema + ".plan_data"
+	definitions := planIndexDefinitions()
+	steps := make([]string, 0, len(definitions)+7)
+	for _, definition := range definitions {
+		statement, err := planIndexDDL(schema, definition, true)
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, statement)
+	}
+	steps = append(steps,
+		"DROP INDEX IF EXISTS "+quotedSchema+".plan_index_shape_bad_idx",
+		"ALTER TABLE "+table+" ALTER COLUMN stats_target_key SET STATISTICS -1",
+		"ALTER TABLE "+table+" ALTER COLUMN stats_ndistinct_key RESET (n_distinct)",
+		"ALTER TABLE "+table+" ADD STATISTICS ((stats_corr_a,stats_corr_b))",
+		"ANALYZE "+table+"(stats_target_key)",
+		"ANALYZE "+table+"(stats_ndistinct_key)",
+		"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
+	)
+	return steps, nil
 }
 
 func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]BaselineRepairResult, error) {
 	if _, err := PlanBaselineRepairSteps(schema); err != nil {
 		return nil, err
 	}
-	table := schema + ".plan_data"
+	quotedSchema, _ := quoteDatasetSchema(schema)
+	table := quotedSchema + ".plan_data"
 	var tableCount int
 	if err := db.Scan(ctx,
 		"SELECT count(*) FROM pg_tables WHERE schemaname=$1 AND tablename='plan_data'",
@@ -63,39 +70,56 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 		record(target, "RESTORED")
 		return true
 	}
-	ensureIndex := func(name, columns string) {
-		var count int
-		if err := db.Scan(ctx,
-			"SELECT count(*) FROM pg_indexes WHERE schemaname=$1 AND indexname=$2",
-			[]any{schema, name}, &count); err != nil {
+	ensureIndex := func(definition planIndexDefinition) {
+		expected, err := planIndexDDL(schema, definition, false)
+		if err != nil {
 			errs = append(errs, err)
-			record(name, "FAILED")
+			record(definition.Name, "FAILED")
 			return
 		}
-		if count == 1 {
-			record(name, "ALREADY_OK")
-			return
+		var actual string
+		err = db.Scan(
+			ctx,
+			planIndexDefinitionQuery,
+			[]any{schema, definition.Name},
+			&actual,
+		)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			exec(definition.Name, expected)
+		case err != nil:
+			errs = append(errs, fmt.Errorf(
+				"inspect %s definition: %w",
+				definition.Name,
+				err,
+			))
+			record(definition.Name, "FAILED")
+		case datasetIndexMatches(actual, expected):
+			record(definition.Name, "ALREADY_OK")
+		default:
+			if exec(
+				definition.Name+" definition",
+				"DROP INDEX "+quotedSchema+"."+definition.Name,
+			) {
+				exec(definition.Name, expected)
+			}
 		}
-		exec(name, "CREATE INDEX "+name+" ON "+table+" ("+columns+")")
 	}
 
-	ensureIndex("plan_stats_target_idx", "stats_target_key")
-	ensureIndex("plan_stats_ndistinct_idx", "stats_ndistinct_key")
-	ensureIndex("plan_stats_corr_idx", "stats_corr_a,stats_corr_b")
-	ensureIndex("plan_index_unusable_idx", "index_unusable_key")
-	ensureIndex("plan_index_drop_idx", "index_drop_key")
-	ensureIndex("plan_index_shape_good_idx", "index_shape_lead,index_shape_tail")
+	for _, definition := range planIndexDefinitions() {
+		ensureIndex(definition)
+	}
 
 	var usable int
 	if err := db.Scan(ctx,
-		`SELECT count(*) FROM pg_index WHERE indexrelid='`+schema+
+		`SELECT count(*) FROM pg_index WHERE indexrelid='`+quotedSchema+
 			`.plan_index_unusable_idx'::regclass AND indisusable AND indisready AND indisvalid`,
 		nil, &usable); err != nil {
 		errs = append(errs, err)
 		record("plan_index_unusable_idx usability", "FAILED")
 	} else if usable == 0 {
 		exec("plan_index_unusable_idx usability",
-			"ALTER INDEX "+schema+".plan_index_unusable_idx REBUILD")
+			"ALTER INDEX "+quotedSchema+".plan_index_unusable_idx REBUILD")
 	} else {
 		record("plan_index_unusable_idx usability", "ALREADY_OK")
 	}
@@ -107,7 +131,7 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 		errs = append(errs, err)
 		record("plan_index_shape_bad_idx", "FAILED")
 	} else if badIndex > 0 {
-		exec("plan_index_shape_bad_idx", "DROP INDEX "+schema+".plan_index_shape_bad_idx")
+		exec("plan_index_shape_bad_idx", "DROP INDEX "+quotedSchema+".plan_index_shape_bad_idx")
 	} else {
 		record("plan_index_shape_bad_idx", "ALREADY_OK")
 	}
@@ -167,6 +191,11 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 	return results, errors.Join(errs...)
 }
 
+const planIndexDefinitionQuery = `SELECT pg_catalog.pg_get_indexdef(c.oid)
+	FROM pg_catalog.pg_class c
+	JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+	WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind='i'`
+
 func AnalyzeExtendedStatistics(ctx context.Context, db *Database, table string) error {
 	return db.ExecSession(ctx,
 		"SET default_statistics_target=-2",
@@ -176,23 +205,48 @@ func AnalyzeExtendedStatistics(ctx context.Context, db *Database, table string) 
 }
 
 func VerifyPlanBaseline(ctx context.Context, db *Database, schema string) error {
-	if !identifierRE.MatchString(schema) {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
 		return fmt.Errorf("unsafe schema %q", schema)
 	}
-	table := schema + ".plan_data"
+	table := quotedSchema + ".plan_data"
 	var errs []error
-	indexes := []string{
-		"plan_stats_target_idx", "plan_stats_ndistinct_idx", "plan_stats_corr_idx",
-		"plan_index_unusable_idx", "plan_index_drop_idx", "plan_index_shape_good_idx",
-	}
-	for _, index := range indexes {
+	for _, definition := range planIndexDefinitions() {
+		expected, err := planIndexDDL(schema, definition, false)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		var actual string
+		if err := db.Scan(
+			ctx,
+			planIndexDefinitionQuery,
+			[]any{schema, definition.Name},
+			&actual,
+		); err != nil {
+			errs = append(errs, fmt.Errorf(
+				"baseline index %s definition: %w",
+				definition.Name,
+				err,
+			))
+		} else if !datasetIndexMatches(actual, expected) {
+			errs = append(errs, fmt.Errorf(
+				"baseline index %s definition %q, expected %q",
+				definition.Name,
+				actual,
+				expected,
+			))
+		}
 		var count int
-		query := `SELECT count(*) FROM pg_index WHERE indexrelid='` + schema + `.` + index +
+		query := `SELECT count(*) FROM pg_index WHERE indexrelid='` + quotedSchema + `.` + definition.Name +
 			`'::regclass AND indisusable AND indisready AND indisvalid`
 		if err := db.Scan(ctx, query, nil, &count); err != nil {
 			errs = append(errs, err)
 		} else if count != 1 {
-			errs = append(errs, fmt.Errorf("baseline index %s is not usable", index))
+			errs = append(errs, fmt.Errorf(
+				"baseline index %s is not usable",
+				definition.Name,
+			))
 		}
 	}
 	checks := []struct {
