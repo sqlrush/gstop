@@ -240,6 +240,24 @@ func (d *Database) operationContext(parent context.Context) (context.Context, co
 	}
 }
 
+// maintenanceContext links long-running maintenance work to both the command
+// and database lifetimes without imposing the per-query workload timeout.
+// Dataset DDL such as CREATE INDEX can legitimately run longer than that
+// workload guard, especially when initializing large datasets.
+func (d *Database) maintenanceContext(
+	parent context.Context,
+) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = d.ctx
+	}
+	ctx, cancel := context.WithCancel(d.ctx)
+	stop := context.AfterFunc(parent, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
 func (d *Database) OpenTagged(parent context.Context, runID, scenario, workerID string) (*TaggedConn, error) {
 	appName, err := ApplicationName(runID, scenario, workerID)
 	if err != nil {
@@ -292,6 +310,16 @@ func normalizeConnectionCloseError(err error) error {
 
 func (d *Database) Exec(parent context.Context, query string, args ...any) (sql.Result, error) {
 	ctx, cancel := d.operationContext(parent)
+	defer cancel()
+	return d.pool.ExecContext(ctx, query, args...)
+}
+
+func (d *Database) execMaintenance(
+	parent context.Context,
+	query string,
+	args ...any,
+) (sql.Result, error) {
+	ctx, cancel := d.maintenanceContext(parent)
 	defer cancel()
 	return d.pool.ExecContext(ctx, query, args...)
 }

@@ -19,6 +19,13 @@ type dbDatasetExecutor struct {
 	minFreeDiskPercent int
 }
 
+// initializationDatasetExecutor only widens the execution budget for dataset
+// lifecycle SQL issued by init. Other dbDatasetExecutor users, including the
+// pre-restore stop request, retain the workload query timeout.
+type initializationDatasetExecutor struct {
+	dbDatasetExecutor
+}
+
 type datasetSQLTransaction interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	Commit() error
@@ -82,6 +89,15 @@ func (t *databaseDatasetTransaction) ScanContext(
 
 func (e dbDatasetExecutor) Exec(ctx context.Context, query string, args ...any) error {
 	_, err := e.db.Exec(ctx, query, args...)
+	return err
+}
+
+func (e initializationDatasetExecutor) Exec(
+	ctx context.Context,
+	query string,
+	args ...any,
+) error {
+	_, err := e.db.execMaintenance(ctx, query, args...)
 	return err
 }
 

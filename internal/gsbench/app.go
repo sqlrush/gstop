@@ -359,13 +359,15 @@ func commandInit(
 			return 1
 		}
 	}
-	executor := dbDatasetExecutor{
-		db:                 db,
-		schema:             cfg.Data.Schema,
-		env:                env,
-		capacityProvider:   capacityProvider,
-		physicalProvider:   physicalProvider,
-		minFreeDiskPercent: cfg.Data.MinFreeDiskPercent,
+	executor := initializationDatasetExecutor{
+		dbDatasetExecutor: dbDatasetExecutor{
+			db:                 db,
+			schema:             cfg.Data.Schema,
+			env:                env,
+			capacityProvider:   capacityProvider,
+			physicalProvider:   physicalProvider,
+			minFreeDiskPercent: cfg.Data.MinFreeDiskPercent,
+		},
 	}
 	if cfg.Run.DryRun {
 		if err := LoadDatasetHighWater(ctx, executor, &plan); err != nil {

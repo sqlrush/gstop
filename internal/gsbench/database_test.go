@@ -304,6 +304,163 @@ type sessionCleanupTestConnector struct {
 	state *sessionCleanupTestState
 }
 
+type maintenanceExecTestConnector struct {
+	state *maintenanceExecTestState
+}
+
+func (c *maintenanceExecTestConnector) Connect(context.Context) (driver.Conn, error) {
+	return &maintenanceExecTestConn{state: c.state}, nil
+}
+
+func (c *maintenanceExecTestConnector) Driver() driver.Driver {
+	return maintenanceExecTestDriver{state: c.state}
+}
+
+type maintenanceExecTestDriver struct {
+	state *maintenanceExecTestState
+}
+
+func (d maintenanceExecTestDriver) Open(string) (driver.Conn, error) {
+	return (&maintenanceExecTestConnector{state: d.state}).Connect(
+		context.Background(),
+	)
+}
+
+type maintenanceExecTestState struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type maintenanceExecTestConn struct {
+	state *maintenanceExecTestState
+}
+
+func (*maintenanceExecTestConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not supported")
+}
+
+func (*maintenanceExecTestConn) Close() error { return nil }
+
+func (*maintenanceExecTestConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not supported")
+}
+
+func (c *maintenanceExecTestConn) ExecContext(
+	ctx context.Context,
+	_ string,
+	_ []driver.NamedValue,
+) (driver.Result, error) {
+	c.state.once.Do(func() { close(c.state.started) })
+	select {
+	case <-c.state.release:
+		return driver.RowsAffected(1), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestDatasetExecutorDoesNotApplyWorkloadQueryTimeoutToMaintenanceDDL(
+	t *testing.T,
+) {
+	const workloadQueryTimeout = 20 * time.Millisecond
+	state := &maintenanceExecTestState{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	pool := sql.OpenDB(&maintenanceExecTestConnector{state: state})
+	databaseContext, cancelDatabase := context.WithCancel(context.Background())
+	database := &Database{
+		cfg: BenchConfig{Safety: SafetyConfig{
+			QueryTimeout: workloadQueryTimeout,
+		}},
+		ctx: databaseContext, cancel: cancelDatabase, pool: pool,
+		tagged: map[*TaggedConn]struct{}{},
+	}
+	t.Cleanup(func() {
+		cancelDatabase()
+		_ = pool.Close()
+	})
+
+	parent, cancelParent := context.WithTimeout(context.Background(), time.Second)
+	defer cancelParent()
+	result := make(chan error, 1)
+	go func() {
+		result <- (initializationDatasetExecutor{
+			dbDatasetExecutor: dbDatasetExecutor{db: database},
+		}).Exec(
+			parent,
+			`CREATE INDEX items_value_idx ON "gsbench".items (value)`,
+		)
+	}()
+
+	select {
+	case <-state.started:
+	case <-parent.Done():
+		t.Fatalf("maintenance DDL did not start: %v", parent.Err())
+	}
+	select {
+	case err := <-result:
+		t.Fatalf(
+			"maintenance DDL ended at the workload query timeout: %v",
+			err,
+		)
+	case <-time.After(3 * workloadQueryTimeout):
+		close(state.release)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("maintenance DDL failed after release: %v", err)
+	}
+}
+
+func TestDatasetExecutorDefaultsToWorkloadQueryTimeout(t *testing.T) {
+	const workloadQueryTimeout = 20 * time.Millisecond
+	state := &maintenanceExecTestState{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	pool := sql.OpenDB(&maintenanceExecTestConnector{state: state})
+	databaseContext, cancelDatabase := context.WithCancel(context.Background())
+	database := &Database{
+		cfg: BenchConfig{Safety: SafetyConfig{
+			QueryTimeout: workloadQueryTimeout,
+		}},
+		ctx: databaseContext, cancel: cancelDatabase, pool: pool,
+		tagged: map[*TaggedConn]struct{}{},
+	}
+	t.Cleanup(func() {
+		cancelDatabase()
+		_ = pool.Close()
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		result <- (dbDatasetExecutor{db: database}).Exec(
+			context.Background(),
+			`UPDATE "gsbench".meta_runs SET stop_requested=true`,
+		)
+	}()
+
+	select {
+	case <-state.started:
+	case <-time.After(time.Second):
+		t.Fatal("bounded dataset operation did not start")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("bounded dataset operation error=%v", err)
+		}
+	case <-time.After(3 * workloadQueryTimeout):
+		close(state.release)
+		err := <-result
+		t.Fatalf(
+			"default dataset operation exceeded workload query timeout: %v",
+			err,
+		)
+	}
+}
+
 func (c *sessionCleanupTestConnector) Connect(context.Context) (driver.Conn, error) {
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
