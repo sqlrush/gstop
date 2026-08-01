@@ -57,6 +57,7 @@ type TaggedConn struct {
 	Conn *sql.Conn
 	pool *sql.DB
 	once sync.Once
+	err  error
 	db   *Database
 }
 
@@ -202,6 +203,23 @@ func taggedLIKEPattern(prefix string) string {
 }
 
 func TaggedSessionPredicate(runID string) (query string, args []any, err error) {
+	return taggedSessionPredicate(runID, "")
+}
+
+func taggedSessionPredicate(
+	runID string,
+	activityAlias string,
+) (query string, args []any, err error) {
+	columnPrefix := ""
+	if activityAlias != "" {
+		if !identifierRE.MatchString(activityAlias) {
+			return "", nil, fmt.Errorf(
+				"unsafe activity alias %q",
+				activityAlias,
+			)
+		}
+		columnPrefix = activityAlias + "."
+	}
 	runToken, err := applicationToken("run id", runID, applicationRunTokenMaxBytes)
 	if err != nil {
 		return "", nil, err
@@ -215,11 +233,18 @@ func TaggedSessionPredicate(runID string) (query string, args []any, err error) 
 	for index, pattern := range patterns {
 		conditions = append(
 			conditions,
-			fmt.Sprintf("application_name LIKE $%d ESCAPE E'\\\\'", index+1),
+			fmt.Sprintf(
+				"%sapplication_name LIKE $%d ESCAPE E'\\\\'",
+				columnPrefix,
+				index+1,
+			),
 		)
 		args = append(args, pattern)
 	}
-	return "(" + strings.Join(conditions, " OR ") + ")", args, nil
+	return "((" + strings.Join(conditions, " OR ") + ")" +
+			" AND (COALESCE(" + columnPrefix + "sessionid,0)<>0 OR " +
+			columnPrefix + "backend_start IS NOT NULL))",
+		args, nil
 }
 
 func (d *Database) operationContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -284,13 +309,12 @@ func (d *Database) OpenTagged(parent context.Context, runID, scenario, workerID 
 }
 
 func (c *TaggedConn) Close() error {
-	var result error
 	c.once.Do(func() {
 		if c.Conn != nil {
-			result = normalizeConnectionCloseError(c.Conn.Close())
+			c.err = normalizeConnectionCloseError(c.Conn.Close())
 		}
-		if err := normalizeConnectionCloseError(c.pool.Close()); result == nil {
-			result = err
+		if err := normalizeConnectionCloseError(c.pool.Close()); c.err == nil {
+			c.err = err
 		}
 		if c.db != nil {
 			c.db.mu.Lock()
@@ -298,7 +322,7 @@ func (c *TaggedConn) Close() error {
 			c.db.mu.Unlock()
 		}
 	})
-	return result
+	return c.err
 }
 
 func normalizeConnectionCloseError(err error) error {
@@ -474,24 +498,30 @@ func (d *Database) TaggedSessionState(
 	parent context.Context,
 	runID string,
 ) (sessions int, locks int, err error) {
-	predicate, args, err := TaggedSessionPredicate(runID)
+	query, args, err := taggedSessionStateSQL(runID)
 	if err != nil {
 		return 0, 0, err
 	}
 	err = d.Scan(
 		parent,
-		"SELECT count(DISTINCT a.pid),count(l.pid) "+
-			"FROM pg_stat_activity a LEFT JOIN pg_locks l ON l.pid=a.pid "+
-			"WHERE "+strings.ReplaceAll(
-			predicate,
-			"application_name",
-			"a.application_name",
-		),
+		query,
 		args,
 		&sessions,
 		&locks,
 	)
 	return sessions, locks, err
+}
+
+func taggedSessionStateSQL(
+	runID string,
+) (query string, args []any, err error) {
+	predicate, args, err := taggedSessionPredicate(runID, "a")
+	if err != nil {
+		return "", nil, err
+	}
+	return "SELECT count(DISTINCT a.pid),count(l.pid) " +
+		"FROM pg_stat_activity a LEFT JOIN pg_locks l ON l.pid=a.pid " +
+		"WHERE " + predicate, args, nil
 }
 
 func (d *Database) Close() error {

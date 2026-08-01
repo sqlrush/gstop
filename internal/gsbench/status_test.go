@@ -17,6 +17,10 @@ func TestStopTaggedSQLUsesExactRunBoundary(t *testing.T) {
 	if arg != "gsbench/run-1/%" || !strings.Contains(query, "pg_terminate_session") {
 		t.Fatalf("query=%q arg=%q", query, arg)
 	}
+	if !strings.Contains(query, "COALESCE(sessionid,0)<>0") ||
+		!strings.Contains(query, "backend_start IS NOT NULL") {
+		t.Fatalf("terminate query includes thread-pool worker rows: %q", query)
+	}
 }
 
 func TestCleanupPlanDropsSchemaOnlyWhenRequested(t *testing.T) {

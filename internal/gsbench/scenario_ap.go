@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 type APSafety struct {
@@ -13,6 +14,23 @@ type APSafety struct {
 }
 
 var defaultAPSafety = APSafety{CPUTargetPercent: 70, MaxWorkers: 8, ScanRows: 1_000_000}
+
+const maximumCPUWorkersPerAdjustment = 8
+
+func cpuControllerConfig(
+	target float64,
+	maxWorkers int,
+	interval time.Duration,
+) ControllerConfig {
+	step := max(1, (maxWorkers-1+9)/10)
+	return ControllerConfig{
+		Target: target, Tolerance: 3, MinWorkers: 1,
+		MaxWorkers:      maxWorkers,
+		Step:            min(maximumCPUWorkersPerAdjustment, step),
+		RequiredSamples: 3,
+		Interval:        interval,
+	}
+}
 
 func LoadAPSafety(rt *Runtime, prefix string, defaults APSafety) (APSafety, error) {
 	policy := APSafety{
@@ -103,11 +121,11 @@ func (s *APScenario) Prepare(ctx context.Context, rt *Runtime) error {
 
 func (s *APScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	controller := Controller{
-		Config: ControllerConfig{
-			Target: float64(s.policy.CPUTargetPercent), Tolerance: 3,
-			MinWorkers: 1, MaxWorkers: s.policy.MaxWorkers,
-			RequiredSamples: 3, Interval: rt.Config.Run.RampInterval,
-		},
+		Config: cpuControllerConfig(
+			float64(s.policy.CPUTargetPercent),
+			s.policy.MaxWorkers,
+			rt.Config.Run.RampInterval,
+		),
 		Actuator: s.workload,
 		Sample: func(ctx context.Context) Sample {
 			snapshot := s.workload.Snapshot()
@@ -135,6 +153,13 @@ func (s *APScenario) ExecutionSnapshot() WorkerSnapshot {
 		return WorkerSnapshot{}
 	}
 	return s.workload.Snapshot()
+}
+func (s *APScenario) RuntimeEvidence() []Evidence {
+	return cpuRuntimeEvidence(
+		float64(s.policy.CPUTargetPercent),
+		s.available,
+		s.control,
+	)
 }
 
 func (s *APScenario) Stop(ctx context.Context, _ *Runtime) error {
@@ -172,7 +197,7 @@ func (s *cpuWorkloadScenario) Prepare(ctx context.Context, rt *Runtime) error {
 func (s *cpuWorkloadScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	s.target = float64(rt.Config.Safety.CPUTargetPercent)
 	controller := Controller{
-		Config:   ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: rt.Config.Safety.MaxWorkers, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval},
+		Config:   cpuControllerConfig(s.target, rt.Config.Safety.MaxWorkers, rt.Config.Run.RampInterval),
 		Actuator: s.workload,
 		Sample: func(ctx context.Context) Sample {
 			snapshot := s.workload.Snapshot()
@@ -198,6 +223,9 @@ func (s *cpuWorkloadScenario) ExecutionSnapshot() WorkerSnapshot {
 		return WorkerSnapshot{}
 	}
 	return s.workload.Snapshot()
+}
+func (s *cpuWorkloadScenario) RuntimeEvidence() []Evidence {
+	return cpuRuntimeEvidence(s.target, s.available, s.control)
 }
 func (s *cpuWorkloadScenario) Stop(ctx context.Context, _ *Runtime) error {
 	s.control = s.loop.Stop()

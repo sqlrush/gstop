@@ -22,18 +22,18 @@ type WorkerSnapshot struct {
 }
 
 type WorkerGroup struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	max          int
-	work         WorkFunc
-	errorBackoff time.Duration
-
-	mu      sync.Mutex
-	slots   map[int]context.CancelFunc
-	nextID  int
-	target  int
-	stopped bool
-	wg      sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+	max      int
+	work     WorkFunc
+	mu       sync.Mutex
+	slots    map[int]context.CancelFunc
+	retiring map[int]bool
+	onRetire func(int)
+	nextID   int
+	target   int
+	stopped  bool
+	wg       sync.WaitGroup
 
 	active     atomic.Int64
 	operations atomic.Int64
@@ -49,9 +49,15 @@ func NewWorkerGroup(parent context.Context, maximum int, work WorkFunc) *WorkerG
 	ctx, cancel := context.WithCancel(parent)
 	return &WorkerGroup{
 		ctx: ctx, cancel: cancel, max: maximum, work: work,
-		errorBackoff: 10 * time.Millisecond,
-		slots:        map[int]context.CancelFunc{},
+		slots:    map[int]context.CancelFunc{},
+		retiring: map[int]bool{},
 	}
+}
+
+func (g *WorkerGroup) SetRetireHook(hook func(int)) {
+	g.mu.Lock()
+	g.onRetire = hook
+	g.mu.Unlock()
 }
 
 func (g *WorkerGroup) Target() int {
@@ -86,6 +92,7 @@ func (g *WorkerGroup) SetTarget(target int) error {
 		}
 		sort.Sort(sort.Reverse(sort.IntSlice(ids)))
 		for _, id := range ids[:current-target] {
+			g.retiring[id] = true
 			g.slots[id]()
 			delete(g.slots, id)
 		}
@@ -95,7 +102,10 @@ func (g *WorkerGroup) SetTarget(target int) error {
 }
 
 func (g *WorkerGroup) runWorker(ctx context.Context, id int) {
-	defer g.wg.Done()
+	defer func() {
+		g.retireWorker(id)
+		g.wg.Done()
+	}()
 	g.active.Add(1)
 	defer g.active.Add(-1)
 	for ctx.Err() == nil {
@@ -108,14 +118,21 @@ func (g *WorkerGroup) runWorker(ctx context.Context, id int) {
 			}
 			g.errors.Add(1)
 			g.recordFirstError(err)
-			if g.errorBackoff > 0 {
-				if err := waitContext(ctx, g.errorBackoff); err != nil {
-					return
-				}
-			}
+			return
 		} else {
 			g.operations.Add(1)
 		}
+	}
+}
+
+func (g *WorkerGroup) retireWorker(id int) {
+	g.mu.Lock()
+	retiring := g.retiring[id]
+	delete(g.retiring, id)
+	hook := g.onRetire
+	g.mu.Unlock()
+	if retiring && hook != nil {
+		hook(id)
 	}
 }
 

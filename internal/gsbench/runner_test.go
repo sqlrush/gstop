@@ -53,6 +53,15 @@ type executionReportingScenario struct {
 	snapshot WorkerSnapshot
 }
 
+type runtimeEvidenceScenario struct {
+	fakeScenario
+	evidence []Evidence
+}
+
+func (s *runtimeEvidenceScenario) RuntimeEvidence() []Evidence {
+	return s.evidence
+}
+
 func (s *executionReportingScenario) ExecutionSnapshot() WorkerSnapshot {
 	return s.snapshot
 }
@@ -82,6 +91,15 @@ type testCodeExecutionScenario struct {
 
 func (s testCodeExecutionScenario) ExecutionSnapshot() WorkerSnapshot {
 	return s.reporter.ExecutionSnapshot()
+}
+
+type testCodeRuntimeEvidenceScenario struct {
+	testCodeScenario
+	reporter runtimeEvidenceReporter
+}
+
+func (s testCodeRuntimeEvidenceScenario) RuntimeEvidence() []Evidence {
+	return s.reporter.RuntimeEvidence()
 }
 
 func newTestRunner(
@@ -120,6 +138,11 @@ func newTestRunner(
 		var candidate Scenario = testCodeScenario{Scenario: scenario, code: code}
 		if reporter, ok := scenario.(executionReporter); ok {
 			candidate = testCodeExecutionScenario{
+				testCodeScenario: testCodeScenario{Scenario: scenario, code: code},
+				reporter:         reporter,
+			}
+		} else if reporter, ok := scenario.(runtimeEvidenceReporter); ok {
+			candidate = testCodeRuntimeEvidenceScenario{
 				testCodeScenario: testCodeScenario{Scenario: scenario, code: code},
 				reporter:         reporter,
 			}
@@ -535,6 +558,32 @@ func TestRunnerMarksCleanExecutionUnverifiedWhenModelValidationDisabled(t *testi
 	if len(result.Evidence) != 3 || result.Evidence[2].Metric != "runtime_validation" ||
 		result.Evidence[2].Available {
 		t.Fatalf("validation evidence=%+v", result.Evidence)
+	}
+}
+
+func TestRunnerKeepsRuntimeMeasurementsWhenModelValidationDisabled(t *testing.T) {
+	scenario := &runtimeEvidenceScenario{
+		fakeScenario: fakeScenario{name: "one", outcome: OutcomeSuccess},
+		evidence: []Evidence{{
+			Metric: "cpu_percent", Target: 95, Actual: 94, Available: true,
+		}},
+	}
+	runtime := &Runtime{RunID: "run-1"}
+	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
+	runner.runtime.Config.Run.ValidationEnabled = false
+	summary := runner.Run(context.Background(), codes)
+	if summary.Outcome != OutcomeUnverified {
+		t.Fatalf("summary=%+v", summary)
+	}
+	var found bool
+	for _, evidence := range summary.Results[0].Evidence {
+		if evidence.Metric == "cpu_percent" && evidence.Target == 95 &&
+			evidence.Actual == 94 && evidence.Available {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("runtime measurements were discarded: %+v", summary.Results[0])
 	}
 }
 

@@ -116,8 +116,18 @@ func TestDefaultAPSafetyCaps(t *testing.T) {
 	}
 }
 
+func TestCPUControllerCapsEachWorkerRampAdjustment(t *testing.T) {
+	config := cpuControllerConfig(95, 640, 2*time.Second)
+	if config.Step != maximumCPUWorkersPerAdjustment {
+		t.Fatalf("cpu controller step=%d, want cap=%d", config.Step, maximumCPUWorkersPerAdjustment)
+	}
+	if config.MaxWorkers != 640 || config.Target != 95 {
+		t.Fatalf("cpu controller config=%+v", config)
+	}
+}
+
 func TestCPUVerificationRequiresMeasuredTargetForSuccess(t *testing.T) {
-	result := verifyCPUResult("tp_cpu", 95, true, ControlResult{Reached: true, Actual: 95, Workers: 8}, WorkerSnapshot{Operations: 100})
+	result := verifyCPUResult("tp_cpu", 95, true, ControlResult{Reached: true, Measured: true, Actual: 95, Workers: 8}, WorkerSnapshot{Operations: 100})
 	if result.Outcome != OutcomeSuccess {
 		t.Fatalf("result=%+v", result)
 	}
@@ -125,9 +135,23 @@ func TestCPUVerificationRequiresMeasuredTargetForSuccess(t *testing.T) {
 	if result.Outcome != OutcomeDegraded {
 		t.Fatalf("fallback result=%+v", result)
 	}
-	result = verifyCPUResult("tp_cpu", 95, true, ControlResult{Ceiling: true, Actual: 50, ReachableMax: 60, Workers: 8}, WorkerSnapshot{})
+	result = verifyCPUResult("tp_cpu", 95, true, ControlResult{Ceiling: true, Measured: true, Actual: 50, ReachableMax: 60, Workers: 8}, WorkerSnapshot{})
 	if result.Outcome != OutcomeFailed || !strings.Contains(result.Message, "ceiling 60.0%") {
 		t.Fatalf("failure result=%+v", result)
+	}
+}
+
+func TestCPURuntimeEvidenceRequiresSuccessfulSample(t *testing.T) {
+	evidence := cpuRuntimeEvidence(95, true, ControlResult{})
+	if len(evidence) == 0 || evidence[0].Available {
+		t.Fatalf("unsampled CPU evidence reported available: %+v", evidence)
+	}
+	evidence = cpuRuntimeEvidence(95, true, ControlResult{
+		Measured: true,
+		Actual:   94,
+	})
+	if !evidence[0].Available || evidence[0].Actual != 94 {
+		t.Fatalf("measured CPU evidence unavailable: %+v", evidence)
 	}
 }
 

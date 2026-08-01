@@ -56,6 +56,13 @@ type executionReporter interface {
 	ExecutionSnapshot() WorkerSnapshot
 }
 
+// runtimeEvidenceReporter exposes measurements collected while a workload ran.
+// Measurements remain useful when model validation is disabled; they do not
+// decide the scenario outcome in that mode.
+type runtimeEvidenceReporter interface {
+	RuntimeEvidence() []Evidence
+}
+
 type RunSummary struct {
 	RunID   string
 	Outcome Outcome
@@ -557,6 +564,14 @@ func (r *Runner) runOne(
 					snapshot.Errors,
 					snapshot.FirstError,
 				))
+			}
+		}
+		if !r.runtime.Config.Run.ValidationEnabled {
+			if reporter, ok := scenario.(runtimeEvidenceReporter); ok {
+				result.Evidence = append(
+					result.Evidence,
+					reporter.RuntimeEvidence()...,
+				)
 			}
 		}
 		if result.Outcome == OutcomeUnverified {

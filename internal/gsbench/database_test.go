@@ -159,6 +159,20 @@ func TestTaggedSessionPredicateDoesNotMatchRunPrefixCollision(t *testing.T) {
 	}
 }
 
+func TestTaggedSessionStateSQLIgnoresThreadPoolWorkerRows(t *testing.T) {
+	query, args, err := taggedSessionStateSQL("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(query, "COALESCE(a.sessionid,0)<>0") ||
+		!strings.Contains(query, "a.backend_start IS NOT NULL") {
+		t.Fatalf("state query includes thread-pool worker rows: %q", query)
+	}
+	if got := onlyStringArgument(t, args); got != "gsbench/run-1/%" {
+		t.Fatalf("state query argument=%q", got)
+	}
+}
+
 func TestTaggedSessionPredicateIncludesLegacyLongRunPrefix(t *testing.T) {
 	const runID = "1234567890123456789012"
 	query, args, err := TaggedSessionPredicate(runID)
@@ -493,6 +507,7 @@ type sessionCleanupTestState struct {
 	statements        map[int][]string
 	failRollback      bool
 	failResetAll      bool
+	failClose         bool
 	cancelOnWorkError context.CancelFunc
 }
 
@@ -509,6 +524,9 @@ func (c *sessionCleanupTestConn) Close() error {
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
 	c.state.closed[c.id] = true
+	if c.state.failClose {
+		return errors.New("close failed")
+	}
 	return nil
 }
 

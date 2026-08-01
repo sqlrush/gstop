@@ -34,6 +34,7 @@ type ControllerConfig struct {
 type ControlResult struct {
 	Reached        bool
 	Ceiling        bool
+	Measured       bool
 	Actual         float64
 	LastSuccessful float64
 	ReachableMax   float64
@@ -46,6 +47,16 @@ type Controller struct {
 	Config   ControllerConfig
 	Actuator Actuator
 	Sample   func(context.Context) Sample
+}
+
+func workerRampAdjustment(cfg ControllerConfig, sample Sample) int {
+	step := max(1, cfg.Step)
+	if !sample.Available || cfg.Target <= 0 || sample.Value <= 0 ||
+		sample.Value >= cfg.Target {
+		return step
+	}
+	remaining := (cfg.Target - sample.Value) / cfg.Target
+	return max(1, min(step, int(math.Ceil(float64(step)*remaining))))
 }
 
 func (c Controller) Run(ctx context.Context) ControlResult {
@@ -129,13 +140,15 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 				}
 			} else {
 				ceilingSamples = 0
-				if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+cfg.Step)); err != nil {
+				adjustment := workerRampAdjustment(cfg, sample)
+				if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+adjustment)); err != nil {
 					result.Err = err
 					return result
 				}
 				result.Workers = c.Actuator.Target()
 			}
 		} else {
+			result.Measured = true
 			result.Actual = sample.Value
 			result.LastSuccessful = sample.Value
 			if !haveReachable || sample.Value > result.ReachableMax {
@@ -166,7 +179,8 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 						}
 					} else {
 						ceilingSamples = 0
-						if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+cfg.Step)); err != nil {
+						adjustment := workerRampAdjustment(cfg, sample)
+						if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+adjustment)); err != nil {
 							result.Err = err
 							return result
 						}

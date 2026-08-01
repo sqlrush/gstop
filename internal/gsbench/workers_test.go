@@ -91,6 +91,25 @@ func TestWorkerGroupBoundsErrorTextAndBacksOffRetries(t *testing.T) {
 	}
 }
 
+func TestWorkerGroupStopsWorkerAfterFirstExecutionError(t *testing.T) {
+	var calls atomic.Int64
+	group := NewWorkerGroup(context.Background(), 1, func(context.Context, int) error {
+		calls.Add(1)
+		return errors.New("terminal workload error")
+	})
+	if err := group.SetTarget(1); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for (calls.Load() == 0 || group.Snapshot().Active != 0) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("terminal workload error was retried %d times", got)
+	}
+	_ = group.Stop(context.Background())
+}
+
 func TestWorkerDrivenScenariosExposeExecutionSnapshots(t *testing.T) {
 	factories := DefaultScenarioFactories()
 	for _, code := range []ScenarioCode{

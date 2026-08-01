@@ -2,7 +2,9 @@ package gsbench
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,5 +115,104 @@ func TestContinuousControlWaitAndStopCanJoinConcurrently(t *testing.T) {
 		case <-deadline:
 			t.Fatal("concurrent Wait/Stop did not both join")
 		}
+	}
+}
+
+func TestSQLWorkloadScalingDownClosesRetiredWorkerSession(t *testing.T) {
+	state := &sessionCleanupTestState{}
+	database := newSessionCleanupTestDatabase(t, state)
+	taggedPool := sql.OpenDB(&sessionCleanupTestConnector{state: state})
+	taggedPool.SetMaxOpenConns(1)
+	taggedPool.SetMaxIdleConns(1)
+	conn, err := taggedPool.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagged := &TaggedConn{Conn: conn, pool: taggedPool, db: database}
+	database.mu.Lock()
+	database.tagged[tagged] = struct{}{}
+	database.mu.Unlock()
+
+	started := make(chan struct{})
+	workload := newSQLWorkload(
+		context.Background(),
+		&Runtime{Config: database.cfg},
+		"scale-down",
+		1,
+		func(ctx context.Context, _ *sql.Conn, _ int) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	)
+	workload.sessions[0] = tagged
+	if err := workload.SetTarget(1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start")
+	}
+	if err := workload.SetTarget(0); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		database.mu.Lock()
+		remaining := len(database.tagged)
+		database.mu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	database.mu.Lock()
+	remaining := len(database.tagged)
+	database.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("scale-down left %d retired tagged sessions open", remaining)
+	}
+	if err := workload.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLWorkloadStopReportsRetiredSessionCloseFailure(t *testing.T) {
+	state := &sessionCleanupTestState{failClose: true}
+	database := newSessionCleanupTestDatabase(t, state)
+	taggedPool := sql.OpenDB(&sessionCleanupTestConnector{state: state})
+	conn, err := taggedPool.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagged := &TaggedConn{Conn: conn, pool: taggedPool, db: database}
+	database.mu.Lock()
+	database.tagged[tagged] = struct{}{}
+	database.mu.Unlock()
+
+	started := make(chan struct{})
+	workload := newSQLWorkload(
+		context.Background(),
+		&Runtime{Config: database.cfg},
+		"scale-down-close-error",
+		1,
+		func(ctx context.Context, _ *sql.Conn, _ int) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	)
+	workload.sessions[0] = tagged
+	if err := workload.SetTarget(1); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := workload.SetTarget(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := workload.Stop(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("Stop error=%v, want retired close failure", err)
 	}
 }

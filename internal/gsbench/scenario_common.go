@@ -201,11 +201,14 @@ type sqlWorkload struct {
 	cleanup                 SQLWorkerOp
 	mu                      sync.Mutex
 	sessions                map[int]*TaggedConn
+	retireErrMu             sync.Mutex
+	retireErr               error
 }
 
 func newSQLWorkload(ctx context.Context, runtime *Runtime, name string, maxWorkers int, op SQLWorkerOp) *sqlWorkload {
 	w := &sqlWorkload{runtime: runtime, name: name, op: op, sessions: map[int]*TaggedConn{}}
 	w.group = NewWorkerGroup(ctx, maxWorkers, w.run)
+	w.group.SetRetireHook(w.retireSession)
 	return w
 }
 
@@ -259,19 +262,51 @@ func (w *sqlWorkload) session(ctx context.Context, workerID int) (*TaggedConn, e
 func (w *sqlWorkload) Stop(ctx context.Context) error {
 	err := w.group.Stop(ctx)
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	for id, conn := range w.sessions {
+	sessions := w.sessions
+	w.sessions = map[int]*TaggedConn{}
+	w.mu.Unlock()
+	for id, conn := range sessions {
 		if w.cleanup != nil {
-			if cleanupErr := w.cleanup(ctx, conn.Conn, id); err == nil {
-				err = cleanupErr
-			}
+			err = errors.Join(err, w.cleanup(ctx, conn.Conn, id))
 		}
-		if closeErr := conn.Close(); err == nil {
-			err = closeErr
-		}
-		delete(w.sessions, id)
+		err = errors.Join(err, conn.Close())
 	}
+	w.retireErrMu.Lock()
+	err = errors.Join(err, w.retireErr)
+	w.retireErrMu.Unlock()
 	return err
+}
+
+func (w *sqlWorkload) retireSession(id int) {
+	w.mu.Lock()
+	conn := w.sessions[id]
+	delete(w.sessions, id)
+	w.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	timeout := 30 * time.Second
+	if w.runtime != nil && w.runtime.Config.Safety.QueryTimeout > 0 {
+		timeout = w.runtime.Config.Safety.QueryTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var retireErr error
+	if w.cleanup != nil {
+		retireErr = errors.Join(retireErr, w.cleanup(ctx, conn.Conn, id))
+	}
+	retireErr = errors.Join(retireErr, conn.Close())
+	if retireErr == nil {
+		return
+	}
+	w.retireErrMu.Lock()
+	w.retireErr = errors.Join(w.retireErr, retireErr)
+	w.retireErrMu.Unlock()
+	w.mu.Lock()
+	if w.sessions[id] == nil {
+		w.sessions[id] = conn
+	}
+	w.mu.Unlock()
 }
 
 func consumeRows(rows *sql.Rows) error {
@@ -294,28 +329,59 @@ func consumeRows(rows *sql.Rows) error {
 
 func verifyCPUResult(name string, target float64, available bool, control ControlResult, snapshot WorkerSnapshot) Result {
 	result := Result{Scenario: name, Outcome: OutcomeFailed}
+	measured := available && control.Measured
 	reachable := control.ReachableMax
 	if control.Actual > reachable {
 		reachable = control.Actual
 	}
-	result.Evidence = []Evidence{{Metric: "db_host_cpu_percent", Target: target, Actual: control.Actual, Available: available}, {
-		Metric: "reachable_max_percent", Target: target, Actual: reachable, Available: available,
+	result.Evidence = []Evidence{{Metric: "db_host_cpu_percent", Target: target, Actual: control.Actual, Available: measured}, {
+		Metric: "reachable_max_percent", Target: target, Actual: reachable, Available: measured,
 	}, {
 		Metric: "operations", Actual: float64(snapshot.Operations), Available: true,
 	}}
 	switch {
-	case available && control.Reached:
+	case measured && control.Reached:
 		result.Outcome = OutcomeSuccess
 		result.Message = fmt.Sprintf("database host CPU sustained %.1f%% with %d workers", control.Actual, control.Workers)
-	case !available && control.Ceiling && snapshot.Operations > 0:
+	case !measured && control.Ceiling && snapshot.Operations > 0:
 		result.Outcome = OutcomeDegraded
 		result.Message = "CPU metric unavailable; workload reached the configured worker ceiling"
-	case available && control.Ceiling:
+	case measured && control.Ceiling:
 		result.Message = fmt.Sprintf("CPU target %.1f%% is unreachable; measured ceiling %.1f%%", target, reachable)
 	default:
 		result.Message = fmt.Sprintf("CPU target %.1f%% was not reached", target)
 	}
 	return result
+}
+
+func cpuRuntimeEvidence(
+	target float64,
+	available bool,
+	control ControlResult,
+) []Evidence {
+	measured := available && control.Measured
+	reachable := control.ReachableMax
+	if control.Actual > reachable {
+		reachable = control.Actual
+	}
+	return []Evidence{
+		{
+			Metric: "db_host_cpu_percent", Target: target,
+			Actual: control.Actual, Available: measured,
+			Details: map[string]any{
+				"target_reached": control.Reached,
+				"ceiling":        control.Ceiling,
+			},
+		},
+		{
+			Metric: "reachable_max_percent", Target: target,
+			Actual: reachable, Available: measured,
+		},
+		{
+			Metric: "workers", Actual: float64(control.Workers),
+			Available: true,
+		},
+	}
 }
 
 func verifyCapacityResult(name string, target, actual float64, real bool, operations int64) Result {

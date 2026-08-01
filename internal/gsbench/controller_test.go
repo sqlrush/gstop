@@ -125,6 +125,40 @@ func TestControllerDefaultStepRemainsOneForSmallRange(t *testing.T) {
 	}
 }
 
+func TestControllerNarrowsWorkerAdjustmentNearTarget(t *testing.T) {
+	a := &fakeActuator{}
+	c := Controller{
+		Config: ControllerConfig{
+			Target: 95, MinWorkers: 1, MaxWorkers: 100,
+			Step: 8, RequiredSamples: 1, Interval: time.Nanosecond,
+		},
+		Actuator: a,
+		Sample: func(context.Context) Sample {
+			switch a.target {
+			case 1:
+				return Sample{Available: true, Value: 0}
+			case 9:
+				return Sample{Available: true, Value: 90}
+			default:
+				return Sample{Available: true, Value: 95}
+			}
+		},
+	}
+	result := c.Run(context.Background())
+	if !result.Reached {
+		t.Fatalf("result=%+v history=%v", result, a.history)
+	}
+	want := []int{1, 9, 10}
+	if len(a.history) != len(want) {
+		t.Fatalf("history=%v want=%v", a.history, want)
+	}
+	for i := range want {
+		if a.history[i] != want[i] {
+			t.Fatalf("history=%v want=%v", a.history, want)
+		}
+	}
+}
+
 func TestControllerRunUntilReadjustsAfterDroppingOutOfBand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &fakeActuator{}

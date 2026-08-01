@@ -112,7 +112,7 @@ func (s *MixedScenario) Prepare(ctx context.Context, rt *Runtime) error {
 }
 func (s *MixedScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	c := Controller{
-		Config:   ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: s.maximum, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval},
+		Config:   cpuControllerConfig(s.target, s.maximum, rt.Config.Run.RampInterval),
 		Actuator: s.actuator,
 		Sample: func(ctx context.Context) Sample {
 			snapshot := s.ExecutionSnapshot()
@@ -147,6 +147,9 @@ func (s *MixedScenario) ExecutionSnapshot() WorkerSnapshot {
 		Operations: tp.Operations + ap.Operations, Errors: tp.Errors + ap.Errors,
 		FirstError: firstError, TotalLatency: tp.TotalLatency + ap.TotalLatency,
 	}
+}
+func (s *MixedScenario) RuntimeEvidence() []Evidence {
+	return cpuRuntimeEvidence(s.target, s.available, s.control)
 }
 func (s *MixedScenario) Stop(ctx context.Context, _ *Runtime) error {
 	s.control = s.loop.Stop()

@@ -852,7 +852,7 @@ func commandRunCore(
 		_, _ = db.Exec(phaseCtx, "UPDATE "+quotedSchema+".meta_runs SET phase=$1,detail=$2,updated_at=current_timestamp WHERE run_id=$3", string(phase), scenario+":"+string(phase), runID)
 	}
 	if caps.DatabaseCPU {
-		runtime.CPU = NewDatabaseCPUSampler(db)
+		runtime.CPU = newRuntimeCPUSampler(ctx, db, cfg, log)
 	}
 	summary := NewRunner(
 		runtime,
