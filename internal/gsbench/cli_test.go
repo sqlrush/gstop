@@ -588,6 +588,48 @@ func TestCLIScenariosListsStableCatalogWithoutDatabaseConnection(t *testing.T) {
 			t.Fatalf("catalog output missing %q:\n%s", token, text)
 		}
 	}
+	factories := DefaultScenarioFactories()
+	seen := make(map[ScenarioCode]bool, len(factories))
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	if got := len(lines) - 1; got != len(factories) {
+		t.Fatalf("scenario output rows=%d want implemented=%d", got, len(factories))
+	}
+	for _, line := range lines[1:] {
+		var code ScenarioCode
+		if _, err := fmt.Sscanf(line, "%d", &code); err != nil {
+			t.Fatalf("parse scenario line %q: %v", line, err)
+		}
+		if factories[code] == nil {
+			t.Fatalf("scenarios listed unimplemented code %03d", code)
+		}
+		if seen[code] {
+			t.Fatalf("scenarios listed duplicate code %03d", code)
+		}
+		seen[code] = true
+	}
+	if len(seen) != len(factories) {
+		t.Fatalf("listed scenario count=%d want implemented=%d", len(seen), len(factories))
+	}
+	for code := range factories {
+		if !seen[code] {
+			t.Errorf("implemented scenario %03d is missing", code)
+		}
+	}
+
+	var usage bytes.Buffer
+	printUsage(&usage)
+	for _, definition := range DefaultScenarioCatalog().Definitions() {
+		entry := fmt.Sprintf("\n  %03d=%s\n", definition.Code, definition.Name)
+		listed := strings.Contains(usage.String(), entry)
+		if (factories[definition.Code] != nil) != listed {
+			t.Errorf(
+				"usage listing for %03d implemented=%v listed=%v",
+				definition.Code,
+				factories[definition.Code] != nil,
+				listed,
+			)
+		}
+	}
 }
 
 func TestParseCLIArgsAcceptsRestoreWithOptionalRunID(t *testing.T) {

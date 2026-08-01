@@ -330,15 +330,15 @@ Configuration:
 
 Scenarios:
 `)
-	for _, definition := range DefaultScenarioCatalog().Definitions() {
+	for _, definition := range implementedScenarioDefinitions() {
 		_, _ = fmt.Fprintf(w, "  %03d=%s\n", definition.Code, definition.Name)
 	}
-	_, _ = io.WriteString(w, "  Run gsbench scenarios for the full catalog with risk and applicability.\n")
+	_, _ = io.WriteString(w, "  Run gsbench scenarios for implemented scenarios with risk and applicability.\n")
 }
 
 func printScenarios(w io.Writer) {
 	_, _ = io.WriteString(w, "CODE  CATEGORY  NAME  RISK  APPLIES_TO\n")
-	for _, definition := range DefaultScenarioCatalog().Definitions() {
+	for _, definition := range implementedScenarioDefinitions() {
 		appliesTo := make([]string, len(definition.AppliesTo))
 		for i, class := range definition.AppliesTo {
 			appliesTo[i] = string(class)

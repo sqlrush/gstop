@@ -139,6 +139,22 @@ func DefaultScenarioFactories() map[ScenarioCode]ScenarioFactory {
 	return factories
 }
 
+// implementedScenarioDefinitions keeps the internal design catalog available
+// for legacy journal/recovery identities while exposing only runnable scenarios
+// to operators. A catalog entry without a factory must never be advertised as
+// executable.
+func implementedScenarioDefinitions() []ScenarioDefinition {
+	factories := DefaultScenarioFactories()
+	definitions := DefaultScenarioCatalog().Definitions()
+	implemented := make([]ScenarioDefinition, 0, len(factories))
+	for _, definition := range definitions {
+		if factories[definition.Code] != nil {
+			implemented = append(implemented, definition)
+		}
+	}
+	return implemented
+}
+
 func (r *Runner) Run(ctx context.Context, codes []ScenarioCode) RunSummary {
 	results := make([]Result, len(codes))
 	constructed := make([]bool, len(codes))

@@ -163,7 +163,7 @@ func commandIsReadOnly(command string, dryRun bool) bool {
 }
 
 func commandDoctor(ctx context.Context, db *Database, cfg BenchConfig, env Environment, log *RunLog) int {
-	for _, line := range doctorEnvironmentReport(env, DefaultScenarioCatalog().Definitions()) {
+	for _, line := range doctorEnvironmentReport(env, implementedScenarioDefinitions()) {
 		log.Info("%s", line)
 	}
 	if !env.Supported {
