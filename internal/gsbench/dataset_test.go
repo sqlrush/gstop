@@ -228,6 +228,7 @@ func TestDatasetDDLIncludesEveryScenarioTable(t *testing.T) {
 
 type recordingDatasetExecutor struct {
 	statements          []string
+	events              []string
 	completed           map[string]int64
 	schemaExists        bool
 	schemaChecks        int
@@ -259,6 +260,7 @@ func (e *atomicDatasetExecutor) ApplyDatasetBatch(
 	start, end int64,
 	version string,
 ) error {
+	e.events = append(e.events, "batch:"+batch.Table)
 	e.applied = append(e.applied, fmt.Sprintf(
 		"%s:%s:%d-%d:%s", schema, batch.Table, start, end, version,
 	))
@@ -301,6 +303,7 @@ func (e *catalogDatasetExecutor) RecordDatasetVersion(_ context.Context, _ strin
 
 func (e *recordingDatasetExecutor) Exec(_ context.Context, query string, _ ...any) error {
 	e.statements = append(e.statements, query)
+	e.events = append(e.events, "exec:"+query)
 	if strings.HasPrefix(query, "CREATE SCHEMA ") && e.createSchemaErr != nil {
 		return e.createSchemaErr
 	}
@@ -465,7 +468,9 @@ func TestDatasetInitQuotesSchemaAtEveryInterpolationBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec := &recordingDatasetExecutor{completed: completedDatasetBatches(plan)}
+	completed := completedDatasetBatches(plan)
+	completed["customers"]--
+	exec := &recordingDatasetExecutor{completed: completed}
 	if err := NewDatasetManager(exec).Init(context.Background(), plan); err != nil {
 		t.Fatal(err)
 	}
@@ -478,6 +483,138 @@ func TestDatasetInitQuotesSchemaAtEveryInterpolationBoundary(t *testing.T) {
 	for _, required := range []string{`CREATE SCHEMA "Bench"`, `ALTER TABLE "Bench".plan_data`, `ANALYZE "Bench".customers`} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("missing quoted boundary %q:\n%s", required, joined)
+		}
+	}
+}
+
+func TestDatasetInitCreatesSecondaryIndexesAfterDataBatches(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		DDL: []string{
+			`CREATE TABLE "gsbench".items (
+				id bigint PRIMARY KEY,
+				value bigint
+			)`,
+			`CREATE INDEX items_value_idx ON "gsbench".items (value)`,
+		},
+		Batches: []TableBatch{{
+			Table:     "items",
+			Rows:      1,
+			BatchSize: 1,
+			InsertSQL: `INSERT INTO "gsbench".items VALUES($1,$2)`,
+		}},
+	}
+	exec := &atomicDatasetExecutor{recordingDatasetExecutor: recordingDatasetExecutor{
+		completed: map[string]int64{},
+	}}
+	if err := NewDatasetManager(exec).Init(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	batchAt := -1
+	indexAt := -1
+	for i, event := range exec.events {
+		if event == "batch:items" {
+			batchAt = i
+		}
+		if strings.HasPrefix(event, "exec:CREATE INDEX items_value_idx ") {
+			indexAt = i
+		}
+	}
+	if batchAt < 0 || indexAt < 0 || indexAt <= batchAt {
+		t.Fatalf("events=%v", exec.events)
+	}
+}
+
+func TestDatasetInitSkipsAnalyzeWhenNoTableChanged(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		Batches: []TableBatch{{
+			Table: "items", Rows: 1, BatchSize: 1,
+		}},
+	}
+	exec := &recordingDatasetExecutor{
+		completed:    map[string]int64{"items": 1},
+		schemaExists: true,
+	}
+	if err := NewDatasetManager(exec).Init(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range exec.statements {
+		if strings.HasPrefix(statement, `ANALYZE "gsbench".`) {
+			t.Fatalf("unchanged table was analyzed: %s", statement)
+		}
+	}
+}
+
+func TestDatasetInitAnalyzesOnlyChangedTablesWithProgress(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		Batches: []TableBatch{
+			{
+				Table: "changed", Rows: 1, BatchSize: 1,
+				InsertSQL: `INSERT INTO "gsbench".changed SELECT $1`,
+			},
+			{Table: "unchanged", Rows: 1, BatchSize: 1},
+		},
+	}
+	exec := &recordingDatasetExecutor{
+		completed:    map[string]int64{"unchanged": 1},
+		schemaExists: true,
+	}
+	var progress []string
+	manager := NewDatasetManager(exec, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	})
+	if err := manager.Init(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(exec.statements, "\n")
+	if strings.Count(joined, `ANALYZE "gsbench".changed`) != 1 {
+		t.Fatalf("changed table analyze count wrong:\n%s", joined)
+	}
+	if strings.Contains(joined, `ANALYZE "gsbench".unchanged`) {
+		t.Fatalf("unchanged table was analyzed:\n%s", joined)
+	}
+	progressText := strings.Join(progress, "\n")
+	for _, want := range []string{
+		"dataset phase=analyze table=changed action=start",
+		"dataset phase=analyze table=changed action=finish elapsed=",
+	} {
+		if !strings.Contains(progressText, want) {
+			t.Fatalf("progress missing %q:\n%s", want, progressText)
+		}
+	}
+}
+
+func TestDatasetMigrationReportsRangePercentAndElapsed(t *testing.T) {
+	plan := DatasetPlan{
+		Schema: "gsbench",
+		Migrations: []TableMigration{{
+			Name:        "items_v2",
+			SourceTable: "items",
+			BatchSize:   50,
+			UpdateSQL:   `UPDATE "gsbench".items SET value=id WHERE id BETWEEN $1 AND $2`,
+		}},
+		Batches: []TableBatch{{Table: "items", Rows: 100, BatchSize: 50}},
+	}
+	exec := &recordingDatasetExecutor{
+		completed: map[string]int64{"items": 100, "items_v2": 0},
+	}
+	var progress []string
+	manager := NewDatasetManager(exec, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	})
+	if err := manager.Init(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(progress, "\n")
+	for _, want := range []string{
+		"dataset phase=migration name=items_v2 table=items rows=1-50 percent=50 action=start",
+		"dataset phase=migration name=items_v2 table=items rows=1-50 percent=50 action=finish elapsed=",
+		"dataset phase=migration name=items_v2 table=items rows=51-100 percent=100 action=finish elapsed=",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("migration progress missing %q:\n%s", want, text)
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -122,18 +123,89 @@ func TestDatasetInitFailsWhenPhysicalLayoutValidationFails(t *testing.T) {
 	}
 }
 
-func TestDatasetInitSkipsCapacityAndLayoutValidationWhenDisabled(t *testing.T) {
+func TestDatasetInitKeepsPhysicalSizingAndCapacitySafetyWhenValidationDisabled(t *testing.T) {
+	plan := physicalTestPlan()
+	var progress []string
+	exec := &physicalDatasetExecutor{
+		atomicDatasetExecutor: atomicDatasetExecutor{
+			recordingDatasetExecutor: recordingDatasetExecutor{
+				completed:    map[string]int64{},
+				schemaExists: true,
+			},
+		},
+		sizes: []DatasetSizeSample{
+			{TotalBytes: 800_000, Source: "catalog"},
+			{TotalBytes: 950_000, Source: "catalog"},
+		},
+		layoutError: errors.New("layout validation failed"),
+	}
+	manager := NewDatasetManagerWithValidation(exec, false, func(
+		format string,
+		args ...any,
+	) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	})
+	if err := manager.Init(
+		context.Background(),
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if exec.capacityChecks != 1 || exec.layoutCalls != 0 {
+		t.Fatalf(
+			"validation calls capacity=%d layout=%d",
+			exec.capacityChecks,
+			exec.layoutCalls,
+		)
+	}
+	if exec.sizeCalls < 2 {
+		t.Fatalf("physical size samples=%d want>=2", exec.sizeCalls)
+	}
+	if len(exec.applied) != 1 {
+		t.Fatalf("applied batches=%v", exec.applied)
+	}
+	if !strings.Contains(strings.Join(progress, "\n"), "size_bytes=") {
+		t.Fatalf("physical progress=%v", progress)
+	}
+}
+
+func TestDatasetInitKeepsCapacityFailureMandatoryWhenValidationDisabled(t *testing.T) {
 	plan := physicalTestPlan()
 	exec := &physicalDatasetExecutor{
 		atomicDatasetExecutor: atomicDatasetExecutor{
 			recordingDatasetExecutor: recordingDatasetExecutor{
-				completed:    map[string]int64{"fact_sales": 100},
+				completed:    map[string]int64{},
 				schemaExists: true,
 			},
 		},
-		sizes:         []DatasetSizeSample{{TotalBytes: 960_000, Source: "catalog"}},
-		layoutError:   errors.New("layout validation failed"),
-		capacityError: errors.New("capacity validation failed"),
+		sizes:         []DatasetSizeSample{{TotalBytes: 800_000, Source: "catalog"}},
+		capacityError: errors.New("capacity safety threshold reached"),
+	}
+	err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	)
+	if err == nil || !strings.Contains(err.Error(), "capacity safety threshold") {
+		t.Fatalf("err=%v", err)
+	}
+	if exec.capacityChecks != 1 {
+		t.Fatalf("capacity checks=%d", exec.capacityChecks)
+	}
+}
+
+func TestDatasetInitSkipsOvershootModelRejectionWhenValidationDisabled(t *testing.T) {
+	plan := physicalTestPlan()
+	exec := &physicalDatasetExecutor{
+		atomicDatasetExecutor: atomicDatasetExecutor{
+			recordingDatasetExecutor: recordingDatasetExecutor{
+				completed:    map[string]int64{},
+				schemaExists: true,
+			},
+		},
+		sizes: []DatasetSizeSample{
+			{TotalBytes: 800_000, Source: "catalog"},
+			{TotalBytes: 1_050_000, Source: "catalog"},
+		},
 	}
 	if err := NewDatasetManagerWithValidation(exec, false).Init(
 		context.Background(),
@@ -141,12 +213,8 @@ func TestDatasetInitSkipsCapacityAndLayoutValidationWhenDisabled(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if exec.capacityChecks != 0 || exec.layoutCalls != 0 {
-		t.Fatalf(
-			"validation calls capacity=%d layout=%d",
-			exec.capacityChecks,
-			exec.layoutCalls,
-		)
+	if exec.sizeCalls < 2 {
+		t.Fatalf("physical size samples=%d want>=2", exec.sizeCalls)
 	}
 }
 

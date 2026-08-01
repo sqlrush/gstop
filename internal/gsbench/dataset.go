@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 const datasetVersion = "4"
@@ -460,7 +461,8 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 			return fmt.Errorf("add column %s.%s: %w", column.Table, column.Name, err)
 		}
 	}
-	if err := m.migrate(ctx, plan); err != nil {
+	changedTables := make(map[string]bool)
+	if err := m.migrate(ctx, plan, changedTables); err != nil {
 		return err
 	}
 	if catalog, ok := m.exec.(DatasetPostMigrationCatalog); ok {
@@ -482,28 +484,7 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 			return err
 		}
 	}
-	if err := m.ensureDatasetObjects(ctx, ordinaryDDL, DatasetObjectIndex); err != nil {
-		return err
-	}
-	if m.validationEnabled {
-		if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectIndex); err != nil {
-			return err
-		}
-	}
-	if err := m.ensureDatasetObjects(
-		ctx, plan.PostMigrationDDL, DatasetObjectIndex,
-	); err != nil {
-		return fmt.Errorf("initialize post-migration DDL: %w", err)
-	}
-	if m.validationEnabled {
-		if err := m.validateDatasetObjects(
-			ctx, plan.PostMigrationDDL, DatasetObjectIndex,
-		); err != nil {
-			return fmt.Errorf("validate post-migration DDL: %w", err)
-		}
-	}
 	inspector, inspectPhysical := m.exec.(DatasetPhysicalInspector)
-	inspectPhysical = inspectPhysical && m.validationEnabled
 	var physical DatasetSizeSample
 	if inspectPhysical {
 		var err error
@@ -586,8 +567,17 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 					end = start + rowsBeforeTarget - 1
 				}
 			}
-			if err := m.applyDatasetBatch(ctx, plan, table, start, end); err != nil {
+			started := time.Now()
+			m.report(
+				"dataset phase=load table=%s rows=%d-%d action=start size_bytes=%d size_source=%s",
+				table.Table, start, end, physical.TotalBytes, physical.Source,
+			)
+			batchChanged, err := m.applyDatasetBatch(ctx, plan, table, start, end)
+			if err != nil {
 				return err
+			}
+			if batchChanged {
+				changedTables[table.Table] = true
 			}
 			if inspectPhysical {
 				physical, err = inspector.DatasetSize(ctx, plan.Schema)
@@ -595,8 +585,12 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 					return fmt.Errorf("sample dataset size after %s batch: %w",
 						table.Table, err)
 				}
-				m.report("dataset table=%s size_bytes=%d size_source=%s",
-					table.Table, physical.TotalBytes, physical.Source)
+				if m.validationEnabled && physical.Source == "" {
+					return fmt.Errorf(
+						"sample dataset size after %s batch: empty size source",
+						table.Table,
+					)
+				}
 				if m.validationEnabled {
 					if err := enforceDatasetHardTarget(
 						physical,
@@ -611,6 +605,11 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 					stopOptional = true
 				}
 			}
+			m.report(
+				"dataset phase=load table=%s rows=%d-%d action=finish elapsed=%s size_bytes=%d size_source=%s",
+				table.Table, start, end, time.Since(started),
+				physical.TotalBytes, physical.Source,
+			)
 			next, ok := nextDatasetBatchStart(end, table.Rows)
 			if !ok {
 				break
@@ -618,9 +617,76 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 			start = next
 		}
 	}
+	indexGroups := []struct {
+		statements []string
+		detail     string
+	}{
+		{statements: ordinaryDDL, detail: "secondary index"},
+		{statements: plan.PostMigrationDDL, detail: "post-migration index"},
+	}
+	for _, group := range indexGroups {
+		for _, statement := range group.statements {
+			object, err := parseDatasetObject(statement)
+			if err != nil {
+				return err
+			}
+			if object.Kind != DatasetObjectIndex {
+				continue
+			}
+			started := time.Now()
+			m.report(
+				"dataset phase=index index=%s action=start size_bytes=%d size_source=%s",
+				object.Name, physical.TotalBytes, physical.Source,
+			)
+			if err := m.ensureDatasetObjects(
+				ctx, []string{statement}, DatasetObjectIndex,
+			); err != nil {
+				return fmt.Errorf("initialize %s %s: %w", group.detail, object.Name, err)
+			}
+			if inspectPhysical {
+				physical, err = inspector.DatasetSize(ctx, plan.Schema)
+				if err != nil {
+					return fmt.Errorf(
+						"sample dataset size after index %s: %w", object.Name, err,
+					)
+				}
+				if m.validationEnabled {
+					if physical.Source == "" {
+						return fmt.Errorf(
+							"sample dataset size after index %s: empty size source",
+							object.Name,
+						)
+					}
+					if err := enforceDatasetHardTarget(
+						physical,
+						plan.EstimatedBytes,
+						"post-index "+object.Name,
+					); err != nil {
+						return err
+					}
+				}
+			}
+			m.report(
+				"dataset phase=index index=%s action=finish elapsed=%s size_bytes=%d size_source=%s",
+				object.Name, time.Since(started), physical.TotalBytes, physical.Source,
+			)
+		}
+	}
+	if m.validationEnabled {
+		if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectIndex); err != nil {
+			return err
+		}
+		if err := m.validateDatasetObjects(
+			ctx, plan.PostMigrationDDL, DatasetObjectIndex,
+		); err != nil {
+			return fmt.Errorf("validate post-migration DDL: %w", err)
+		}
+	}
 	if inspectPhysical {
 		var err error
-		physical, err = m.calibrateDataset(ctx, plan, inspector, physical)
+		physical, err = m.calibrateDataset(
+			ctx, plan, inspector, physical, changedTables,
+		)
 		if err != nil {
 			return err
 		}
@@ -633,9 +699,18 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 		}
 	}
 	for _, table := range plan.Batches {
+		if !changedTables[table.Table] {
+			continue
+		}
+		started := time.Now()
+		m.report("dataset phase=analyze table=%s action=start", table.Table)
 		if err := m.exec.Exec(ctx, "ANALYZE "+quotedSchema+"."+table.Table); err != nil {
 			return fmt.Errorf("analyze %s: %w", table.Table, err)
 		}
+		m.report(
+			"dataset phase=analyze table=%s action=finish elapsed=%s",
+			table.Table, time.Since(started),
+		)
 	}
 	if inspectPhysical {
 		if m.validationEnabled {
@@ -734,26 +809,23 @@ func (m *DatasetManager) applyDatasetBatch(
 	plan DatasetPlan,
 	table TableBatch,
 	start, end int64,
-) error {
-	if m.validationEnabled {
-		checker, ok := m.exec.(DatasetCapacityChecker)
-		if ok {
-			if err := checker.CheckCapacity(ctx); err != nil {
-				return fmt.Errorf("dataset disk safety check: %w", err)
-			}
-		}
+) (bool, error) {
+	if err := m.checkDatasetCapacity(ctx); err != nil {
+		return false, err
 	}
 	if atomic, ok := m.exec.(DatasetAtomicBatchExecutor); ok {
 		if err := atomic.ApplyDatasetBatch(
 			ctx, plan.Schema, table, start, end, datasetVersion,
 		); err != nil {
-			return fmt.Errorf("populate %s rows %d-%d atomically: %w",
+			return false, fmt.Errorf("populate %s rows %d-%d atomically: %w",
 				table.Table, start, end, err)
 		}
-		return nil
+		return true, nil
 	}
 	if err := m.exec.Exec(ctx, table.InsertSQL, start, end); err != nil {
-		return fmt.Errorf("populate %s rows %d-%d: %w", table.Table, start, end, err)
+		return false, fmt.Errorf(
+			"populate %s rows %d-%d: %w", table.Table, start, end, err,
+		)
 	}
 	if err := m.recordHighWater(
 		ctx,
@@ -763,9 +835,9 @@ func (m *DatasetManager) applyDatasetBatch(
 		table.Rows,
 		table.EstimatedRowBytes,
 	); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 func (m *DatasetManager) calibrateDataset(
@@ -773,6 +845,7 @@ func (m *DatasetManager) calibrateDataset(
 	plan DatasetPlan,
 	inspector DatasetPhysicalInspector,
 	physical DatasetSizeSample,
+	changedTables map[string]bool,
 ) (DatasetSizeSample, error) {
 	for round := 1; round <= 3 &&
 		physical.TotalBytes*100 < plan.EstimatedBytes*90; round++ {
@@ -820,10 +893,19 @@ func (m *DatasetManager) calibrateDataset(
 			end := high + rowDeficit
 			calibrationBatch := table
 			calibrationBatch.Rows = end
-			if err := m.applyDatasetBatch(
+			started := time.Now()
+			m.report(
+				"dataset phase=calibration round=%d table=%s rows=%d-%d action=start size_bytes=%d size_source=%s",
+				round, table.Table, start, end, physical.TotalBytes, physical.Source,
+			)
+			batchChanged, err := m.applyDatasetBatch(
 				ctx, plan, calibrationBatch, start, end,
-			); err != nil {
+			)
+			if err != nil {
 				return physical, fmt.Errorf("calibration round %d: %w", round, err)
+			}
+			if batchChanged {
+				changedTables[table.Table] = true
 			}
 			physical, err = inspector.DatasetSize(ctx, plan.Schema)
 			if err != nil {
@@ -831,6 +913,12 @@ func (m *DatasetManager) calibrateDataset(
 					"sample dataset size in calibration round %d: %w", round, err)
 			}
 			if m.validationEnabled {
+				if physical.Source == "" {
+					return physical, fmt.Errorf(
+						"sample dataset size in calibration round %d: empty size source",
+						round,
+					)
+				}
 				if err := enforceDatasetHardTarget(
 					physical,
 					plan.EstimatedBytes,
@@ -839,6 +927,11 @@ func (m *DatasetManager) calibrateDataset(
 					return physical, err
 				}
 			}
+			m.report(
+				"dataset phase=calibration round=%d table=%s rows=%d-%d action=finish elapsed=%s size_bytes=%d size_source=%s",
+				round, table.Table, start, end, time.Since(started),
+				physical.TotalBytes, physical.Source,
+			)
 		}
 	}
 	return physical, nil
@@ -966,7 +1059,11 @@ func (m *DatasetManager) ensureSchema(ctx context.Context, schema string) error 
 	return nil
 }
 
-func (m *DatasetManager) migrate(ctx context.Context, plan DatasetPlan) error {
+func (m *DatasetManager) migrate(
+	ctx context.Context,
+	plan DatasetPlan,
+	changedTables map[string]bool,
+) error {
 	for _, migration := range plan.Migrations {
 		end, err := m.exec.BatchHighWater(ctx, migration.SourceTable)
 		if err != nil {
@@ -977,15 +1074,19 @@ func (m *DatasetManager) migrate(ctx context.Context, plan DatasetPlan) error {
 			return fmt.Errorf("read %s migration high-water: %w", migration.Name, err)
 		}
 		for start := high + 1; start <= end; start += migration.BatchSize {
-			if m.validationEnabled {
-				checker, ok := m.exec.(DatasetCapacityChecker)
-				if ok {
-					if err := checker.CheckCapacity(ctx); err != nil {
-						return fmt.Errorf("dataset disk safety check: %w", err)
-					}
-				}
+			if err := m.checkDatasetCapacity(ctx); err != nil {
+				return err
 			}
 			batchEnd := min(end, start+migration.BatchSize-1)
+			percent := int64(100)
+			if end > 0 {
+				percent = batchEnd * 100 / end
+			}
+			started := time.Now()
+			m.report(
+				"dataset phase=migration name=%s table=%s rows=%d-%d percent=%d action=start",
+				migration.Name, migration.SourceTable, start, batchEnd, percent,
+			)
 			if err := m.exec.Exec(ctx, migration.UpdateSQL, start, batchEnd); err != nil {
 				return fmt.Errorf("migrate %s rows %d-%d: %w", migration.Name, start, batchEnd, err)
 			}
@@ -999,7 +1100,24 @@ func (m *DatasetManager) migrate(ctx context.Context, plan DatasetPlan) error {
 			); err != nil {
 				return err
 			}
+			changedTables[migration.SourceTable] = true
+			m.report(
+				"dataset phase=migration name=%s table=%s rows=%d-%d percent=%d action=finish elapsed=%s",
+				migration.Name, migration.SourceTable, start, batchEnd, percent,
+				time.Since(started),
+			)
 		}
+	}
+	return nil
+}
+
+func (m *DatasetManager) checkDatasetCapacity(ctx context.Context) error {
+	checker, ok := m.exec.(DatasetCapacityChecker)
+	if !ok {
+		return nil
+	}
+	if err := checker.CheckCapacity(ctx); err != nil {
+		return fmt.Errorf("dataset disk safety check: %w", err)
 	}
 	return nil
 }

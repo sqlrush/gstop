@@ -318,34 +318,27 @@ func commandInit(
 	}
 	providerDB := databaseJournalDB{db: db}
 	externalProviders := DatasetExternalProviders{}
-	var capacityProvider DatasetCapacityProvider
-	capacity := Capacity{}
-	capacityStatus := CapacityStatus{Source: "validation_disabled"}
-	if cfg.Run.ValidationEnabled {
-		var providerErr error
-		capacityProvider, providerErr = selectDatasetCapacityProvider(
-			cfg, env, providerDB, externalProviders,
-		)
-		if providerErr != nil {
-			if !cfg.Run.DryRun {
-				log.Error("select dataset capacity provider: %v", providerErr)
-				return 1
-			}
-			capacityProvider = unavailableDatasetCapacityProvider{err: providerErr}
-		}
-		var err error
-		capacity, capacityStatus, err = resolveDatasetCapacity(
-			ctx,
-			capacityProvider,
-			env,
-			cfg.Run.DryRun,
-			cfg.Data.TargetBytes,
-			cfg.Data.MinFreeDiskPercent,
-		)
-		if err != nil {
-			log.Error("detect disk capacity: %v", err)
+	capacityProvider, providerErr := selectDatasetCapacityProvider(
+		cfg, env, providerDB, externalProviders,
+	)
+	if providerErr != nil {
+		if !cfg.Run.DryRun {
+			log.Error("select dataset capacity provider: %v", providerErr)
 			return 1
 		}
+		capacityProvider = unavailableDatasetCapacityProvider{err: providerErr}
+	}
+	capacity, capacityStatus, err := resolveDatasetCapacity(
+		ctx,
+		capacityProvider,
+		env,
+		cfg.Run.DryRun,
+		cfg.Data.TargetBytes,
+		cfg.Data.MinFreeDiskPercent,
+	)
+	if err != nil {
+		log.Error("detect disk capacity: %v", err)
+		return 1
 	}
 	plan, err := PlanDataset(cfg, capacity, env)
 	if err != nil {
@@ -353,7 +346,7 @@ func commandInit(
 		return 1
 	}
 	var physicalProvider DatasetPhysicalProvider
-	if !cfg.Run.DryRun && cfg.Run.ValidationEnabled {
+	if !cfg.Run.DryRun {
 		physicalProvider, err = selectDatasetPhysicalProvider(
 			cfg, env, providerDB, externalProviders,
 		)
@@ -404,20 +397,6 @@ func commandInit(
 	if err := manager.Init(ctx, plan); err != nil {
 		log.Error("initialize dataset: %v", err)
 		return 1
-	}
-	results, err := RepairPlanBaseline(ctx, db, cfg.Data.Schema)
-	for _, result := range results {
-		log.Info("plan baseline target=%s status=%s", result.Target, result.Status)
-	}
-	if err != nil {
-		log.Error("repair plan baseline: %v", err)
-		return 1
-	}
-	if cfg.Run.ValidationEnabled {
-		if err := VerifyPlanBaseline(ctx, db, cfg.Data.Schema); err != nil {
-			log.Error("verify plan baseline: %v", err)
-			return 1
-		}
 	}
 	log.Info("init SUCCESS")
 	return 0
