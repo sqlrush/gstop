@@ -254,6 +254,22 @@ func TestApplyActionPersistsBeforeForwardExecution(t *testing.T) {
 	}
 }
 
+func TestJournalSkipsApplyPreflightWhenValidationDisabled(t *testing.T) {
+	store := &memoryActionStore{}
+	executor := &memoryActionExecutor{
+		preflightError: errors.New("preflight validation failed"),
+	}
+	if err := NewJournalWithValidation(store, executor, false).ApplyAction(
+		context.Background(),
+		validSQLJournalAction(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.entries) != 1 || store.states[1] != MutationApplied {
+		t.Fatalf("entries=%+v states=%+v", store.entries, store.states)
+	}
+}
+
 func TestApplyActionPreflightRejectsUnusableSQLInverseBeforePersistence(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -574,5 +590,28 @@ func TestRestoreVerificationFailureRemainsPendingForRetry(t *testing.T) {
 	pending, pendingErr := store.Pending(context.Background(), "run-1")
 	if pendingErr != nil || len(pending) != 1 {
 		t.Fatalf("pending = %+v, error = %v", pending, pendingErr)
+	}
+}
+
+func TestJournalSkipsRestoreVerificationWhenValidationDisabled(t *testing.T) {
+	action := validSQLJournalAction()
+	action.Sequence = 7
+	action.Verify = []byte(`{"sql":"SELECT restored","expected":"true"}`)
+	action.State = MutationApplied
+	store := &memoryActionStore{entries: []Action{action}}
+	executor := &memoryActionExecutor{
+		preflightError: errors.New("preflight validation failed"),
+		verifyError:    errors.New("restore validation failed"),
+	}
+	err := NewJournalWithValidation(store, executor, false).
+		restoreCoordinatorActions(context.Background(), []Action{action})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.states[7] != MutationRestored {
+		t.Fatalf("state=%q want=%q", store.states[7], MutationRestored)
+	}
+	if len(executor.verifyActions) != 0 {
+		t.Fatalf("restore verification calls=%d", len(executor.verifyActions))
 	}
 }

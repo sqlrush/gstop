@@ -60,7 +60,7 @@ gsbench run -s 621,624 -d 2m
 
 ## 生命周期与恢复
 
-推荐顺序是 `scenarios`、`doctor`、`init --dry-run`、`init`、`run --dry-run`、`run`、`status`。真实运行按 `preflight → prepare → ramp → hold → verify → stop → restore → verify_restore` 执行；新的变更型运行会先恢复 stale run。
+推荐顺序是 `scenarios`、`doctor`、`init --dry-run`、`init`、`run --dry-run`、`run`、`status`。发布配置默认 `run.validation_enabled=false`，运行按 `preflight → prepare → ramp → hold → stop → restore` 执行；改为 `true` 后增加计划/场景验证和恢复结果验证阶段。新的变更型运行会先恢复 stale run。
 
 `gsbench restore` 是所有场景共用的恢复入口。无 `--run-id` 时，它发现全部活动/失败运行和未完成动作；指定 `--run-id RUN_ID` 时只处理该运行。每次 `gsbench run` 完成时都会无条件调用同一个恢复协调器。恢复前可先 dry-run：
 
@@ -78,7 +78,14 @@ Risk A 无额外开关。Risk B 还要求 `safety.allow_admin_mutation=true` 和
 
 配置只包含实际读取的键：`database.*`、`run.*`、`data.*`、`safety.*`、`fault_provider.*`，以及现有 CPU、连接池、线程池和 vacuum 场景的 `scenario.*` 参数。不要在配置中写密码；使用 `database.password_env=GSBENCH_PASSWORD`，或以 `database.password_config` 引用同发布目录的 gstop 配置。日志会脱敏 DSN 密码，但配置文件仍应限制权限。
 
-分布式真实 `init` 仍因缺少按 primary DN 验证的容量/物理大小 provider wiring 而 fail closed；dry-run 只展示分布式 DDL 方言。生产使用前，应在同版本测试环境完成 `doctor`、`init --dry-run`、最短运行和 restore 演练。
+`run.validation_enabled=false` 时会跳过容量、数据集结构/版本/物理布局、计划基线、场景结果、动作前置/恢复结果及拓扑健康验证；配置和标识符安全、Risk B/C 授权、真实 DDL/DML/负载错误、恢复逆操作错误、锁与 journal 持久化仍然生效。该模式可能写满磁盘或隐藏结果偏差，仅用于隔离测试。需要原有严格行为时设置：
+
+```ini
+[run]
+validation_enabled = true
+```
+
+分布式真实 `init` 在默认关闭验证时不再因容量/物理大小 provider 缺失而中止；启用验证后仍会 fail closed。生产使用前，应启用验证，并在同版本测试环境完成 `doctor`、`init --dry-run`、最短运行和 restore 演练。
 
 ## 结果
 

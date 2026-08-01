@@ -451,7 +451,8 @@ func (r *Runner) runOne(
 			)
 		}
 	}
-	if prepareErr == nil && r.runtime.PlanPreflight != nil {
+	if prepareErr == nil && r.runtime.Config.Run.ValidationEnabled &&
+		r.runtime.PlanPreflight != nil {
 		var statements []string
 		statements, prepareErr = ScenarioWorkloadStatements(
 			r.runtime,
@@ -496,7 +497,7 @@ func (r *Runner) runOne(
 				verify = true
 			}
 		}
-		if verify {
+		if verify && r.runtime.Config.Run.ValidationEnabled {
 			report(PhaseVerify)
 			verified, err := scenario.Verify(ctx, r.runtime)
 			if err != nil {
@@ -505,6 +506,8 @@ func (r *Runner) runOne(
 				result = verified
 				result.StartedAt = startedAt
 			}
+		} else if verify {
+			result.Message = "runtime validation disabled"
 		}
 	}
 	cleanupTimeout := r.runtime.Config.Safety.QueryTimeout

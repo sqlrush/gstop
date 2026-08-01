@@ -17,6 +17,7 @@ type physicalDatasetExecutor struct {
 	layoutCalls    int
 	layoutError    error
 	capacityChecks int
+	capacityError  error
 }
 
 func (e *physicalDatasetExecutor) DatasetSize(
@@ -44,7 +45,7 @@ func (e *physicalDatasetExecutor) ValidateDatasetLayout(
 
 func (e *physicalDatasetExecutor) CheckCapacity(context.Context) error {
 	e.capacityChecks++
-	return nil
+	return e.capacityError
 }
 
 func physicalTestPlan() DatasetPlan {
@@ -118,6 +119,34 @@ func TestDatasetInitFailsWhenPhysicalLayoutValidationFails(t *testing.T) {
 	err := NewDatasetManager(exec).Init(context.Background(), plan)
 	if err == nil || !strings.Contains(err.Error(), "row imbalance") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDatasetInitSkipsCapacityAndLayoutValidationWhenDisabled(t *testing.T) {
+	plan := physicalTestPlan()
+	exec := &physicalDatasetExecutor{
+		atomicDatasetExecutor: atomicDatasetExecutor{
+			recordingDatasetExecutor: recordingDatasetExecutor{
+				completed:    map[string]int64{"fact_sales": 100},
+				schemaExists: true,
+			},
+		},
+		sizes:         []DatasetSizeSample{{TotalBytes: 960_000, Source: "catalog"}},
+		layoutError:   errors.New("layout validation failed"),
+		capacityError: errors.New("capacity validation failed"),
+	}
+	if err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if exec.capacityChecks != 0 || exec.layoutCalls != 0 {
+		t.Fatalf(
+			"validation calls capacity=%d layout=%d",
+			exec.capacityChecks,
+			exec.layoutCalls,
+		)
 	}
 }
 

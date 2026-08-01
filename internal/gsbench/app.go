@@ -87,6 +87,7 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 		logger.Info("command=%s run_id=%s config=%s", options.Command, runID, cfg.Path)
 	}
 	logger.Info("database=%s", cfg.Redacted())
+	logger.Info("runtime_validation_enabled=%v", cfg.Run.ValidationEnabled)
 	openDatabase := OpenDatabase
 	if options.Command == "restore" || options.Command == "stop" {
 		openDatabase = OpenRestoreDatabase
@@ -104,7 +105,8 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 		db.setTargetProduct(environment.Product)
 		caps = capabilitiesFor(environment)
 	}
-	if options.Command != "init" &&
+	if cfg.Run.ValidationEnabled &&
+		options.Command != "init" &&
 		options.Command != "doctor" &&
 		options.Command != "restore" &&
 		options.Command != "stop" {
@@ -164,7 +166,10 @@ func commandDoctor(ctx context.Context, db *Database, cfg BenchConfig, env Envir
 			log,
 			DefaultFaultProviderRegistry(),
 		)
-		summary := NewRestoreCoordinator(backend).Restore(
+		summary := NewRestoreCoordinatorWithValidation(
+			backend,
+			cfg.Run.ValidationEnabled,
+		).Restore(
 			ctx,
 			RestoreRequest{DryRun: true},
 		)
@@ -278,33 +283,40 @@ func commandInit(
 	caps Capabilities,
 	log *RunLog,
 ) int {
-	if !caps.Supported {
+	if cfg.Run.ValidationEnabled && !caps.Supported {
 		log.Error("unsupported target product or topology")
 		return 1
 	}
 	providerDB := databaseJournalDB{db: db}
 	externalProviders := DatasetExternalProviders{}
-	capacityProvider, providerErr := selectDatasetCapacityProvider(
-		cfg, env, providerDB, externalProviders,
-	)
-	if providerErr != nil {
-		if !cfg.Run.DryRun {
-			log.Error("select dataset capacity provider: %v", providerErr)
+	var capacityProvider DatasetCapacityProvider
+	capacity := Capacity{}
+	capacityStatus := CapacityStatus{Source: "validation_disabled"}
+	if cfg.Run.ValidationEnabled {
+		var providerErr error
+		capacityProvider, providerErr = selectDatasetCapacityProvider(
+			cfg, env, providerDB, externalProviders,
+		)
+		if providerErr != nil {
+			if !cfg.Run.DryRun {
+				log.Error("select dataset capacity provider: %v", providerErr)
+				return 1
+			}
+			capacityProvider = unavailableDatasetCapacityProvider{err: providerErr}
+		}
+		var err error
+		capacity, capacityStatus, err = resolveDatasetCapacity(
+			ctx,
+			capacityProvider,
+			env,
+			cfg.Run.DryRun,
+			cfg.Data.TargetBytes,
+			cfg.Data.MinFreeDiskPercent,
+		)
+		if err != nil {
+			log.Error("detect disk capacity: %v", err)
 			return 1
 		}
-		capacityProvider = unavailableDatasetCapacityProvider{err: providerErr}
-	}
-	capacity, capacityStatus, err := resolveDatasetCapacity(
-		ctx,
-		capacityProvider,
-		env,
-		cfg.Run.DryRun,
-		cfg.Data.TargetBytes,
-		cfg.Data.MinFreeDiskPercent,
-	)
-	if err != nil {
-		log.Error("detect disk capacity: %v", err)
-		return 1
 	}
 	plan, err := PlanDataset(cfg, capacity, env)
 	if err != nil {
@@ -312,7 +324,7 @@ func commandInit(
 		return 1
 	}
 	var physicalProvider DatasetPhysicalProvider
-	if !cfg.Run.DryRun {
+	if !cfg.Run.DryRun && cfg.Run.ValidationEnabled {
 		physicalProvider, err = selectDatasetPhysicalProvider(
 			cfg, env, providerDB, externalProviders,
 		)
@@ -355,8 +367,9 @@ func commandInit(
 		log.Info("init SUCCESS (dry run)")
 		return 0
 	}
-	manager := NewDatasetManager(
+	manager := NewDatasetManagerWithValidation(
 		executor,
+		cfg.Run.ValidationEnabled,
 		log.Info,
 	)
 	if err := manager.Init(ctx, plan); err != nil {
@@ -371,9 +384,11 @@ func commandInit(
 		log.Error("repair plan baseline: %v", err)
 		return 1
 	}
-	if err := VerifyPlanBaseline(ctx, db, cfg.Data.Schema); err != nil {
-		log.Error("verify plan baseline: %v", err)
-		return 1
+	if cfg.Run.ValidationEnabled {
+		if err := VerifyPlanBaseline(ctx, db, cfg.Data.Schema); err != nil {
+			log.Error("verify plan baseline: %v", err)
+			return 1
+		}
 	}
 	log.Info("init SUCCESS")
 	return 0
@@ -428,26 +443,38 @@ func commandRun(
 	if cfg.Run.DryRun {
 		for _, code := range cfg.Run.ScenarioCodes {
 			definition := DefaultScenarioCatalog().MustCode(code)
+			lifecycle := "preflight,prepare,ramp,hold,stop,restore"
+			if cfg.Run.ValidationEnabled {
+				lifecycle = "preflight,prepare,ramp,hold,verify,stop,restore,verify_restore"
+			}
 			log.Info(
-				"DRY-RUN scenario=%03d name=%s lifecycle=preflight,prepare,ramp,hold,verify,stop,restore,verify_restore",
+				"DRY-RUN scenario=%03d name=%s lifecycle=%s",
 				code,
 				definition.Name,
+				lifecycle,
 			)
 		}
 		log.Info("run SUCCESS (dry run, no database mutations)")
 		return 0
 	}
-	journal := NewSQLJournal(db, cfg.Data.Schema)
+	journal := NewSQLJournalWithValidation(
+		db,
+		cfg.Data.Schema,
+		cfg.Run.ValidationEnabled,
+	)
 	backend := newDatabaseRestoreBackend(
 		db,
 		cfg,
 		log,
 		DefaultFaultProviderRegistry(),
 	)
-	staleSummary := NewRestoreCoordinator(backend).Restore(
+	staleSummary := NewRestoreCoordinatorWithValidation(
+		backend,
+		cfg.Run.ValidationEnabled,
+	).Restore(
 		parent,
 		RestoreRequest{afterSuccess: func(ctx context.Context) error {
-			if scenarioCodesContainPlanChange(
+			if cfg.Run.ValidationEnabled && scenarioCodesContainPlanChange(
 				cfg.Run.ScenarioCodes,
 			) {
 				activeRunID, err := findActivePlanRun(
@@ -498,13 +525,18 @@ func commandRun(
 		Provider: restoreBackend.provider, Ledger: restoreBackend.ledger,
 		Log: log, RunID: runID, AllowRisk: allowRisk,
 	}
-	runtime.RestoreService = NewRestoreCoordinator(restoreBackend)
-	runtime.PlanPreflight = func(
-		preflightCtx context.Context,
-		scenario string,
-		statements []string,
-	) error {
-		return EnsureWorkloadPlans(preflightCtx, runtime, scenario, statements)
+	runtime.RestoreService = NewRestoreCoordinatorWithValidation(
+		restoreBackend,
+		cfg.Run.ValidationEnabled,
+	)
+	if cfg.Run.ValidationEnabled {
+		runtime.PlanPreflight = func(
+			preflightCtx context.Context,
+			scenario string,
+			statements []string,
+		) error {
+			return EnsureWorkloadPlans(preflightCtx, runtime, scenario, statements)
+		}
 	}
 	runtime.ReportPhase = func(phaseCtx context.Context, scenario string, phase Phase) {
 		_, _ = db.Exec(phaseCtx, "UPDATE "+quotedSchema+".meta_runs SET phase=$1,detail=$2,updated_at=current_timestamp WHERE run_id=$3", string(phase), scenario+":"+string(phase), runID)
@@ -647,7 +679,10 @@ func commandStop(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog
 	)
 	return executeRestoreService(
 		ctx,
-		NewRestoreCoordinator(backend),
+		NewRestoreCoordinatorWithValidation(
+			backend,
+			cfg.Run.ValidationEnabled,
+		),
 		RestoreRequest{RunID: runID, DryRun: cfg.Run.DryRun},
 		"stop",
 		log,
@@ -1032,7 +1067,11 @@ func (b *databaseRestoreBackend) restoreLocalControlPlane(
 		nil,
 		actions,
 	)
-	journal := NewJournal(store, b.executor)
+	journal := NewJournalWithValidation(
+		store,
+		b.executor,
+		b.cfg.Run.ValidationEnabled,
+	)
 	var errs []error
 	for _, runID := range runs {
 		group := restoreActionGroup(
@@ -1150,7 +1189,11 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 		b.localActions,
 	)
 	b.actionStore = actionStore
-	b.journal = NewJournal(actionStore, b.executor)
+	b.journal = NewJournalWithValidation(
+		actionStore,
+		b.executor,
+		b.cfg.Run.ValidationEnabled,
+	)
 	return discovery, nil
 }
 
@@ -1612,7 +1655,10 @@ func commandRestore(ctx context.Context, db *Database, cfg BenchConfig, log *Run
 	)
 	return executeRestoreService(
 		ctx,
-		NewRestoreCoordinator(backend),
+		NewRestoreCoordinatorWithValidation(
+			backend,
+			cfg.Run.ValidationEnabled,
+		),
 		RestoreRequest{RunID: runID, DryRun: cfg.Run.DryRun},
 		"restore",
 		log,

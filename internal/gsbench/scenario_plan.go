@@ -190,7 +190,7 @@ func (s *PlanChangeScenario) Hold(ctx context.Context, rt *Runtime) error {
 		return err
 	}
 	s.baseline = baseline
-	if rt.PlanPreflight != nil {
+	if rt.Config.Run.ValidationEnabled && rt.PlanPreflight != nil {
 		if err := rt.PlanPreflight(ctx, s.Name(), []string{baseline.SQL}); err != nil {
 			return fmt.Errorf("refresh changed workload plan: %w", err)
 		}

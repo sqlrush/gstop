@@ -40,11 +40,12 @@ type DatabaseConfig struct {
 }
 
 type RunConfig struct {
-	ScenarioCodes []ScenarioCode
-	Duration      time.Duration
-	RampInterval  time.Duration
-	Profile       string
-	DryRun        bool
+	ScenarioCodes     []ScenarioCode
+	Duration          time.Duration
+	RampInterval      time.Duration
+	Profile           string
+	DryRun            bool
+	ValidationEnabled bool
 }
 
 type DataConfig struct {
@@ -153,11 +154,12 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 			ConnectTimeout:  connectTimeout,
 		},
 		Run: RunConfig{
-			ScenarioCodes: scenarioCodes(configuredDefinitions),
-			Duration:      duration,
-			RampInterval:  ramp,
-			Profile:       strings.ToLower(raw.GetString("run.profile", "quick")),
-			DryRun:        raw.GetBool("run.dry_run", false),
+			ScenarioCodes:     scenarioCodes(configuredDefinitions),
+			Duration:          duration,
+			RampInterval:      ramp,
+			Profile:           strings.ToLower(raw.GetString("run.profile", "quick")),
+			DryRun:            raw.GetBool("run.dry_run", false),
+			ValidationEnabled: raw.GetBool("run.validation_enabled", false),
 		},
 		Data: DataConfig{
 			Schema:             raw.GetString("data.schema", "gsbench"),

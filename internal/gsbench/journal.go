@@ -53,9 +53,10 @@ type JournalEntry struct {
 }
 
 type Journal struct {
-	store         ActionStore
-	exec          ActionExecutor
-	targetProduct Product
+	store             ActionStore
+	exec              ActionExecutor
+	targetProduct     Product
+	validationEnabled bool
 }
 
 func NewJournal(
@@ -63,7 +64,20 @@ func NewJournal(
 	exec ActionExecutor,
 	targetProduct ...Product,
 ) *Journal {
-	journal := &Journal{store: store, exec: exec}
+	return NewJournalWithValidation(store, exec, true, targetProduct...)
+}
+
+func NewJournalWithValidation(
+	store ActionStore,
+	exec ActionExecutor,
+	validationEnabled bool,
+	targetProduct ...Product,
+) *Journal {
+	journal := &Journal{
+		store:             store,
+		exec:              exec,
+		validationEnabled: validationEnabled,
+	}
 	if len(targetProduct) != 0 {
 		journal.targetProduct = targetProduct[0]
 	}
@@ -88,8 +102,10 @@ func (j *Journal) ApplyAction(ctx context.Context, action Action) error {
 	if err := action.Validate(); err != nil {
 		return err
 	}
-	if err := j.exec.Preflight(ctx, action); err != nil {
-		return fmt.Errorf("preflight action %s: %w", action.Target, err)
+	if j.validationEnabled {
+		if err := j.exec.Preflight(ctx, action); err != nil {
+			return fmt.Errorf("preflight action %s: %w", action.Target, err)
+		}
 	}
 	entry, err := j.store.InsertPlanned(ctx, action)
 	if err != nil {
@@ -131,11 +147,13 @@ func (j *Journal) restoreActions(ctx context.Context, actions []Action) error {
 		if action.State == MutationRestored {
 			continue
 		}
-		if err := j.exec.Preflight(ctx, action); err != nil {
-			errs = append(errs, j.markRestoreFailed(
-				ctx, action, "preflight restore", err,
-			))
-			continue
+		if j.validationEnabled {
+			if err := j.exec.Preflight(ctx, action); err != nil {
+				errs = append(errs, j.markRestoreFailed(
+					ctx, action, "preflight restore", err,
+				))
+				continue
+			}
 		}
 		claimed, err := j.claimAction(ctx, action)
 		if err != nil {
@@ -151,9 +169,11 @@ func (j *Journal) restoreActions(ctx context.Context, actions []Action) error {
 			errs = append(errs, j.markRestoreFailed(ctx, action, "restore", err))
 			continue
 		}
-		if err := j.exec.VerifyRestored(ctx, action); err != nil {
-			errs = append(errs, j.markRestoreFailed(ctx, action, "verify restore", err))
-			continue
+		if j.validationEnabled {
+			if err := j.exec.VerifyRestored(ctx, action); err != nil {
+				errs = append(errs, j.markRestoreFailed(ctx, action, "verify restore", err))
+				continue
+			}
 		}
 		if err := j.setActionState(
 			ctx, action, MutationRestored, "",

@@ -1023,8 +1023,21 @@ type sqlJournalStore struct {
 }
 
 func NewSQLJournal(db *Database, schema string) *Journal {
+	return NewSQLJournalWithValidation(db, schema, true)
+}
+
+func NewSQLJournalWithValidation(
+	db *Database,
+	schema string,
+	validationEnabled bool,
+) *Journal {
 	store := newSQLJournalStore(databaseJournalDB{db: db}, schema)
-	return NewJournal(store, dbActionExecutor{db: db}, db.journalTargetProduct())
+	return NewJournalWithValidation(
+		store,
+		dbActionExecutor{db: db},
+		validationEnabled,
+		db.journalTargetProduct(),
+	)
 }
 
 type journalRows interface {

@@ -56,6 +56,25 @@ func TestConfigLoadsDefaultsAndDurations(t *testing.T) {
 		cfg.Data.PhysicalSizeProvider != "auto" {
 		t.Fatalf("dataset providers=%+v", cfg.Data)
 	}
+	if cfg.Run.ValidationEnabled {
+		t.Fatal("runtime validation must default to disabled")
+	}
+}
+
+func TestConfigEnablesRuntimeValidationExplicitly(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"duration = 10m",
+		"duration = 10m\nvalidation_enabled = true",
+		1,
+	)
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Run.ValidationEnabled {
+		t.Fatal("runtime validation must honor explicit true")
+	}
 }
 
 func TestConfigParsesExplicitDatasetProviders(t *testing.T) {

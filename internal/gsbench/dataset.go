@@ -104,12 +104,24 @@ type DatasetPostMigrationCatalog interface {
 type DatasetProgress func(format string, args ...any)
 
 type DatasetManager struct {
-	exec     DatasetExecutor
-	progress DatasetProgress
+	exec              DatasetExecutor
+	progress          DatasetProgress
+	validationEnabled bool
 }
 
 func NewDatasetManager(exec DatasetExecutor, progress ...DatasetProgress) *DatasetManager {
-	manager := &DatasetManager{exec: exec}
+	return NewDatasetManagerWithValidation(exec, true, progress...)
+}
+
+func NewDatasetManagerWithValidation(
+	exec DatasetExecutor,
+	validationEnabled bool,
+	progress ...DatasetProgress,
+) *DatasetManager {
+	manager := &DatasetManager{
+		exec:              exec,
+		validationEnabled: validationEnabled,
+	}
 	if len(progress) > 0 {
 		manager.progress = progress[0]
 	}
@@ -126,15 +138,20 @@ func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPl
 	if !identifierRE.MatchString(cfg.Data.Schema) {
 		return DatasetPlan{}, fmt.Errorf("unsafe schema %q", cfg.Data.Schema)
 	}
-	if capacity.TotalBytes <= 0 || capacity.FreeBytes <= 0 || capacity.FreeBytes > capacity.TotalBytes {
+	capacityValid := capacity.TotalBytes > 0 && capacity.FreeBytes > 0 &&
+		capacity.FreeBytes <= capacity.TotalBytes
+	if cfg.Run.ValidationEnabled && !capacityValid {
 		return DatasetPlan{}, fmt.Errorf("invalid disk capacity: %+v", capacity)
 	}
 	minFree := cfg.Data.MinFreeDiskPercent
 	if minFree == 0 {
 		minFree = 20
 	}
-	reserved := capacity.TotalBytes * int64(minFree) / 100
-	available := capacity.FreeBytes - reserved
+	var reserved, available int64
+	if capacityValid {
+		reserved = capacity.TotalBytes * int64(minFree) / 100
+		available = capacity.FreeBytes - reserved
+	}
 	profile := strings.ToLower(cfg.Run.Profile)
 	if profile == "" {
 		profile = "quick"
@@ -159,7 +176,7 @@ func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPl
 	if target > maxDatasetBytes {
 		return DatasetPlan{}, fmt.Errorf("dataset target %d exceeds 2TB", target)
 	}
-	if target > available {
+	if cfg.Run.ValidationEnabled && target > available {
 		return DatasetPlan{}, fmt.Errorf(
 			"dataset capacity rejected: target=%d free=%d reserved=%d safe_available=%d",
 			target, capacity.FreeBytes, reserved, available,
@@ -433,26 +450,33 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 			}
 		}
 	}
-	if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectTable); err != nil {
-		return err
+	if m.validationEnabled {
+		if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectTable); err != nil {
+			return err
+		}
 	}
 	if err := m.ensureDatasetObjects(ctx, ordinaryDDL, DatasetObjectIndex); err != nil {
 		return err
 	}
-	if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectIndex); err != nil {
-		return err
+	if m.validationEnabled {
+		if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectIndex); err != nil {
+			return err
+		}
 	}
 	if err := m.ensureDatasetObjects(
 		ctx, plan.PostMigrationDDL, DatasetObjectIndex,
 	); err != nil {
 		return fmt.Errorf("initialize post-migration DDL: %w", err)
 	}
-	if err := m.validateDatasetObjects(
-		ctx, plan.PostMigrationDDL, DatasetObjectIndex,
-	); err != nil {
-		return fmt.Errorf("validate post-migration DDL: %w", err)
+	if m.validationEnabled {
+		if err := m.validateDatasetObjects(
+			ctx, plan.PostMigrationDDL, DatasetObjectIndex,
+		); err != nil {
+			return fmt.Errorf("validate post-migration DDL: %w", err)
+		}
 	}
 	inspector, inspectPhysical := m.exec.(DatasetPhysicalInspector)
+	inspectPhysical = inspectPhysical && m.validationEnabled
 	var physical DatasetSizeSample
 	if inspectPhysical {
 		var err error
@@ -460,13 +484,15 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 		if err != nil {
 			return fmt.Errorf("sample dataset physical size: %w", err)
 		}
-		if physical.Source == "" {
+		if m.validationEnabled && physical.Source == "" {
 			return fmt.Errorf("sample dataset physical size: empty size source")
 		}
-		if err := enforceDatasetHardTarget(
-			physical, plan.EstimatedBytes, "initial sample",
-		); err != nil {
-			return err
+		if m.validationEnabled {
+			if err := enforceDatasetHardTarget(
+				physical, plan.EstimatedBytes, "initial sample",
+			); err != nil {
+				return err
+			}
 		}
 		m.report("dataset size_bytes=%d size_source=%s nodes=%d",
 			physical.TotalBytes, physical.Source, physical.NodeCount)
@@ -544,12 +570,14 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 				}
 				m.report("dataset table=%s size_bytes=%d size_source=%s",
 					table.Table, physical.TotalBytes, physical.Source)
-				if err := enforceDatasetHardTarget(
-					physical,
-					plan.EstimatedBytes,
-					"post-batch "+table.Table,
-				); err != nil {
-					return err
+				if m.validationEnabled {
+					if err := enforceDatasetHardTarget(
+						physical,
+						plan.EstimatedBytes,
+						"post-batch "+table.Table,
+					); err != nil {
+						return err
+					}
 				}
 				if physical.TotalBytes >= plan.EstimatedBytes ||
 					physical.TotalBytes*100 >= plan.EstimatedBytes*95 {
@@ -569,10 +597,12 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 		if err != nil {
 			return err
 		}
-		if err := enforceDatasetHardTarget(
-			physical, plan.EstimatedBytes, "post-calibration",
-		); err != nil {
-			return err
+		if m.validationEnabled {
+			if err := enforceDatasetHardTarget(
+				physical, plan.EstimatedBytes, "post-calibration",
+			); err != nil {
+				return err
+			}
 		}
 	}
 	for _, table := range plan.Batches {
@@ -581,8 +611,10 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 		}
 	}
 	if inspectPhysical {
-		if err := inspector.ValidateDatasetLayout(ctx, plan); err != nil {
-			return fmt.Errorf("validate dataset physical layout: %w", err)
+		if m.validationEnabled {
+			if err := inspector.ValidateDatasetLayout(ctx, plan); err != nil {
+				return fmt.Errorf("validate dataset physical layout: %w", err)
+			}
 		}
 		m.report("dataset final_size_bytes=%d target_bytes=%d size_source=%s",
 			physical.TotalBytes, plan.EstimatedBytes, physical.Source)
@@ -659,7 +691,9 @@ func (m *DatasetManager) bootstrapDatasetVersion(
 	switch version {
 	case "", "1", "2", "3", datasetVersion:
 	default:
-		return nil, fmt.Errorf("unsupported dataset version %q", version)
+		if m.validationEnabled {
+			return nil, fmt.Errorf("unsupported dataset version %q", version)
+		}
 	}
 	if exists {
 		return statements, nil
@@ -676,9 +710,12 @@ func (m *DatasetManager) applyDatasetBatch(
 	table TableBatch,
 	start, end int64,
 ) error {
-	if checker, ok := m.exec.(DatasetCapacityChecker); ok {
-		if err := checker.CheckCapacity(ctx); err != nil {
-			return fmt.Errorf("dataset disk safety check: %w", err)
+	if m.validationEnabled {
+		checker, ok := m.exec.(DatasetCapacityChecker)
+		if ok {
+			if err := checker.CheckCapacity(ctx); err != nil {
+				return fmt.Errorf("dataset disk safety check: %w", err)
+			}
 		}
 	}
 	if atomic, ok := m.exec.(DatasetAtomicBatchExecutor); ok {
@@ -768,12 +805,14 @@ func (m *DatasetManager) calibrateDataset(
 				return physical, fmt.Errorf(
 					"sample dataset size in calibration round %d: %w", round, err)
 			}
-			if err := enforceDatasetHardTarget(
-				physical,
-				plan.EstimatedBytes,
-				fmt.Sprintf("calibration round %d table %s", round, table.Table),
-			); err != nil {
-				return physical, err
+			if m.validationEnabled {
+				if err := enforceDatasetHardTarget(
+					physical,
+					plan.EstimatedBytes,
+					fmt.Sprintf("calibration round %d table %s", round, table.Table),
+				); err != nil {
+					return physical, err
+				}
 			}
 		}
 	}
@@ -913,9 +952,12 @@ func (m *DatasetManager) migrate(ctx context.Context, plan DatasetPlan) error {
 			return fmt.Errorf("read %s migration high-water: %w", migration.Name, err)
 		}
 		for start := high + 1; start <= end; start += migration.BatchSize {
-			if checker, ok := m.exec.(DatasetCapacityChecker); ok {
-				if err := checker.CheckCapacity(ctx); err != nil {
-					return fmt.Errorf("dataset disk safety check: %w", err)
+			if m.validationEnabled {
+				checker, ok := m.exec.(DatasetCapacityChecker)
+				if ok {
+					if err := checker.CheckCapacity(ctx); err != nil {
+						return fmt.Errorf("dataset disk safety check: %w", err)
+					}
 				}
 			}
 			batchEnd := min(end, start+migration.BatchSize-1)

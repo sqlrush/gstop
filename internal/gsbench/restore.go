@@ -174,7 +174,8 @@ type restoreFinalizationDeadlineBackend interface {
 const maximumRestoreFinalizationTimeout = 5 * time.Second
 
 type RestoreCoordinator struct {
-	backend RestoreCoordinatorBackend
+	backend           RestoreCoordinatorBackend
+	validationEnabled bool
 }
 
 type RestoreSummary struct {
@@ -186,7 +187,17 @@ type RestoreSummary struct {
 }
 
 func NewRestoreCoordinator(backend RestoreCoordinatorBackend) *RestoreCoordinator {
-	return &RestoreCoordinator{backend: backend}
+	return NewRestoreCoordinatorWithValidation(backend, true)
+}
+
+func NewRestoreCoordinatorWithValidation(
+	backend RestoreCoordinatorBackend,
+	validationEnabled bool,
+) *RestoreCoordinator {
+	return &RestoreCoordinator{
+		backend:           backend,
+		validationEnabled: validationEnabled,
+	}
 }
 
 func (r *RestoreCoordinator) Restore(
@@ -282,11 +293,13 @@ func (r *RestoreCoordinator) Restore(
 	if err := r.backend.RepairBaseline(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("repair benchmark baseline: %w", err))
 	}
-	if err := r.backend.RedetectTopology(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("re-detect topology: %w", err))
-	}
-	if err := r.backend.VerifyRestore(ctx, runs, actions); err != nil {
-		errs = append(errs, fmt.Errorf("verify restored state: %w", err))
+	if r.validationEnabled {
+		if err := r.backend.RedetectTopology(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("re-detect topology: %w", err))
+		}
+		if err := r.backend.VerifyRestore(ctx, runs, actions); err != nil {
+			errs = append(errs, fmt.Errorf("verify restored state: %w", err))
+		}
 	}
 
 	outcome := OutcomeSuccess

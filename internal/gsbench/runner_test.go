@@ -72,6 +72,7 @@ func newTestRunner(
 	scenarios []Scenario,
 ) (*Runner, []ScenarioCode) {
 	t.Helper()
+	runtime.Config.Run.ValidationEnabled = true
 	if !runtime.Environment.Supported {
 		runtime.Environment = Environment{
 			Product:      ProductOpenGauss,
@@ -437,6 +438,30 @@ func TestRunnerUsesExactLifecycleOrder(t *testing.T) {
 	}
 	if summary.Results[0].StartedAt.IsZero() || summary.Results[0].EndedAt.IsZero() {
 		t.Fatalf("runner timestamps missing: %+v", summary.Results[0])
+	}
+}
+
+func TestRunnerSkipsPlanAndScenarioVerificationWhenValidationDisabled(t *testing.T) {
+	scenario := &fakeScenario{
+		name:      "one",
+		outcome:   OutcomeFailed,
+		failPhase: PhaseVerify,
+	}
+	runtime := &Runtime{
+		RunID: "run-1",
+		PlanPreflight: func(context.Context, string, []string) error {
+			return errors.New("plan validation failed")
+		},
+	}
+	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
+	runner.runtime.Config.Run.ValidationEnabled = false
+	summary := runner.Run(context.Background(), codes)
+	if summary.Outcome != OutcomeSuccess {
+		t.Fatalf("summary=%+v", summary)
+	}
+	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseStop}
+	if !reflect.DeepEqual(scenario.phases, want) {
+		t.Fatalf("phases=%v want=%v", scenario.phases, want)
 	}
 }
 
@@ -1232,6 +1257,7 @@ func TestRunnerPreflightOrderBeforePrepare(t *testing.T) {
 	}}
 	runtime := &Runtime{
 		Config: BenchConfig{
+			Run:  RunConfig{ValidationEnabled: true},
 			Data: DataConfig{Schema: "gsbench"},
 		},
 		Environment: Environment{
@@ -1382,6 +1408,7 @@ func TestRunnerPopulatesCatalogEnvironmentAndRestoreEvidence(t *testing.T) {
 	}
 	runtime := &Runtime{
 		RunID: "run-1", Environment: environment,
+		Config:         BenchConfig{Run: RunConfig{ValidationEnabled: true}},
 		RestoreService: service,
 	}
 

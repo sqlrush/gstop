@@ -269,6 +269,30 @@ func TestRestoreCoordinatorRunsExactSafetyOrder(t *testing.T) {
 	}
 }
 
+func TestRestoreCoordinatorSkipsTopologyAndStateValidationWhenDisabled(t *testing.T) {
+	backend := &fakeRestoreBackend{
+		discovery: RestoreDiscovery{
+			Runs: []RestoreRun{{RunID: "run-1", StartedAt: time.Unix(10, 0)}},
+		},
+		fail: map[string]error{
+			"topology": errors.New("topology validation failed"),
+			"verify":   errors.New("restore validation failed"),
+		},
+	}
+	summary := NewRestoreCoordinatorWithValidation(backend, false).Restore(
+		context.Background(),
+		RestoreRequest{},
+	)
+	if summary.Failed {
+		t.Fatal(summary.Err)
+	}
+	for _, event := range backend.events {
+		if event == "topology" || strings.HasPrefix(event, "verify:") {
+			t.Fatalf("validation event executed: %s", event)
+		}
+	}
+}
+
 func TestRestoreCoordinatorRunsStartupCallbackBeforeUnlockForActiveOnlyRun(
 	t *testing.T,
 ) {

@@ -11,7 +11,7 @@ import (
 
 func datasetConfig(profile string, maxGB int) BenchConfig {
 	return BenchConfig{
-		Run:  RunConfig{Profile: profile},
+		Run:  RunConfig{Profile: profile, ValidationEnabled: true},
 		Data: DataConfig{Schema: "gsbench", MaxSizeGB: maxGB, MinFreeDiskPercent: 20, ReuseExisting: true},
 	}
 }
@@ -177,6 +177,22 @@ func TestDatasetPlanFailsWhenSafeFreeSpaceIsTooSmall(t *testing.T) {
 		if !strings.Contains(err.Error(), field) {
 			t.Errorf("capacity diagnostic missing %q: %v", field, err)
 		}
+	}
+}
+
+func TestDatasetPlanAllowsInsufficientCapacityWhenValidationDisabled(t *testing.T) {
+	cfg := datasetConfig("quick", 5)
+	cfg.Run.ValidationEnabled = false
+	plan, err := PlanDataset(
+		cfg,
+		Capacity{TotalBytes: 100 << 30, FreeBytes: 15 << 30},
+		testDatasetEnvironment(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.EstimatedBytes != 5<<30 {
+		t.Fatalf("estimated bytes=%d", plan.EstimatedBytes)
 	}
 }
 
@@ -619,6 +635,45 @@ func TestDatasetInitRejectsUnsupportedVersionBeforeTableMutation(t *testing.T) {
 		if strings.HasPrefix(event, "migrate:") ||
 			strings.HasPrefix(event, "validate:") {
 			t.Fatalf("unsupported dataset catalog was mutated/validated: %s", event)
+		}
+	}
+}
+
+func TestDatasetInitAllowsUnsupportedVersionWhenValidationDisabled(t *testing.T) {
+	plan, err := PlanDataset(
+		datasetConfig("quick", 1),
+		Capacity{TotalBytes: 20 << 30, FreeBytes: 20 << 30},
+		testDatasetEnvironment(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := &catalogDatasetExecutor{
+		recordingDatasetExecutor: recordingDatasetExecutor{
+			completed:    completedDatasetBatches(plan),
+			schemaExists: true,
+		},
+		existing: map[string]bool{},
+		version:  "99",
+	}
+	for _, statement := range append(
+		append([]string{}, plan.DDL...), plan.PostMigrationDDL...,
+	) {
+		object, parseErr := parseDatasetObject(statement)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		exec.existing[string(object.Kind)+":"+object.Name] = true
+	}
+	if err := NewDatasetManagerWithValidation(exec, false).Init(
+		context.Background(),
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range exec.events {
+		if strings.HasPrefix(event, "validate:") {
+			t.Fatalf("dataset validation ran: %s", event)
 		}
 	}
 }
