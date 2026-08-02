@@ -56,6 +56,16 @@ type LockEvidence struct {
 
 type lockRollback interface{ Rollback() error }
 type lockClose interface{ Close() error }
+type lockSQLExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+type lockWaiterSession struct {
+	role     LockWaiterRole
+	conn     lockClose
+	tx       lockRollback
+	executor lockSQLExecutor
+}
 
 // LockEngine owns exactly the tagged sessions it opens. The stop path is kept
 // intentionally small and ordered so a waiter never keeps a blocker alive.
@@ -63,12 +73,18 @@ type LockEngine struct {
 	definition LockDefinition
 	runtime    *Runtime
 
-	holderConn *TaggedConn
-	waiterConn *TaggedConn
-	holderTx   lockRollback
-	waiterTx   lockRollback
-	chainTx    []lockRollback
-	chainConn  []*TaggedConn
+	holderConn           *TaggedConn
+	waiterConn           *TaggedConn
+	holderTx             lockRollback
+	waiterTx             lockRollback
+	chainTx              []lockRollback
+	chainConn            []*TaggedConn
+	configuredWaiters    []*lockWaiterSession
+	openConfiguredWaiter func(
+		context.Context,
+		*Runtime,
+		LockWaiterRole,
+	) (*lockWaiterSession, error)
 
 	cancelHolder func()
 	cancelWaiter func()
@@ -135,9 +151,11 @@ func firstLockSQLCount(definition LockDefinition) int {
 	return len(definition.HolderSQL)
 }
 
-func executeLockSQL(ctx context.Context, executor interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, statements []string) error {
+func executeLockSQL(
+	ctx context.Context,
+	executor lockSQLExecutor,
+	statements []string,
+) error {
 	for _, statement := range statements {
 		if _, err := executor.ExecContext(ctx, statement); err != nil {
 			return err
@@ -147,6 +165,9 @@ func executeLockSQL(ctx context.Context, executor interface {
 }
 
 func (e *LockEngine) Ramp(ctx context.Context, rt *Runtime) error {
+	if len(e.definition.Waiters) > 0 {
+		return e.rampConfiguredWaiters(ctx, rt)
+	}
 	if e.definition.Deadlock {
 		return e.rampDeadlock(ctx, rt)
 	}
@@ -154,6 +175,104 @@ func (e *LockEngine) Ramp(ctx context.Context, rt *Runtime) error {
 		return e.rampRowChain(ctx, rt)
 	}
 	return e.rampWaiter(ctx, rt)
+}
+
+func openConfiguredLockWaiter(
+	ctx context.Context,
+	rt *Runtime,
+	scenario string,
+	role LockWaiterRole,
+) (*lockWaiterSession, error) {
+	if rt == nil || rt.Database == nil {
+		return nil, fmt.Errorf("lock runtime database is unavailable")
+	}
+	conn, err := rt.Database.OpenTagged(
+		ctx,
+		rt.RunID,
+		scenario,
+		role.Tag,
+	)
+	if err != nil {
+		return nil, err
+	}
+	session := &lockWaiterSession{role: role, conn: conn}
+	if !role.Transactional {
+		session.executor = conn.Conn
+		return session, nil
+	}
+	tx, err := conn.Conn.BeginTx(ctx, nil)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	session.tx = tx
+	session.executor = tx
+	return session, nil
+}
+
+func (e *LockEngine) startConfiguredWaiters(
+	ctx context.Context,
+	rt *Runtime,
+) error {
+	waitCtx, cancel := context.WithCancel(ctx)
+	e.cancelWaiter = cancel
+	opener := e.openConfiguredWaiter
+	if opener == nil {
+		opener = func(
+			openCtx context.Context,
+			runtime *Runtime,
+			role LockWaiterRole,
+		) (*lockWaiterSession, error) {
+			return openConfiguredLockWaiter(
+				openCtx,
+				runtime,
+				e.definition.Name,
+				role,
+			)
+		}
+	}
+	for _, role := range e.definition.Waiters {
+		session, err := opener(waitCtx, rt, role)
+		if err != nil {
+			return fmt.Errorf("waiter %s open: %w", role.Tag, err)
+		}
+		e.configuredWaiters = append(e.configuredWaiters, session)
+		if err := executeLockSQL(
+			waitCtx,
+			session.executor,
+			role.SetupSQL,
+		); err != nil {
+			return fmt.Errorf("waiter %s setup: %w", role.Tag, err)
+		}
+		e.waiterWG.Add(1)
+		go func(session *lockWaiterSession) {
+			defer e.waiterWG.Done()
+			err := executeLockSQL(
+				waitCtx,
+				session.executor,
+				session.role.WaitSQL,
+			)
+			if err != nil {
+				err = fmt.Errorf(
+					"waiter %s wait: %w",
+					session.role.Tag,
+					err,
+				)
+			}
+			e.setWaiterError(err)
+		}(session)
+	}
+	return nil
+}
+
+func (e *LockEngine) rampConfiguredWaiters(
+	ctx context.Context,
+	rt *Runtime,
+) error {
+	if err := e.startConfiguredWaiters(ctx, rt); err != nil {
+		return err
+	}
+	return e.captureExpectedEvidence(ctx, rt)
 }
 
 func (e *LockEngine) rampRowChain(ctx context.Context, rt *Runtime) error {
@@ -360,6 +479,15 @@ func (e *LockEngine) Stop(_ context.Context, _ *Runtime) error {
 	}
 	e.waiterWG.Wait()
 	var errs []error
+	for index := len(e.configuredWaiters) - 1; index >= 0; index-- {
+		session := e.configuredWaiters[index]
+		if session.tx != nil {
+			errs = append(errs, rollbackLock(session.tx))
+		}
+		if session.conn != nil {
+			errs = append(errs, session.conn.Close())
+		}
+	}
 	for index := len(e.chainTx) - 1; index >= 0; index-- {
 		errs = append(errs, rollbackLock(e.chainTx[index]))
 	}
@@ -420,7 +548,7 @@ func (e *LockEngine) setWaiterError(err error) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.waiterErr = err
+	e.waiterErr = errors.Join(e.waiterErr, err)
 }
 
 func (e *LockEngine) setHolderError(err error) {

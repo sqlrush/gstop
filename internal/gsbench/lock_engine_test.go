@@ -2,6 +2,7 @@ package gsbench
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"reflect"
 	"strings"
@@ -13,6 +14,36 @@ import (
 type recordingRollback struct {
 	events *[]string
 	name   string
+}
+
+type recordingClose struct {
+	events *[]string
+	name   string
+}
+
+func (c recordingClose) Close() error {
+	*c.events = append(*c.events, "close_"+c.name)
+	return nil
+}
+
+type blockingConfiguredLockExecutor struct {
+	tag            string
+	setupRemaining int
+	started        chan<- string
+}
+
+func (e *blockingConfiguredLockExecutor) ExecContext(
+	ctx context.Context,
+	_ string,
+	_ ...any,
+) (sql.Result, error) {
+	if e.setupRemaining > 0 {
+		e.setupRemaining--
+		return nil, nil
+	}
+	e.started <- e.tag
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 func (r recordingRollback) Rollback() error {
@@ -33,6 +64,121 @@ func TestLockEngineCancelsWaiterBeforeBlocker(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"cancel_waiter", "rollback_leaf", "rollback_waiter", "cancel_blocker", "rollback_blocker"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%v want=%v", events, want)
+	}
+}
+
+func TestLockEngineStartsEveryConfiguredWaiter(t *testing.T) {
+	definition, err := configureLockDefinition(
+		businessLockDefinitionForTest(t, 501),
+		LockWorkloadConfig{RowChainSessions: 8, RowChainDepth: 3},
+		"gsbench",
+		"run-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := NewLockEngine(definition)
+	started := make(chan string, len(definition.Waiters))
+	opened := []string{}
+	cleanupEvents := []string{}
+	engine.openConfiguredWaiter = func(
+		_ context.Context,
+		_ *Runtime,
+		role LockWaiterRole,
+	) (*lockWaiterSession, error) {
+		opened = append(opened, role.Tag)
+		return &lockWaiterSession{
+			role: role,
+			conn: recordingClose{
+				events: &cleanupEvents,
+				name:   role.Tag,
+			},
+			tx: recordingRollback{
+				events: &cleanupEvents,
+				name:   role.Tag,
+			},
+			executor: &blockingConfiguredLockExecutor{
+				tag:            role.Tag,
+				setupRemaining: len(role.SetupSQL),
+				started:        started,
+			},
+		}, nil
+	}
+	if err := engine.startConfiguredWaiters(
+		context.Background(),
+		&Runtime{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	startedTags := make(map[string]bool, len(definition.Waiters))
+	for range definition.Waiters {
+		select {
+		case tag := <-started:
+			startedTags[tag] = true
+		case <-time.After(time.Second):
+			t.Fatalf("only %d configured waiters started", len(startedTags))
+		}
+	}
+	if len(opened) != 7 || len(startedTags) != 7 {
+		t.Fatalf("opened=%v started=%v", opened, startedTags)
+	}
+	if err := engine.Stop(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(cleanupEvents) != 14 {
+		t.Fatalf("cleanup events=%v", cleanupEvents)
+	}
+}
+
+func TestLockEngineCleansPartialConfiguredWaitersInReverseOrder(t *testing.T) {
+	definition, err := configureLockDefinition(
+		businessLockDefinitionForTest(t, 502),
+		LockWorkloadConfig{TableExclusiveSessions: 6},
+		"gsbench",
+		"run-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []string{}
+	engine := NewLockEngine(definition)
+	engine.holderTx = recordingRollback{events: &events, name: "blocker"}
+	engine.cancelHolder = func() { events = append(events, "cancel_blocker") }
+	engine.openConfiguredWaiter = func(
+		_ context.Context,
+		_ *Runtime,
+		role LockWaiterRole,
+	) (*lockWaiterSession, error) {
+		if role.Tag == "waiter-4" {
+			return nil, errors.New("connection refused")
+		}
+		return &lockWaiterSession{
+			role: role,
+			conn: recordingClose{events: &events, name: role.Tag},
+			tx:   recordingRollback{events: &events, name: role.Tag},
+			executor: &blockingConfiguredLockExecutor{
+				tag:     role.Tag,
+				started: make(chan string, 1),
+			},
+		}, nil
+	}
+	if err := engine.startConfiguredWaiters(
+		context.Background(),
+		&Runtime{},
+	); err == nil || !strings.Contains(err.Error(), "waiter waiter-4 open") {
+		t.Fatalf("start error=%v", err)
+	}
+	if err := engine.Stop(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"rollback_waiter-3", "close_waiter-3",
+		"rollback_waiter-2", "close_waiter-2",
+		"rollback_waiter-1", "close_waiter-1",
+		"cancel_blocker", "rollback_blocker",
+	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events=%v want=%v", events, want)
 	}
