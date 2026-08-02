@@ -23,6 +23,11 @@ const maxDatasetBytes int64 = 2 << 40
 
 var datasetSizeRE = regexp.MustCompile(`(?i)^([0-9]+(?:\.[0-9]{1,2})?)(GB|TB)$`)
 
+var workMemSizeRE = regexp.MustCompile(`(?i)^([1-9][0-9]*)(kB|MB|GB)$`)
+
+const minWorkMemKB int64 = 64
+const defaultWorkMemKB int64 = 256 * 1024
+
 var lifecycleCommands = map[string]struct{}{
 	"init": {}, "run": {}, "status": {}, "stop": {}, "restore": {}, "cleanup": {}, "doctor": {}, "scenarios": {},
 }
@@ -33,6 +38,10 @@ type CLIOptions struct {
 	AllowRisk     RiskLevel
 	ScenarioCodes []ScenarioCode
 	Duration      time.Duration
+	Workers       int
+	TPWorkers     int
+	APWorkers     int
+	WorkMemKB     int64
 	Profile       string
 	DryRun        bool
 	WithData      bool
@@ -61,6 +70,35 @@ func ParseDatasetSize(value string) (int64, error) {
 	return bytes, nil
 }
 
+func ParseWorkMemKB(value string) (int64, error) {
+	match := workMemSizeRE.FindStringSubmatch(strings.TrimSpace(value))
+	if match == nil {
+		return 0, fmt.Errorf("work_mem must be a positive integer using kB, MB, or GB")
+	}
+	quantity, err := strconv.ParseUint(match[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("work_mem value is out of range")
+	}
+	multiplier := uint64(1)
+	switch strings.ToUpper(match[2]) {
+	case "MB":
+		multiplier = 1024
+	case "GB":
+		multiplier = 1024 * 1024
+	}
+	if quantity > uint64(math.MaxInt64)/multiplier {
+		return 0, fmt.Errorf("work_mem value is out of range")
+	}
+	workMemKB := int64(quantity * multiplier)
+	if workMemKB < minWorkMemKB {
+		return 0, fmt.Errorf("work_mem must be at least %dkB", minWorkMemKB)
+	}
+	if workMemKB > math.MaxInt64/1024 {
+		return 0, fmt.Errorf("work_mem value is out of range")
+	}
+	return workMemKB, nil
+}
+
 func ParseCLIArgs(args []string) (CLIOptions, error) {
 	if len(args) == 0 {
 		return CLIOptions{Command: "help"}, nil
@@ -74,33 +112,77 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var configPath, scenarios, durationText, sizeText, allowRiskText string
+	var configPath, scenarios, durationText, sizeText, workMemText, allowRiskText string
 	options := CLIOptions{Command: command}
 	flags.StringVar(&configPath, "c", "", "config path")
 	flags.StringVar(&configPath, "config", "", "config path")
 	flags.StringVar(&scenarios, "s", "", "comma-separated scenarios")
 	flags.StringVar(&scenarios, "scenario", "", "comma-separated scenarios")
-	flags.StringVar(&durationText, "d", "", "total workload duration (ramp + hold)")
-	flags.StringVar(&durationText, "duration", "", "total workload duration (ramp + hold)")
+	flags.StringVar(&durationText, "d", "", "pressure duration")
+	flags.StringVar(&durationText, "duration", "", "pressure duration")
+	flags.IntVar(&options.Workers, "workers", 0, "fixed workers for scenarios 101/102 or 201/202")
+	flags.IntVar(&options.TPWorkers, "tp-workers", 0, "fixed TP workers for scenario 103")
+	flags.IntVar(&options.APWorkers, "ap-workers", 0, "fixed AP workers for scenario 103")
+	flags.StringVar(&workMemText, "work-mem", "", "work_mem for scenarios 201/202 (kB, MB, or GB)")
 	flags.StringVar(&options.Profile, "profile", "", "data profile")
 	flags.BoolVar(&options.DryRun, "dry-run", false, "show actions without mutation")
 	flags.BoolVar(&options.WithData, "data", false, "include benchmark data")
 	flags.StringVar(&options.RunID, "run-id", "", "specific run id")
 	flags.StringVar(&sizeText, "size", "", "target init data size (1GB-2TB)")
 	flags.StringVar(&allowRiskText, "allow-risk", "", "explicit maximum risk authorization (A, B, or C)")
-	if err := flags.Parse(args[1:]); err != nil {
+	parseArgs := append([]string(nil), args[1:]...)
+	if command == "run" && len(parseArgs) > 1 &&
+		!strings.HasPrefix(parseArgs[0], "-") {
+		positionalScenario := parseArgs[0]
+		parseArgs = append(parseArgs[1:], positionalScenario)
+	}
+	if err := flags.Parse(parseArgs); err != nil {
 		return CLIOptions{}, err
 	}
 	sizeSet := false
 	allowRiskSet := false
+	workersSet := false
+	tpWorkersSet := false
+	apWorkersSet := false
+	workMemSet := false
 	flags.Visit(func(value *flag.Flag) {
-		if value.Name == "size" {
+		switch value.Name {
+		case "size":
 			sizeSet = true
-		}
-		if value.Name == "allow-risk" {
+		case "allow-risk":
 			allowRiskSet = true
+		case "workers":
+			workersSet = true
+		case "tp-workers":
+			tpWorkersSet = true
+		case "ap-workers":
+			apWorkersSet = true
+		case "work-mem":
+			workMemSet = true
 		}
 	})
+	workerOverrideSet := workersSet || tpWorkersSet || apWorkersSet
+	if (workerOverrideSet || workMemSet) && command != "run" {
+		return CLIOptions{}, fmt.Errorf("worker and work_mem overrides are only valid with run")
+	}
+	if (workersSet && options.Workers <= 0) ||
+		(tpWorkersSet && options.TPWorkers <= 0) ||
+		(apWorkersSet && options.APWorkers <= 0) {
+		return CLIOptions{}, fmt.Errorf("worker counts must be positive")
+	}
+	if tpWorkersSet != apWorkersSet {
+		return CLIOptions{}, fmt.Errorf("--tp-workers and --ap-workers must be provided together")
+	}
+	if workersSet && (tpWorkersSet || apWorkersSet) {
+		return CLIOptions{}, fmt.Errorf("--workers cannot be combined with --tp-workers or --ap-workers")
+	}
+	if workMemSet {
+		workMemKB, err := ParseWorkMemKB(workMemText)
+		if err != nil {
+			return CLIOptions{}, err
+		}
+		options.WorkMemKB = workMemKB
+	}
 	if sizeSet {
 		if command != "init" {
 			return CLIOptions{}, fmt.Errorf("--size is only valid with init")
@@ -146,6 +228,9 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 		if err != nil {
 			return CLIOptions{}, fmt.Errorf("duration: %w", err)
 		}
+		if duration <= 0 {
+			return CLIOptions{}, fmt.Errorf("duration must be positive")
+		}
 		options.Duration = duration
 	}
 	definitions, err := resolveScenarioInputs(splitList(scenarios))
@@ -155,6 +240,17 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	options.ScenarioCodes = make([]ScenarioCode, len(definitions))
 	for i, definition := range definitions {
 		options.ScenarioCodes[i] = definition.Code
+	}
+	if (workerOverrideSet || workMemSet) && len(options.ScenarioCodes) > 0 {
+		if err := validateFixedWorkerOverrideCompatibility(
+			options.ScenarioCodes,
+			options.Workers,
+			options.TPWorkers,
+			options.APWorkers,
+			options.WorkMemKB,
+		); err != nil {
+			return CLIOptions{}, err
+		}
 	}
 	return options, nil
 }
@@ -309,6 +405,11 @@ func printUsage(w io.Writer) {
 	gsbench <init|run|status|stop|restore|cleanup|doctor|scenarios|version> [options]
   gsbench run [-s LIST] [-d DURATION]
   gsbench run SCENARIO[,SCENARIO...]
+  gsbench run 101 --workers N --duration DURATION
+  gsbench run 102 --workers N --duration DURATION
+  gsbench run 103 --tp-workers N --ap-workers N --duration DURATION
+  gsbench run 201 --workers N --work-mem VALUE --duration DURATION
+  gsbench run 202 --workers N --work-mem VALUE --duration DURATION
   gsbench restore [--run-id RUN_ID]
 	gsbench cleanup [--data]
   gsbench init --size 100GB
@@ -316,7 +417,11 @@ func printUsage(w io.Writer) {
 Options:
   -c, --config PATH       configuration file (legacy-compatible override)
   -s, --scenario LIST    comma-separated three-digit scenario codes or canonical names
-  -d, --duration VALUE   total ramp+hold duration, for example 30s or 5m
+  -d, --duration VALUE   pressure duration, for example 30s or 5m
+      --workers N        fixed workers for scenarios 101/102 or 201/202
+      --tp-workers N     fixed TP workers for scenario 103 (use with --ap-workers)
+      --ap-workers N     fixed AP workers for scenario 103 (use with --tp-workers)
+      --work-mem VALUE   work_mem for scenarios 201/202: integer kB, MB, or GB (minimum 64kB)
       --profile VALUE    data profile: quick or stress
       --dry-run          validate and show actions without workload mutation
       --run-id ID        select one run for status, stop, or restore; cannot combine with cleanup --data

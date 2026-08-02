@@ -153,8 +153,24 @@ func TestConfigLoadsDefaultsAndDurations(t *testing.T) {
 	if cfg.Run.Duration != 10*time.Minute {
 		t.Fatalf("duration = %v", cfg.Run.Duration)
 	}
-	if cfg.Safety.CPUTargetPercent != 95 || cfg.Safety.MaxWorkers != 256 {
+	if cfg.Safety.MaxWorkers != 256 {
 		t.Fatalf("safety defaults = %+v", cfg.Safety)
+	}
+	if cfg.FixedWorkers != (FixedWorkerConfig{
+		TPWorkers:      1,
+		APWorkers:      1,
+		MixedTPWorkers: 1,
+		MixedAPWorkers: 1,
+	}) {
+		t.Fatalf("fixed worker defaults = %+v", cfg.FixedWorkers)
+	}
+	if cfg.MemoryWorkloads != (MemoryWorkloadConfig{
+		SortWorkers:   1,
+		SortWorkMemKB: 256 * 1024,
+		HashWorkers:   1,
+		HashWorkMemKB: 256 * 1024,
+	}) {
+		t.Fatalf("memory workload defaults = %+v", cfg.MemoryWorkloads)
 	}
 	if got := cfg.Run.ScenarioCodes; !reflect.DeepEqual(got, []ScenarioCode{101}) {
 		t.Fatalf("scenario codes = %v", got)
@@ -165,6 +181,302 @@ func TestConfigLoadsDefaultsAndDurations(t *testing.T) {
 	}
 	if cfg.Run.ValidationEnabled {
 		t.Fatal("runtime validation must default to disabled")
+	}
+}
+
+func TestConfigLoadsFixedWorkerScenarioSettings(t *testing.T) {
+	body := minimalConfig() + `
+[scenario.tp_cpu]
+workers = 7
+
+[scenario.ap_cpu]
+workers = 5
+
+[scenario.mixed_cpu]
+tp_workers = 4
+ap_workers = 2
+`
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := FixedWorkerConfig{
+		TPWorkers:      7,
+		APWorkers:      5,
+		MixedTPWorkers: 4,
+		MixedAPWorkers: 2,
+	}
+	if cfg.FixedWorkers != want {
+		t.Fatalf("fixed workers=%+v want=%+v", cfg.FixedWorkers, want)
+	}
+}
+
+func TestConfigLoadsMemoryWorkloadScenarioSettings(t *testing.T) {
+	body := minimalConfig() + `
+[scenario.memory_workmem_sort]
+workers = 7
+work_mem = 128MB
+
+[scenario.memory_workmem_hash]
+workers = 5
+work_mem = 1GB
+`
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := MemoryWorkloadConfig{
+		SortWorkers:   7,
+		SortWorkMemKB: 128 * 1024,
+		HashWorkers:   5,
+		HashWorkMemKB: 1024 * 1024,
+	}
+	if cfg.MemoryWorkloads != want {
+		t.Fatalf("memory workloads=%+v want=%+v", cfg.MemoryWorkloads, want)
+	}
+}
+
+func TestConfigFixedWorkerOverridesFollowFinalScenarios(t *testing.T) {
+	path := writeTestConfig(t, minimalConfig()+`
+[scenario.tp_cpu]
+workers = 2
+
+[scenario.ap_cpu]
+workers = 3
+
+[scenario.mixed_cpu]
+tp_workers = 4
+ap_workers = 5
+`)
+
+	tpAP, err := LoadConfig(path, Overrides{
+		ScenarioCodes: []ScenarioCode{101, 102},
+		Workers:       9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tpAP.FixedWorkers.TPWorkers != 9 ||
+		tpAP.FixedWorkers.APWorkers != 9 {
+		t.Fatalf("shared override not applied: %+v", tpAP.FixedWorkers)
+	}
+
+	mixed, err := LoadConfig(path, Overrides{
+		ScenarioCodes: []ScenarioCode{103},
+		TPWorkers:     8,
+		APWorkers:     6,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mixed.FixedWorkers.MixedTPWorkers != 8 ||
+		mixed.FixedWorkers.MixedAPWorkers != 6 {
+		t.Fatalf("mixed overrides not applied: %+v", mixed.FixedWorkers)
+	}
+}
+
+func TestConfigMemoryOverridesFollowFinalScenarios(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 201,202",
+		1,
+	) + `
+[scenario.memory_workmem_sort]
+workers = 2
+work_mem = 128MB
+
+[scenario.memory_workmem_hash]
+workers = 3
+work_mem = 512MB
+`
+	path := writeTestConfig(t, body)
+
+	hashOnly, err := LoadConfig(path, Overrides{
+		ScenarioCodes: []ScenarioCode{202},
+		Workers:       9,
+		WorkMemKB:     64 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHashOnly := MemoryWorkloadConfig{
+		SortWorkers:   2,
+		SortWorkMemKB: 128 * 1024,
+		HashWorkers:   9,
+		HashWorkMemKB: 64 * 1024,
+	}
+	if hashOnly.MemoryWorkloads != wantHashOnly {
+		t.Fatalf("hash memory overrides=%+v want=%+v", hashOnly.MemoryWorkloads, wantHashOnly)
+	}
+
+	sortOnly, err := LoadConfig(path, Overrides{
+		ScenarioCodes: []ScenarioCode{201},
+		WorkMemKB:     96 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sortOnly.MemoryWorkloads.SortWorkers != 2 ||
+		sortOnly.MemoryWorkloads.SortWorkMemKB != 96*1024 ||
+		sortOnly.MemoryWorkloads.HashWorkers != 3 ||
+		sortOnly.MemoryWorkloads.HashWorkMemKB != 512*1024 {
+		t.Fatalf("sort-only memory override=%+v", sortOnly.MemoryWorkloads)
+	}
+}
+
+func TestCLIConfigOverridesPropagateMemoryTuning(t *testing.T) {
+	options := CLIOptions{
+		ScenarioCodes: []ScenarioCode{201, 202},
+		Duration:      45 * time.Second,
+		Workers:       8,
+		WorkMemKB:     192 * 1024,
+		Profile:       "stress",
+		DryRun:        true,
+		DatasetBytes:  20 << 30,
+		DatasetSize:   "20GB",
+	}
+	overrides := configOverridesFromCLI(options)
+	if !reflect.DeepEqual(overrides.ScenarioCodes, options.ScenarioCodes) ||
+		overrides.Duration != options.Duration ||
+		overrides.Workers != options.Workers ||
+		overrides.WorkMemKB != options.WorkMemKB ||
+		overrides.Profile != options.Profile ||
+		overrides.DryRun == nil || !*overrides.DryRun ||
+		overrides.DatasetBytes != options.DatasetBytes ||
+		overrides.DatasetSize != options.DatasetSize {
+		t.Fatalf("CLI overrides were not propagated: options=%+v overrides=%+v", options, overrides)
+	}
+}
+
+func TestConfigRejectsFixedWorkerOverridesIncompatibleWithFinalScenarios(t *testing.T) {
+	path := writeTestConfig(t, minimalConfig())
+	for _, override := range []Overrides{
+		{ScenarioCodes: []ScenarioCode{103}, Workers: 2},
+		{ScenarioCodes: []ScenarioCode{101}, TPWorkers: 2, APWorkers: 1},
+		{ScenarioCodes: []ScenarioCode{101, 201}, Workers: 2},
+		{ScenarioCodes: []ScenarioCode{103, 102}, TPWorkers: 2, APWorkers: 1},
+		{ScenarioCodes: []ScenarioCode{103}, TPWorkers: 2},
+		{ScenarioCodes: []ScenarioCode{103}, APWorkers: 1},
+		{ScenarioCodes: []ScenarioCode{101}, WorkMemKB: 256 * 1024},
+		{ScenarioCodes: []ScenarioCode{203}, WorkMemKB: 256 * 1024},
+		{ScenarioCodes: []ScenarioCode{201, 203}, Workers: 2},
+		{ScenarioCodes: []ScenarioCode{201, 202}, Workers: 2, WorkMemKB: 256 * 1024},
+		{ScenarioCodes: []ScenarioCode{201, 202, 201}, WorkMemKB: 256 * 1024},
+		{ScenarioCodes: []ScenarioCode{201}, WorkMemKB: 63},
+	} {
+		if _, err := LoadConfig(path, override); err == nil {
+			t.Fatalf("accepted incompatible override %+v", override)
+		}
+	}
+}
+
+func TestConfigValidatesFixedWorkerTotalsAgainstBothHardCaps(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		scenarios string
+		settings  string
+		workers   int
+		conns     int
+	}{
+		{
+			name:      "selected 101 and 102 sum exceeds max workers",
+			scenarios: "101,102",
+			settings:  "[scenario.tp_cpu]\nworkers = 3\n[scenario.ap_cpu]\nworkers = 4\n",
+			workers:   6,
+			conns:     20,
+		},
+		{
+			name:      "103 sum exceeds max connections",
+			scenarios: "103",
+			settings:  "[scenario.mixed_cpu]\ntp_workers = 4\nap_workers = 3\n",
+			workers:   20,
+			conns:     6,
+		},
+		{
+			name:      "201 and 202 sum exceeds max workers",
+			scenarios: "201,202",
+			settings: "[scenario.memory_workmem_sort]\nworkers = 3\n" +
+				"[scenario.memory_workmem_hash]\nworkers = 4\n",
+			workers: 6,
+			conns:   20,
+		},
+		{
+			name:      "202 exceeds max connections",
+			scenarios: "202",
+			settings:  "[scenario.memory_workmem_hash]\nworkers = 7\n",
+			workers:   20,
+			conns:     6,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := strings.Replace(
+				minimalConfig(),
+				"scenarios = tp_cpu",
+				"scenarios = "+test.scenarios,
+				1,
+			) + "\n[safety]\nmax_workers = " + strconv.Itoa(test.workers) +
+				"\nmax_connections = " + strconv.Itoa(test.conns) + "\n" + test.settings
+			if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil ||
+				!strings.Contains(err.Error(), "fixed workers") {
+				t.Fatalf("hard-cap error=%v", err)
+			}
+		})
+	}
+}
+
+func TestConfigRejectsFixedWorkersCombinedWithUnbudgetedScenarios(t *testing.T) {
+	for _, scenarios := range []string{"101,203", "201,203", "202,301"} {
+		body := strings.Replace(
+			minimalConfig(),
+			"scenarios = tp_cpu",
+			"scenarios = "+scenarios,
+			1,
+		)
+		if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil ||
+			!strings.Contains(err.Error(), "fixed-worker scenarios") {
+			t.Fatalf("scenarios=%s error=%v", scenarios, err)
+		}
+	}
+}
+
+func TestConfigRejectsNonPositiveFixedWorkers(t *testing.T) {
+	body := minimalConfig() + "\n[scenario.tp_cpu]\nworkers = 0\n"
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil ||
+		!strings.Contains(err.Error(), "workers") {
+		t.Fatalf("non-positive fixed workers error=%v", err)
+	}
+}
+
+func TestConfigRejectsInvalidMemoryWorkloadSettings(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		settings string
+	}{
+		{name: "zero sort workers", settings: "[scenario.memory_workmem_sort]\nworkers = 0\n"},
+		{name: "zero hash workers", settings: "[scenario.memory_workmem_hash]\nworkers = 0\n"},
+		{name: "sort work mem below minimum", settings: "[scenario.memory_workmem_sort]\nwork_mem = 63kB\n"},
+		{name: "hash work mem missing unit", settings: "[scenario.memory_workmem_hash]\nwork_mem = 256\n"},
+		{name: "hash work mem unsafe", settings: "[scenario.memory_workmem_hash]\nwork_mem = 64kB;RESET ALL\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := LoadConfig(
+				writeTestConfig(t, minimalConfig()+"\n"+test.settings),
+				Overrides{},
+			)
+			if err == nil ||
+				(!strings.Contains(err.Error(), "workers") &&
+					!strings.Contains(err.Error(), "work_mem")) {
+				t.Fatalf("invalid memory setting error=%v", err)
+			}
+		})
+	}
+}
+
+func TestConfigIgnoresLegacyCPUTargetSetting(t *testing.T) {
+	body := minimalConfig() + "\n[safety]\ncpu_target_percent = 0\n"
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+		t.Fatalf("obsolete CPU target still controls fixed workers: %v", err)
 	}
 }
 
@@ -407,12 +719,12 @@ func TestConfigRejectsMoreThanTwoTiB(t *testing.T) {
 }
 
 func TestConfigResolvesThreeDigitScenarioCodesAndCanonicalNames(t *testing.T) {
-	body := strings.Replace(minimalConfig(), "scenarios = tp_cpu", "scenarios = 101,ap_cpu,501", 1)
+	body := strings.Replace(minimalConfig(), "scenarios = tp_cpu", "scenarios = 203,io_sequential_read,501", 1)
 	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := cfg.Run.ScenarioCodes, []ScenarioCode{101, 102, 501}; !reflect.DeepEqual(got, want) {
+	if got, want := cfg.Run.ScenarioCodes, []ScenarioCode{203, 301, 501}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("scenario codes=%v want=%v", got, want)
 	}
 }

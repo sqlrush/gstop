@@ -126,6 +126,10 @@ func (l *RunLog) Info(format string, args ...any) {
 	l.write("INFO", format, args...)
 }
 
+func (l *RunLog) Warn(format string, args ...any) {
+	l.write("WARN", format, args...)
+}
+
 func (l *RunLog) Error(format string, args ...any) {
 	l.write("ERROR", format, args...)
 }

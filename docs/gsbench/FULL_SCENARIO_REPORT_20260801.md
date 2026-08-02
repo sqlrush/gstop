@@ -8,7 +8,7 @@
 
 - `init --size 20GB` 生成 20 GiB 测试数据及 19–21 GiB 物理大小确认；
 - 65 个场景的真实 SQL、锁、执行计划、连接池和线程池验证；
-- 101–103 的真实数据库 CPU 百分比与稳定性；
+- 101–103 的固定 TP/AP worker 数、持续流量与到时停止行为；
 - 401、402、404 的容量上限、实际负载和不可达 ceiling 证据；
 - gstop 覆盖全场景的同步采样；
 - 最终 restore、stale recovery 检查和专用 schema 清理。
@@ -46,14 +46,14 @@
 
 | 场景 | 默认目标 | 运行要求 | 必须保存的达标/ceiling 证据 |
 |---|---:|---|---|
-| 101 `tp_cpu` | CPU 95% | 60 秒持续闭环调节，默认最大 640 workers | `target`、持续采样的 `actual`、`reachable_max`、最终 workers、operations、errors；达到 worker/连接/主机上限仍未达标时必须写明 ceiling，不能记为达标 |
-| 102 `ap_cpu` | CPU 70% | 60 秒持续闭环调节，默认最大 8 workers、每次最多扫描 1,000,000 行 | 同 101，并记录 AP worker 和 scan_rows 上限造成的 ceiling |
-| 103 `mixed_cpu` | CPU 70% | 60 秒持续闭环调节，默认最大 20 workers，其中 AP 最多 4、TP/AP 默认 80/20 | 同 101，并记录 TP/AP 实际 worker 分配及其 ceiling |
+| 101 `tp_cpu` | 固定 TP workers | 所有 worker 就绪后持续满速执行 60 秒 | 配置 workers、tagged TP session 峰值、duration、operations、errors；到时 session 归零且 operations 不再增长 |
+| 102 `ap_cpu` | 固定 AP workers | 所有 worker 就绪后持续满速执行 60 秒，每次最多扫描 1,000,000 行 | 配置 workers、tagged AP session 峰值、scan_rows、duration、operations、errors；到时停止注入 |
+| 103 `mixed_cpu` | 固定 TP/AP workers | 两组 worker 共享启动屏障并持续满速执行 60 秒 | `tp_workers`、`ap_workers` 与两类 tagged session 分别一致；记录总 workers、duration、operations、errors并确认到时归零 |
 | 401 `connection_pool` | 可用连接容量的 95% | 以 `max_connections - reserved` 为分母，扣除已有连接后补足；同时受 `safety.max_connections` 限制 | `usable_connection_capacity`、`reserved_connections`、`existing_connections`、`workload_connection_target`、实际连接百分比、`reachable_max`、`connection_capacity_ceiling_percent`、operations、errors |
 | 402 `thread_pool` | 线程池利用率 95% | 仅真实线程池视图可用于达标判断；默认受 max workers、max connections、reserved 和已有连接共同限制 | `thread_pool_actual_workers`、`thread_pool_idle_workers`、`thread_pool_pending_sessions`、实际利用率、`reachable_max`、`topology_session_ceiling_percent`、operations、errors；fallback 或指标不可用不能记为达标 |
 | 404 `threadpool_queue` | 产生真实 pending，不是百分比目标 | 建立至少 `actual_workers + 1` 个会话并观测 `pending > 0` | actual/idle workers、峰值 `thread_pool_pending_sessions`、所需会话数、实际建立会话数、`thread_queue_session_ceiling`、operations、errors；会话 ceiling 不足必须明确报不可达 |
 
-CPU 控制器的现场验收还应确认目标附近的连续采样，而不是只看一次瞬时峰值。验证脚本会从 EVIDENCE 提取 `target`、`observed`、`ceiling`、`operations` 和 `errors`；gstop 日志用于独立对照主机与数据库采样口径。
+101–103 的现场验收不再检查 CPU 目标或闭环收敛。验证应在 Hold 窗口持续对照 EVIDENCE、tagged session 和 gstop：实际 TP/AP worker 数必须等于输入参数，时间到后会话归零且不再注入请求。CPU 只作为旁路观测数据。
 
 ## 65 个已实现场景
 
@@ -63,9 +63,9 @@ CPU 控制器的现场验收还应确认目标附近的连续采样，而不是�
 
 | 编号 | 场景名 | 适用范围 | 当前状态 | 现场重点证据 |
 |---:|---|---|---|---|
-| 101 | `tp_cpu` | openGauss / 集中式 GaussDB / 分布式 GaussDB | LIVE_NOT_RUN | CPU 95% 目标、持续采样、reachable ceiling、operations/errors |
-| 102 | `ap_cpu` | openGauss / 集中式 GaussDB / 分布式 GaussDB | LIVE_NOT_RUN | CPU 70% 目标、AP worker/scan ceiling、operations/errors |
-| 103 | `mixed_cpu` | openGauss / 集中式 GaussDB / 分布式 GaussDB | LIVE_NOT_RUN | CPU 70% 目标、TP/AP 分配、reachable ceiling、operations/errors |
+| 101 | `tp_cpu` | openGauss / 集中式 GaussDB / 分布式 GaussDB | LIVE_NOT_RUN | 输入 TP workers 与 tagged session 一致、持续流量、到时停止、operations/errors |
+| 102 | `ap_cpu` | openGauss / 集中式 GaussDB / 分布式 GaussDB | LIVE_NOT_RUN | 输入 AP workers 与 tagged session 一致、scan_rows、到时停止、operations/errors |
+| 103 | `mixed_cpu` | openGauss / 集中式 GaussDB / 分布式 GaussDB | LIVE_NOT_RUN | TP/AP 输入分别与 tagged session 一致、同步起停、operations/errors |
 
 ### 2xx：内存（7）
 

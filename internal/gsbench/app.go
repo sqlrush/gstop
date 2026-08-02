@@ -48,9 +48,11 @@ func executeRestoreService(
 	return 0
 }
 
-func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.Writer) int {
+func configOverridesFromCLI(options CLIOptions) Overrides {
 	overrides := Overrides{
 		ScenarioCodes: options.ScenarioCodes, Duration: options.Duration,
+		Workers: options.Workers, TPWorkers: options.TPWorkers,
+		APWorkers: options.APWorkers, WorkMemKB: options.WorkMemKB,
 		Profile: options.Profile, DatasetBytes: options.DatasetBytes,
 		DatasetSize: options.DatasetSize,
 	}
@@ -58,6 +60,11 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 		value := true
 		overrides.DryRun = &value
 	}
+	return overrides
+}
+
+func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.Writer) int {
+	overrides := configOverridesFromCLI(options)
 	cfg, err := LoadConfig(options.ConfigPath, overrides)
 	if err != nil {
 		fmt.Fprintln(stderr, "load config:", err)
@@ -850,9 +857,6 @@ func commandRunCore(
 	}
 	runtime.ReportPhase = func(phaseCtx context.Context, scenario string, phase Phase) {
 		_, _ = db.Exec(phaseCtx, "UPDATE "+quotedSchema+".meta_runs SET phase=$1,detail=$2,updated_at=current_timestamp WHERE run_id=$3", string(phase), scenario+":"+string(phase), runID)
-	}
-	if caps.DatabaseCPU {
-		runtime.CPU = newRuntimeCPUSampler(ctx, db, cfg, log)
 	}
 	summary := NewRunner(
 		runtime,
@@ -2311,7 +2315,7 @@ func (b *databaseRestoreBackend) StopTaggedSessions(
 				"inspect tagged-session quiescence: %w", err,
 			))
 		} else if sessions == 0 && locks == 0 {
-			break
+			return nil
 		}
 		timer := time.NewTimer(interval)
 		select {
@@ -2328,7 +2332,6 @@ func (b *databaseRestoreBackend) StopTaggedSessions(
 		case <-timer.C:
 		}
 	}
-	return errors.Join(errs...)
 }
 
 func (b *databaseRestoreBackend) RestoreActionGroup(

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 )
 
@@ -21,26 +22,32 @@ type Actuator interface {
 }
 
 type ControllerConfig struct {
-	Target          float64
-	Tolerance       float64
-	MinWorkers      int
-	MaxWorkers      int
-	Step            int
-	RequiredSamples int
-	MaxSamples      int
-	Interval        time.Duration
+	Target                    float64
+	Tolerance                 float64
+	MinWorkers                int
+	MaxWorkers                int
+	Step                      int
+	ExplorationStep           int
+	SettledStep               int
+	RequiredSamples           int
+	RequiredAdjustmentSamples int
+	RequiredSettlingSamples   int
+	AdjustmentCooldownSamples int
+	MaxSamples                int
+	Interval                  time.Duration
 }
 
 type ControlResult struct {
-	Reached        bool
-	Ceiling        bool
-	Measured       bool
-	Actual         float64
-	LastSuccessful float64
-	ReachableMax   float64
-	Workers        int
-	Samples        int
-	Err            error
+	Reached         bool
+	Ceiling         bool
+	Measured        bool
+	Actual          float64
+	LastSuccessful  float64
+	ReachableMax    float64
+	Workers         int
+	ResidentWorkers int
+	Samples         int
+	Err             error
 }
 
 type Controller struct {
@@ -50,13 +57,25 @@ type Controller struct {
 }
 
 func workerRampAdjustment(cfg ControllerConfig, sample Sample) int {
+	return actuatorRampAdjustment(cfg, sample, max(1, cfg.Step))
+}
+
+func actuatorRampAdjustment(
+	cfg ControllerConfig,
+	sample Sample,
+	current int,
+) int {
 	step := max(1, cfg.Step)
-	if !sample.Available || cfg.Target <= 0 || sample.Value <= 0 ||
-		sample.Value >= cfg.Target {
-		return step
+	if !sample.Available || cfg.Target <= 0 || sample.Value <= 0 {
+		initial := cfg.ExplorationStep
+		if initial <= 0 {
+			initial = step
+		}
+		return max(1, min(step, initial))
 	}
-	remaining := (cfg.Target - sample.Value) / cfg.Target
-	return max(1, min(step, int(math.Ceil(float64(step)*remaining))))
+	deviation := math.Abs(cfg.Target-sample.Value) / cfg.Target
+	base := min(step, max(1, current))
+	return max(1, min(step, int(math.Ceil(float64(base)*deviation))))
 }
 
 func (c Controller) Run(ctx context.Context) ControlResult {
@@ -85,6 +104,12 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 	if cfg.RequiredSamples <= 0 {
 		cfg.RequiredSamples = 3
 	}
+	if cfg.RequiredAdjustmentSamples <= 0 {
+		cfg.RequiredAdjustmentSamples = 1
+	}
+	if cfg.RequiredSettlingSamples <= 0 {
+		cfg.RequiredSettlingSamples = 1
+	}
 	if cfg.MaxSamples <= 0 {
 		cfg.MaxSamples = max(cfg.RequiredSamples, cfg.MaxWorkers*4)
 	}
@@ -103,22 +128,47 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 	if err := c.Actuator.SetTarget(cfg.MinWorkers); err != nil {
 		return ControlResult{Err: err}
 	}
-	result := ControlResult{Workers: c.Actuator.Target()}
+	result := ControlResult{}
+	updateControlWorkers(&result, c.Actuator)
 	var inBand int
 	var ceilingSamples int
 	var haveReachable bool
+	var lowerTarget, upperTarget int
+	var haveLowerTarget, haveUpperTarget bool
+	var settled bool
+	var settledValues []float64
+	var bandObservations int
+	var adjustmentCooldown int
+	var pendingDirection int
+	var pendingSamples int
+	resetPendingAdjustment := func() {
+		pendingDirection = 0
+		pendingSamples = 0
+	}
+	adjustmentConfirmed := func(direction int) bool {
+		if direction != pendingDirection {
+			pendingDirection = direction
+			pendingSamples = 0
+		}
+		pendingSamples++
+		if pendingSamples < cfg.RequiredAdjustmentSamples {
+			return false
+		}
+		resetPendingAdjustment()
+		return true
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			if !continuous {
 				result.Err = err
 			}
-			result.Workers = c.Actuator.Target()
+			updateControlWorkers(&result, c.Actuator)
 			return result
 		}
 		sample := c.Sample(ctx)
 		result.Samples++
 		current := c.Actuator.Target()
-		result.Workers = current
+		updateControlWorkers(&result, c.Actuator)
 		if sample.Err != nil {
 			result.Err = sample.Err
 			return result
@@ -129,6 +179,9 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 		}
 		if !sample.Available {
 			inBand = 0
+			bandObservations = 0
+			resetPendingAdjustment()
+			settledValues = nil
 			if continuous {
 				result.Reached = false
 			}
@@ -140,12 +193,13 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 				}
 			} else {
 				ceilingSamples = 0
-				adjustment := workerRampAdjustment(cfg, sample)
+				adjustment := actuatorRampAdjustment(cfg, sample, current)
 				if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+adjustment)); err != nil {
 					result.Err = err
 					return result
 				}
-				result.Workers = c.Actuator.Target()
+				bandObservations = 0
+				updateControlWorkers(&result, c.Actuator)
 			}
 		} else {
 			result.Measured = true
@@ -155,9 +209,31 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 				result.ReachableMax = sample.Value
 				haveReachable = true
 			}
-			if math.Abs(sample.Value-cfg.Target) <= cfg.Tolerance {
+			controlSample := sample
+			if settled {
+				settledValues = append(settledValues, sample.Value)
+				if len(settledValues) > 3 {
+					settledValues = settledValues[len(settledValues)-3:]
+				}
+				controlSample.Value = medianControlValue(settledValues)
+			}
+			coolingDown := settled && adjustmentCooldown > 0
+			if coolingDown {
+				adjustmentCooldown--
+			}
+			if math.Abs(controlSample.Value-cfg.Target) <= cfg.Tolerance {
 				inBand++
 				ceilingSamples = 0
+				resetPendingAdjustment()
+				if cfg.SettledStep > 0 && !settled {
+					bandObservations++
+					if bandObservations >= cfg.RequiredSettlingSamples {
+						settled = true
+						settledValues = []float64{sample.Value}
+						haveLowerTarget = false
+						haveUpperTarget = false
+					}
+				}
 				if inBand >= cfg.RequiredSamples {
 					result.Reached = true
 					if !continuous {
@@ -170,31 +246,121 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 					result.Reached = false
 				}
 				switch {
-				case sample.Value < cfg.Target:
+				case controlSample.Value < cfg.Target:
+					if settled {
+						if coolingDown {
+							resetPendingAdjustment()
+							ceilingSamples = 0
+							break
+						}
+						if current >= cfg.MaxWorkers {
+							resetPendingAdjustment()
+							ceilingSamples++
+							if ceilingSamples >= cfg.RequiredSamples {
+								result.Ceiling = true
+								return result
+							}
+						} else if adjustmentConfirmed(1) {
+							ceilingSamples = 0
+							adjustment := min(
+								cfg.SettledStep,
+								actuatorRampAdjustment(cfg, controlSample, current),
+							)
+							if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+max(1, adjustment))); err != nil {
+								result.Err = err
+								return result
+							}
+							adjustmentCooldown = cfg.AdjustmentCooldownSamples
+							updateControlWorkers(&result, c.Actuator)
+						}
+						break
+					}
+					sameUpperTarget := haveUpperTarget && current == upperTarget
+					if haveUpperTarget && current > upperTarget {
+						haveUpperTarget = false
+					}
+					if !haveLowerTarget || current > lowerTarget {
+						lowerTarget, haveLowerTarget = current, true
+					}
 					if current >= cfg.MaxWorkers {
+						resetPendingAdjustment()
 						ceilingSamples++
 						if ceilingSamples >= cfg.RequiredSamples {
 							result.Ceiling = true
 							return result
 						}
-					} else {
+					} else if adjustmentConfirmed(1) {
 						ceilingSamples = 0
-						adjustment := workerRampAdjustment(cfg, sample)
-						if err := c.Actuator.SetTarget(min(cfg.MaxWorkers, current+adjustment)); err != nil {
+						next := 0
+						if haveUpperTarget && upperTarget > current {
+							next = current + max(1, (upperTarget-current)/2)
+						} else {
+							adjustment := actuatorRampAdjustment(cfg, controlSample, current)
+							if sameUpperTarget {
+								haveUpperTarget = false
+							} else if cfg.ExplorationStep > 0 {
+								adjustment = max(adjustment, min(cfg.Step, cfg.ExplorationStep))
+							}
+							next = min(cfg.MaxWorkers, current+adjustment)
+						}
+						if err := c.Actuator.SetTarget(next); err != nil {
 							result.Err = err
 							return result
 						}
-						result.Workers = c.Actuator.Target()
+						bandObservations = 0
+						updateControlWorkers(&result, c.Actuator)
 					}
-				case sample.Value > cfg.Target && current > cfg.MinWorkers:
+				case controlSample.Value > cfg.Target && current > cfg.MinWorkers:
+					if settled {
+						ceilingSamples = 0
+						if coolingDown {
+							resetPendingAdjustment()
+							break
+						}
+						if adjustmentConfirmed(-1) {
+							adjustment := min(
+								cfg.SettledStep,
+								actuatorRampAdjustment(cfg, controlSample, current),
+							)
+							if err := c.Actuator.SetTarget(max(cfg.MinWorkers, current-max(1, adjustment))); err != nil {
+								result.Err = err
+								return result
+							}
+							adjustmentCooldown = cfg.AdjustmentCooldownSamples
+							updateControlWorkers(&result, c.Actuator)
+						}
+						break
+					}
+					sameLowerTarget := haveLowerTarget && current == lowerTarget
+					if haveLowerTarget && current < lowerTarget {
+						haveLowerTarget = false
+					}
+					if !haveUpperTarget || current < upperTarget {
+						upperTarget, haveUpperTarget = current, true
+					}
 					ceilingSamples = 0
-					if err := c.Actuator.SetTarget(max(cfg.MinWorkers, current-cfg.Step)); err != nil {
+					if !adjustmentConfirmed(-1) {
+						break
+					}
+					next := 0
+					if haveLowerTarget && lowerTarget < current {
+						next = lowerTarget + (current-lowerTarget)/2
+					} else if sameLowerTarget {
+						haveLowerTarget = false
+						adjustment := actuatorRampAdjustment(cfg, controlSample, current)
+						next = max(cfg.MinWorkers, current-adjustment)
+					} else {
+						next = max(cfg.MinWorkers, current/2)
+					}
+					if err := c.Actuator.SetTarget(next); err != nil {
 						result.Err = err
 						return result
 					}
-					result.Workers = c.Actuator.Target()
+					bandObservations = 0
+					updateControlWorkers(&result, c.Actuator)
 				default:
 					ceilingSamples = 0
+					resetPendingAdjustment()
 				}
 			}
 		}
@@ -205,7 +371,7 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 			if !continuous {
 				result.Err = err
 			}
-			result.Workers = c.Actuator.Target()
+			updateControlWorkers(&result, c.Actuator)
 			return result
 		}
 		if err := waitContext(ctx, cfg.Interval); err != nil {
@@ -215,6 +381,31 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 			result.Workers = c.Actuator.Target()
 			return result
 		}
+	}
+}
+
+func medianControlValue(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	ordered := append([]float64(nil), values...)
+	sort.Float64s(ordered)
+	middle := len(ordered) / 2
+	if len(ordered)%2 == 1 {
+		return ordered[middle]
+	}
+	return (ordered[middle-1] + ordered[middle]) / 2
+}
+
+type residentWorkerActuator interface {
+	ResidentWorkers() int
+}
+
+func updateControlWorkers(result *ControlResult, actuator Actuator) {
+	result.Workers = actuator.Target()
+	result.ResidentWorkers = result.Workers
+	if resident, ok := actuator.(residentWorkerActuator); ok {
+		result.ResidentWorkers = resident.ResidentWorkers()
 	}
 }
 

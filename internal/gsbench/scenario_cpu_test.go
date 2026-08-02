@@ -3,20 +3,9 @@ package gsbench
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-type sequenceCPUSampler struct{ calls atomic.Int64 }
-
-func (s *sequenceCPUSampler) SampleCPU(context.Context) (float64, bool) {
-	call := s.calls.Add(1)
-	if call <= 3 || call >= 5 {
-		return 50, true
-	}
-	return 10, true
-}
 
 func TestTPStatementsUseIndexedReadsWritesAndInserts(t *testing.T) {
 	statements := TPStatements("gsbench", 42, 9001, 12.34)
@@ -38,27 +27,25 @@ func TestTPStatementsUseIndexedReadsWritesAndInserts(t *testing.T) {
 	}
 }
 
-func TestAPStatementsContainScanJoinAggregateAndSort(t *testing.T) {
+func TestAPStatementsContainBoundSingleThreadedAnalytics(t *testing.T) {
 	statements, err := APStatements("gsbench", 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	joined := strings.ToUpper(strings.Join(statements, "\n"))
-	for _, required := range []string{"FACT_SALES", " JOIN ", "GROUP BY", "ORDER BY", "SUM("} {
-		if !strings.Contains(joined, required) {
-			t.Errorf("AP statements missing %q: %s", required, joined)
-		}
-	}
-}
-
-func TestAPStatementsBoundFactInput(t *testing.T) {
-	statements, err := APStatements("gsbench", 1_000_000)
-	if err != nil {
-		t.Fatal(err)
+	joinedAll := strings.ToUpper(strings.Join(statements, "\n"))
+	if !strings.Contains(joinedAll, " JOIN ") {
+		t.Fatalf("AP workload has no join: %s", joinedAll)
 	}
 	for _, statement := range statements {
-		if !strings.Contains(statement, "FROM gsbench.fact_sales LIMIT 1000000") {
-			t.Fatalf("unbounded AP SQL: %s", statement)
+		joined := strings.ToUpper(statement)
+		for _, required := range []string{
+			"FACT_SALES", "GROUP BY", "ORDER BY", "SUM(",
+			"FROM GSBENCH.FACT_SALES LIMIT 1000000",
+			"/*+ SET(QUERY_DOP 1) */",
+		} {
+			if !strings.Contains(joined, required) {
+				t.Errorf("AP statement missing %q: %s", required, statement)
+			}
 		}
 	}
 }
@@ -83,103 +70,81 @@ func TestAPWorkloadDisablesOperationTimeoutOnly(t *testing.T) {
 	}
 }
 
-func TestMixedWorkerTargetsPreserveRatio(t *testing.T) {
-	tp, ap := MixedWorkerTargets(10, 80)
-	if tp != 8 || ap != 2 {
-		t.Fatalf("tp=%d ap=%d", tp, ap)
+func TestFixedWorkerVerificationUsesExactWorkersWithoutCPUFeedback(t *testing.T) {
+	run := &fixedWorkerRun{
+		duration: 30 * time.Second,
+		lanes:    []fixedWorkerLane{{Name: "tp", Workers: 3}},
+		final: map[string]WorkerSnapshot{
+			"tp": {
+				Target: 3, Started: 3, PeakActive: 3,
+				Operations: 120, TotalLatency: 6 * time.Second,
+			},
+		},
+		startedAt: time.Unix(100, 0),
+		endedAt:   time.Unix(130, 0),
 	}
-	tp, ap = MixedWorkerTargets(1, 80)
-	if tp+ap != 1 {
-		t.Fatalf("single worker split tp=%d ap=%d", tp, ap)
-	}
-}
-
-func TestMixedWorkerTargetsCapAPAndShiftRemainderToTP(t *testing.T) {
-	tp, ap := MixedWorkerTargetsCapped(20, 50, 4)
-	if tp != 16 || ap != 4 {
-		t.Fatalf("tp=%d ap=%d", tp, ap)
-	}
-	tp, ap = MixedWorkerTargetsCapped(40, 80, 4)
-	if tp != 36 || ap != 4 {
-		t.Fatalf("tp=%d ap=%d", tp, ap)
-	}
-}
-
-func TestDefaultAPSafetyCaps(t *testing.T) {
-	if defaultAPSafety.MaxWorkers != 8 ||
-		defaultAPSafety.CPUTargetPercent != 70 ||
-		defaultAPSafety.ScanRows != 1_000_000 {
-		t.Fatalf("AP defaults=%+v", defaultAPSafety)
-	}
-	if defaultMixedMaximum != 20 || defaultMixedAPMaximum != 4 {
-		t.Fatalf("mixed defaults total=%d ap=%d", defaultMixedMaximum, defaultMixedAPMaximum)
-	}
-}
-
-func TestCPUControllerCapsEachWorkerRampAdjustment(t *testing.T) {
-	config := cpuControllerConfig(95, 640, 2*time.Second)
-	if config.Step != maximumCPUWorkersPerAdjustment {
-		t.Fatalf("cpu controller step=%d, want cap=%d", config.Step, maximumCPUWorkersPerAdjustment)
-	}
-	if config.MaxWorkers != 640 || config.Target != 95 {
-		t.Fatalf("cpu controller config=%+v", config)
-	}
-}
-
-func TestCPUVerificationRequiresMeasuredTargetForSuccess(t *testing.T) {
-	result := verifyCPUResult("tp_cpu", 95, true, ControlResult{Reached: true, Measured: true, Actual: 95, Workers: 8}, WorkerSnapshot{Operations: 100})
+	result := verifyFixedWorkerResult(
+		"tp_cpu",
+		run,
+		map[string]string{"tp": "workers"},
+	)
 	if result.Outcome != OutcomeSuccess {
 		t.Fatalf("result=%+v", result)
 	}
-	result = verifyCPUResult("tp_cpu", 95, false, ControlResult{Ceiling: true, Workers: 8}, WorkerSnapshot{Operations: 100})
-	if result.Outcome != OutcomeDegraded {
-		t.Fatalf("fallback result=%+v", result)
+	metrics := map[string]Evidence{}
+	for _, evidence := range result.Evidence {
+		metrics[evidence.Metric] = evidence
+		if strings.Contains(evidence.Metric, "cpu") || evidence.Metric == "effective_workers" {
+			t.Fatalf("fixed worker result retained feedback evidence: %+v", evidence)
+		}
 	}
-	result = verifyCPUResult("tp_cpu", 95, true, ControlResult{Ceiling: true, Measured: true, Actual: 50, ReachableMax: 60, Workers: 8}, WorkerSnapshot{})
-	if result.Outcome != OutcomeFailed || !strings.Contains(result.Message, "ceiling 60.0%") {
-		t.Fatalf("failure result=%+v", result)
+	if workers := metrics["workers"]; workers.Target != 3 || workers.Actual != 3 {
+		t.Fatalf("workers evidence=%+v", workers)
 	}
-}
-
-func TestCPURuntimeEvidenceRequiresSuccessfulSample(t *testing.T) {
-	evidence := cpuRuntimeEvidence(95, true, ControlResult{})
-	if len(evidence) == 0 || evidence[0].Available {
-		t.Fatalf("unsampled CPU evidence reported available: %+v", evidence)
-	}
-	evidence = cpuRuntimeEvidence(95, true, ControlResult{
-		Measured: true,
-		Actual:   94,
-	})
-	if !evidence[0].Available || evidence[0].Actual != 94 {
-		t.Fatalf("measured CPU evidence unavailable: %+v", evidence)
+	if duration := metrics["duration_seconds"]; duration.Target != 30 || duration.Actual != 30 {
+		t.Fatalf("duration evidence=%+v", duration)
 	}
 }
 
-func TestCPUWorkloadScenarioContinuesRegulatingThroughHold(t *testing.T) {
-	workload := &sqlWorkload{group: NewWorkerGroup(context.Background(), 8, func(ctx context.Context, _ int) error {
-		<-ctx.Done()
-		return ctx.Err()
-	})}
-	scenario := &cpuWorkloadScenario{
-		code: 101, name: "tp_cpu", workload: workload, available: true,
+func TestFixedWorkerVerificationRejectsMissingOrFailedWorker(t *testing.T) {
+	for _, snapshot := range []WorkerSnapshot{
+		{Target: 2, Started: 1, PeakActive: 1, Operations: 10},
+		{Target: 2, Started: 2, PeakActive: 2, Operations: 10, Errors: 1, FirstError: "query failed"},
+	} {
+		run := &fixedWorkerRun{
+			duration:  time.Second,
+			lanes:     []fixedWorkerLane{{Name: "ap", Workers: 2}},
+			final:     map[string]WorkerSnapshot{"ap": snapshot},
+			startedAt: time.Unix(100, 0), endedAt: time.Unix(101, 0),
+		}
+		result := verifyFixedWorkerResult(
+			"ap_cpu",
+			run,
+			map[string]string{"ap": "workers"},
+		)
+		if result.Outcome != OutcomeFailed {
+			t.Fatalf("snapshot=%+v result=%+v", snapshot, result)
+		}
 	}
-	runtime := &Runtime{
-		Config: BenchConfig{
-			Run:    RunConfig{Duration: 5 * time.Millisecond, RampInterval: time.Nanosecond},
-			Safety: SafetyConfig{CPUTargetPercent: 50, MaxWorkers: 8},
-		},
-		CPU: &sequenceCPUSampler{},
+}
+
+func TestCPUScenariosDeclareFixedWorkerStrategiesAndOwnDuration(t *testing.T) {
+	checks := []struct {
+		scenario Scenario
+		strategy string
+	}{
+		{scenario: NewTPScenario(), strategy: "tp_sql_fixed_workers"},
+		{scenario: NewAPScenario(), strategy: "ap_sql_fixed_workers"},
+		{scenario: NewMixedScenario(), strategy: "mixed_tp_ap_fixed_workers"},
 	}
-	if err := scenario.Ramp(context.Background(), runtime); err != nil {
-		t.Fatal(err)
-	}
-	if err := scenario.Hold(context.Background(), runtime); err != nil {
-		t.Fatal(err)
-	}
-	if scenario.workload.Target() <= 1 {
-		t.Fatalf("worker target froze after first entering the band: control=%+v target=%d", scenario.control, scenario.workload.Target())
-	}
-	if err := scenario.Stop(context.Background(), runtime); err != nil {
-		t.Fatal(err)
+	for _, check := range checks {
+		strategic, ok := check.scenario.(ScenarioStrategy)
+		if !ok || strategic.Strategy() != check.strategy {
+			t.Fatalf("scenario %s strategy=%q, want %q", check.scenario.Name(), strategic.Strategy(), check.strategy)
+		}
+		owner, ok := check.scenario.(workloadDurationOwner)
+		if !ok || !owner.OwnsWorkloadDuration() {
+			t.Fatalf("scenario %s does not own its fixed pressure duration", check.scenario.Name())
+		}
 	}
 }

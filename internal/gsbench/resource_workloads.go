@@ -3,11 +3,19 @@ package gsbench
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	defaultPlanCacheObjectLimit = 64
+	defaultSessionCursorLimit   = 256
+	totalMemoryCompositeWorkMem = "SET work_mem='64MB'"
 )
 
 // ResourceWorkload is the allowlisted SQL shape for one lightweight resource
@@ -32,13 +40,14 @@ func ResourceWorkloadFor(code ScenarioCode, schema string, _ Environment) (Resou
 	switch code {
 	case 201:
 		workload.Setup, workload.Cleanup = "SET work_mem='256MB'", "RESET work_mem"
-		workload.Statement = "SELECT id,customer_id,amount,payload FROM " + fact + " WHERE id BETWEEN $1 AND $2 ORDER BY payload,amount DESC,id"
+		workload.Statement = "SELECT CAST(id AS text) AS id_text,CAST(customer_id AS text) AS customer_id_text,amount,payload FROM " + fact + " WHERE id BETWEEN $1 AND $2 ORDER BY payload,amount DESC,id"
 	case 202:
 		workload.Setup, workload.Cleanup = "SET work_mem='256MB'", "RESET work_mem"
 		workload.Statement = "SELECT f1.product_id,sum(f1.amount),count(*) FROM " + fact + " f1 JOIN " + fact + " f2 ON f1.customer_id=f2.customer_id WHERE mod(f1.id,16)=0 GROUP BY f1.product_id ORDER BY sum(f1.amount) DESC"
 	case 203, 301:
-		workload.Statement = "SELECT sum(amount),avg(quantity),count(payload) FROM " + fact + " WHERE id BETWEEN $1 AND $2"
+		workload.Statement = "SELECT sum(amount),avg(quantity),CAST(count(payload) AS text) AS payload_count_text FROM " + fact + " WHERE id BETWEEN $1 AND $2"
 	case 204:
+		workload.Cleanup = "DEALLOCATE ALL"
 		workload.Statement = "SELECT sum(amount) FROM " + fact + " WHERE customer_id=$1 AND id >= $2"
 	case 205:
 		workload.Cleanup = "CLOSE ALL; ROLLBACK"
@@ -57,7 +66,7 @@ func ResourceWorkloadFor(code ScenarioCode, schema string, _ Environment) (Resou
 		workload.Setup, workload.Cleanup = "SET work_mem='64kB'", "RESET work_mem"
 		workload.Statement = "SELECT customer_id,sum(amount) FROM " + fact + " GROUP BY customer_id ORDER BY sum(amount) DESC"
 	case 321:
-		workload.Statement = "SELECT id,customer_id,product_id,store_id,amount,payload FROM " + fact + " WHERE id BETWEEN $1 AND $2"
+		workload.Statement = "SELECT CAST(id AS text) AS id_text,CAST(customer_id AS text) AS customer_id_text,CAST(product_id AS text) AS product_id_text,CAST(store_id AS text) AS store_id_text,amount,payload FROM " + fact + " WHERE id BETWEEN $1 AND $2"
 	case 322:
 		workload.Statement = "INSERT INTO " + quoted + ".network_ingress(run_id,dist_key,seq,payload) VALUES($1,$2,$3,$4)"
 	case 331:
@@ -124,12 +133,15 @@ func resourceRequiredStream(code ScenarioCode) string {
 }
 
 type resourceScenario struct {
-	code     ScenarioCode
-	name     string
-	workload ResourceWorkload
-	workers  *sqlWorkload
-	evidence resourceEvidence
-	sequence atomic.Int64
+	code              ScenarioCode
+	name              string
+	workload          ResourceWorkload
+	workers           *sqlWorkload
+	evidence          resourceEvidence
+	sequence          atomic.Int64
+	memoryMu          sync.Mutex
+	memoryObjects     map[int][]string
+	memoryObjectCount int
 }
 
 func newResourceScenario(code ScenarioCode, name string) *resourceScenario {
@@ -172,14 +184,22 @@ func (s *resourceScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		}
 	}
 	s.workers = newSQLWorkloadWithCleanup(ctx, rt, s.name, rt.Config.Safety.MaxWorkers, s.operation(rt), func(ctx context.Context, conn *sql.Conn, _ int) error {
+		var cleanupErrors []error
 		for _, statement := range strings.Split(s.workload.Cleanup, ";") {
 			if statement = strings.TrimSpace(statement); statement != "" {
-				if _, err := conn.ExecContext(ctx, statement); err != nil && err != sql.ErrTxDone {
-					return err
+				if _, err := conn.ExecContext(ctx, statement); err != nil && !errors.Is(err, sql.ErrTxDone) {
+					cleanupErrors = append(cleanupErrors, err)
 				}
 			}
 		}
-		return nil
+		switch len(cleanupErrors) {
+		case 0:
+			return nil
+		case 1:
+			return cleanupErrors[0]
+		default:
+			return errors.Join(cleanupErrors...)
+		}
 	})
 	return nil
 }
@@ -194,13 +214,34 @@ func (s *resourceScenario) operation(rt *Runtime) SQLWorkerOp {
 		n := s.sequence.Add(1)
 		switch s.code {
 		case 204:
-			_, err := conn.ExecContext(ctx, resourcePrepareStatement(rt.RunID, n, s.workload.Statement))
-			return err
-		case 205:
-			if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "transaction") {
+			candidate := resourcePrepareName(rt.RunID, n)
+			name, create, _ := s.boundedMemoryObject(
+				workerID, candidate, 0, defaultPlanCacheObjectLimit,
+			)
+			if create {
+				_, err := conn.ExecContext(ctx, resourcePrepareStatement(rt.RunID, n, s.workload.Statement))
 				return err
 			}
-			name := "gsbench_cur_" + strconv.FormatInt(n, 10)
+			if name == "" {
+				_, err := conn.ExecContext(ctx, "SELECT 1")
+				return err
+			}
+			_, err := conn.ExecContext(ctx, resourceExecutePrepared(name))
+			return err
+		case 205:
+			candidate := "gsbench_cur_" + strconv.FormatInt(n, 10)
+			name, create, first := s.boundedMemoryObject(
+				workerID, candidate, 0, defaultSessionCursorLimit,
+			)
+			if !create {
+				_, err := conn.ExecContext(ctx, "SELECT 1")
+				return err
+			}
+			if first {
+				if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+					return err
+				}
+			}
 			if _, err := conn.ExecContext(ctx, "DECLARE "+name+" NO SCROLL CURSOR FOR "+s.workload.Statement, int(n%97)); err != nil {
 				return err
 			}
@@ -242,6 +283,32 @@ func (s *resourceScenario) operation(rt *Runtime) SQLWorkerOp {
 			return consumeRows(rows)
 		}
 	}
+}
+
+func (s *resourceScenario) boundedMemoryObject(
+	workerID int,
+	candidate string,
+	reuseIndex int64,
+	limit int,
+) (name string, create, first bool) {
+	s.memoryMu.Lock()
+	defer s.memoryMu.Unlock()
+	if s.memoryObjects == nil {
+		s.memoryObjects = make(map[int][]string)
+	}
+	owned := s.memoryObjects[workerID]
+	if s.memoryObjectCount < limit {
+		s.memoryObjects[workerID] = append(owned, candidate)
+		s.memoryObjectCount++
+		return candidate, true, len(owned) == 0
+	}
+	if len(owned) == 0 {
+		return "", false, false
+	}
+	if reuseIndex < 0 {
+		reuseIndex = 0
+	}
+	return owned[reuseIndex%int64(len(owned))], false, false
 }
 
 func (s *resourceScenario) observeRequiredStream(ctx context.Context, rt *Runtime) error {
@@ -300,6 +367,8 @@ func ResourceScenarioFactories() map[ScenarioCode]ScenarioFactory {
 				return nil, fmt.Errorf("resource factory code mismatch: %d", definition.Code)
 			}
 			switch code {
+			case 201, 202:
+				return newWorkMemScenario(code, definition.Name)
 			case 207:
 				return newTotalMemoryScenario(definition.Name), nil
 			case 208:
@@ -329,7 +398,15 @@ func resourceIdentifier(runID string) string {
 }
 
 func resourcePrepareStatement(runID string, sequence int64, statement string) string {
-	return "PREPARE gsbench_pc_" + resourceIdentifier(runID) + "_" + strconv.FormatInt(sequence, 10) + "(bigint,bigint) AS " + statement
+	return "PREPARE " + resourcePrepareName(runID, sequence) + "(bigint,bigint) AS " + statement
+}
+
+func resourcePrepareName(runID string, sequence int64) string {
+	return "gsbench_pc_" + resourceIdentifier(runID) + "_" + strconv.FormatInt(sequence, 10)
+}
+
+func resourceExecutePrepared(name string) string {
+	return "EXECUTE " + name + "(0,0)"
 }
 
 func resourceRunID(runID string) (string, error) {
@@ -753,6 +830,9 @@ func (s *totalMemoryScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		child := newResourceScenario(code, s.name+"_"+definition.Name)
 		if err := child.Prepare(ctx, rt); err != nil {
 			return err
+		}
+		if code == 201 || code == 202 {
+			child.workload.Setup = totalMemoryCompositeWorkMem
 		}
 		s.composite.scenarios = append(s.composite.scenarios, child)
 	}

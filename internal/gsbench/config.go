@@ -21,6 +21,10 @@ var (
 type Overrides struct {
 	ScenarioCodes []ScenarioCode
 	Duration      time.Duration
+	Workers       int
+	TPWorkers     int
+	APWorkers     int
+	WorkMemKB     int64
 	Profile       string
 	DryRun        *bool
 	DatasetBytes  int64
@@ -48,6 +52,20 @@ type RunConfig struct {
 	ValidationEnabled bool
 }
 
+type FixedWorkerConfig struct {
+	TPWorkers      int
+	APWorkers      int
+	MixedTPWorkers int
+	MixedAPWorkers int
+}
+
+type MemoryWorkloadConfig struct {
+	SortWorkers   int
+	SortWorkMemKB int64
+	HashWorkers   int
+	HashWorkMemKB int64
+}
+
 type DataConfig struct {
 	Schema                string
 	MaxSizeGB             int
@@ -61,7 +79,6 @@ type DataConfig struct {
 }
 
 type SafetyConfig struct {
-	CPUTargetPercent             int
 	MaxConnections               int
 	MaxWorkers                   int
 	QueryTimeout                 time.Duration
@@ -82,14 +99,16 @@ type FaultProviderConfig struct {
 }
 
 type BenchConfig struct {
-	Path          string
-	ConfigDir     string
-	Database      DatabaseConfig
-	Run           RunConfig
-	Data          DataConfig
-	Safety        SafetyConfig
-	FaultProvider FaultProviderConfig
-	Raw           *baseconfig.Config
+	Path            string
+	ConfigDir       string
+	Database        DatabaseConfig
+	Run             RunConfig
+	FixedWorkers    FixedWorkerConfig
+	MemoryWorkloads MemoryWorkloadConfig
+	Data            DataConfig
+	Safety          SafetyConfig
+	FaultProvider   FaultProviderConfig
+	Raw             *baseconfig.Config
 }
 
 func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
@@ -150,6 +169,25 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 	if err != nil {
 		return BenchConfig{}, err
 	}
+	parseWorkMem := func(key string) (int64, error) {
+		value := "256MB"
+		if configured := raw.Get(key); configured != nil {
+			value = fmt.Sprint(configured)
+		}
+		workMemKB, err := ParseWorkMemKB(value)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %w", key, err)
+		}
+		return workMemKB, nil
+	}
+	sortWorkMemKB, err := parseWorkMem("scenario.memory_workmem_sort.work_mem")
+	if err != nil {
+		return BenchConfig{}, err
+	}
+	hashWorkMemKB, err := parseWorkMem("scenario.memory_workmem_hash.work_mem")
+	if err != nil {
+		return BenchConfig{}, err
+	}
 	cfg := BenchConfig{
 		Path:      path,
 		ConfigDir: filepath.Dir(path),
@@ -172,6 +210,22 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 			DryRun:            raw.GetBool("run.dry_run", false),
 			ValidationEnabled: raw.GetBool("run.validation_enabled", false),
 		},
+		FixedWorkers: FixedWorkerConfig{
+			TPWorkers:      raw.GetInt("scenario.tp_cpu.workers", 1),
+			APWorkers:      raw.GetInt("scenario.ap_cpu.workers", 1),
+			MixedTPWorkers: raw.GetInt("scenario.mixed_cpu.tp_workers", 1),
+			MixedAPWorkers: raw.GetInt("scenario.mixed_cpu.ap_workers", 1),
+		},
+		MemoryWorkloads: MemoryWorkloadConfig{
+			SortWorkers: raw.GetInt(
+				"scenario.memory_workmem_sort.workers", 1,
+			),
+			SortWorkMemKB: sortWorkMemKB,
+			HashWorkers: raw.GetInt(
+				"scenario.memory_workmem_hash.workers", 1,
+			),
+			HashWorkMemKB: hashWorkMemKB,
+		},
 		Data: DataConfig{
 			Schema:             raw.GetString("data.schema", "gsbench"),
 			MaxSizeGB:          raw.GetInt("data.max_size_gb", 5),
@@ -188,7 +242,6 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 			),
 		},
 		Safety: SafetyConfig{
-			CPUTargetPercent:             raw.GetInt("safety.cpu_target_percent", 95),
 			MaxConnections:               raw.GetInt("safety.max_connections", 500),
 			MaxWorkers:                   raw.GetInt("safety.max_workers", 256),
 			QueryTimeout:                 queryTimeout,
@@ -210,6 +263,9 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 			[]ScenarioCode(nil),
 			overrides.ScenarioCodes...,
 		)
+	}
+	if err := applyFixedWorkerOverrides(&cfg, overrides); err != nil {
+		return BenchConfig{}, err
 	}
 	if overrides.Duration > 0 {
 		cfg.Run.Duration = overrides.Duration
@@ -265,6 +321,115 @@ func configuredScenarios(raw *baseconfig.Config) []string {
 	return names
 }
 
+func validateFixedWorkerOverrideCompatibility(
+	codes []ScenarioCode,
+	workers, tpWorkers, apWorkers int,
+	workMemKB int64,
+) error {
+	if workers == 0 && tpWorkers == 0 && apWorkers == 0 && workMemKB == 0 {
+		return nil
+	}
+	if workers < 0 || tpWorkers < 0 || apWorkers < 0 {
+		return fmt.Errorf("worker counts must be positive")
+	}
+	if workMemKB < 0 || (workMemKB > 0 && workMemKB < minWorkMemKB) {
+		return fmt.Errorf("work_mem must be at least %dkB", minWorkMemKB)
+	}
+	if (tpWorkers == 0) != (apWorkers == 0) {
+		return fmt.Errorf("--tp-workers and --ap-workers must be provided together")
+	}
+	if workers > 0 && (tpWorkers > 0 || apWorkers > 0) {
+		return fmt.Errorf("--workers cannot be combined with --tp-workers or --ap-workers")
+	}
+	if workMemKB > 0 && (tpWorkers > 0 || apWorkers > 0) {
+		return fmt.Errorf("--work-mem cannot be combined with --tp-workers or --ap-workers")
+	}
+	if tpWorkers > 0 || apWorkers > 0 {
+		if len(codes) != 1 || codes[0] != 103 {
+			return fmt.Errorf("--tp-workers and --ap-workers require only scenario 103")
+		}
+		return nil
+	}
+	if len(codes) < 1 || len(codes) > 2 {
+		return fmt.Errorf(
+			"--workers/--work-mem require only scenario family 101/102 or 201/202",
+		)
+	}
+	seen := make(map[ScenarioCode]struct{}, len(codes))
+	cpuFamily := true
+	memoryFamily := true
+	for _, code := range codes {
+		if _, duplicate := seen[code]; duplicate {
+			return fmt.Errorf("worker overrides require unique scenarios")
+		}
+		seen[code] = struct{}{}
+		if code != 101 && code != 102 {
+			cpuFamily = false
+		}
+		if code != 201 && code != 202 {
+			memoryFamily = false
+		}
+	}
+	if workMemKB > 0 && !memoryFamily {
+		return fmt.Errorf("--work-mem requires exactly one scenario: 201 or 202")
+	}
+	if workers > 0 && !cpuFamily && !memoryFamily {
+		return fmt.Errorf(
+			"--workers requires only scenario family 101/102 or 201/202",
+		)
+	}
+	if memoryFamily && len(codes) != 1 {
+		return fmt.Errorf(
+			"memory worker/work_mem overrides require exactly one scenario: 201 or 202",
+		)
+	}
+	return nil
+}
+
+func applyFixedWorkerOverrides(cfg *BenchConfig, overrides Overrides) error {
+	if cfg == nil {
+		return fmt.Errorf("benchmark config is required")
+	}
+	if err := validateFixedWorkerOverrideCompatibility(
+		cfg.Run.ScenarioCodes,
+		overrides.Workers,
+		overrides.TPWorkers,
+		overrides.APWorkers,
+		overrides.WorkMemKB,
+	); err != nil {
+		return err
+	}
+	if overrides.Workers > 0 {
+		for _, code := range cfg.Run.ScenarioCodes {
+			switch code {
+			case 101:
+				cfg.FixedWorkers.TPWorkers = overrides.Workers
+			case 102:
+				cfg.FixedWorkers.APWorkers = overrides.Workers
+			case 201:
+				cfg.MemoryWorkloads.SortWorkers = overrides.Workers
+			case 202:
+				cfg.MemoryWorkloads.HashWorkers = overrides.Workers
+			}
+		}
+	}
+	if overrides.TPWorkers > 0 {
+		cfg.FixedWorkers.MixedTPWorkers = overrides.TPWorkers
+		cfg.FixedWorkers.MixedAPWorkers = overrides.APWorkers
+	}
+	if overrides.WorkMemKB > 0 {
+		for _, code := range cfg.Run.ScenarioCodes {
+			switch code {
+			case 201:
+				cfg.MemoryWorkloads.SortWorkMemKB = overrides.WorkMemKB
+			case 202:
+				cfg.MemoryWorkloads.HashWorkMemKB = overrides.WorkMemKB
+			}
+		}
+	}
+	return nil
+}
+
 func (c BenchConfig) Validate() error {
 	if !identifierRE.MatchString(c.Data.Schema) {
 		return fmt.Errorf("data.schema %q is not a safe SQL identifier", c.Data.Schema)
@@ -287,6 +452,8 @@ func (c BenchConfig) Validate() error {
 	catalog := DefaultScenarioCatalog()
 	seen := map[ScenarioCode]struct{}{}
 	planChangeCount := 0
+	fixedWorkerSelected := false
+	unbudgetedSelected := false
 	for _, code := range c.Run.ScenarioCodes {
 		definition, err := catalog.LookupCode(code)
 		if err != nil {
@@ -299,17 +466,83 @@ func (c BenchConfig) Validate() error {
 		if definition.Category == CategoryPlan && code >= 601 && code <= 606 {
 			planChangeCount++
 		}
+		switch code {
+		case 101, 102, 103, 201, 202:
+			fixedWorkerSelected = true
+		default:
+			unbudgetedSelected = true
+		}
+	}
+	if fixedWorkerSelected && unbudgetedSelected {
+		return fmt.Errorf(
+			"fixed-worker scenarios 101-103 and 201-202 cannot be combined with other scenarios because their total concurrency cannot be bounded safely",
+		)
 	}
 	if planChangeCount > 1 {
 		return fmt.Errorf(
 			"plan-change scenarios 601-606 must be run individually and serially",
 		)
 	}
-	if c.Safety.CPUTargetPercent < 1 || c.Safety.CPUTargetPercent > 100 {
-		return fmt.Errorf("cpu_target_percent must be between 1 and 100")
-	}
 	if c.Safety.MaxWorkers <= 0 || c.Safety.MaxConnections <= 0 || c.Data.MaxSizeGB <= 0 {
 		return fmt.Errorf("worker, connection, and data size limits must be positive")
+	}
+	if c.FixedWorkers.TPWorkers <= 0 ||
+		c.FixedWorkers.APWorkers <= 0 ||
+		c.FixedWorkers.MixedTPWorkers <= 0 ||
+		c.FixedWorkers.MixedAPWorkers <= 0 {
+		return fmt.Errorf("fixed workers must be positive")
+	}
+	if c.MemoryWorkloads.SortWorkers <= 0 ||
+		c.MemoryWorkloads.HashWorkers <= 0 {
+		return fmt.Errorf("memory workload workers must be positive")
+	}
+	if c.MemoryWorkloads.SortWorkMemKB < minWorkMemKB ||
+		c.MemoryWorkloads.HashWorkMemKB < minWorkMemKB {
+		return fmt.Errorf("memory workload work_mem must be at least %dkB", minWorkMemKB)
+	}
+	selectedFixedWorkers := 0
+	addFixedWorkers := func(workers int) error {
+		if workers > c.Safety.MaxWorkers-selectedFixedWorkers {
+			return fmt.Errorf(
+				"selected fixed workers exceed safety.max_workers %d",
+				c.Safety.MaxWorkers,
+			)
+		}
+		if workers > c.Safety.MaxConnections-selectedFixedWorkers {
+			return fmt.Errorf(
+				"selected fixed workers exceed safety.max_connections %d",
+				c.Safety.MaxConnections,
+			)
+		}
+		selectedFixedWorkers += workers
+		return nil
+	}
+	for _, code := range c.Run.ScenarioCodes {
+		switch code {
+		case 101:
+			if err := addFixedWorkers(c.FixedWorkers.TPWorkers); err != nil {
+				return err
+			}
+		case 102:
+			if err := addFixedWorkers(c.FixedWorkers.APWorkers); err != nil {
+				return err
+			}
+		case 103:
+			if err := addFixedWorkers(c.FixedWorkers.MixedTPWorkers); err != nil {
+				return err
+			}
+			if err := addFixedWorkers(c.FixedWorkers.MixedAPWorkers); err != nil {
+				return err
+			}
+		case 201:
+			if err := addFixedWorkers(c.MemoryWorkloads.SortWorkers); err != nil {
+				return err
+			}
+		case 202:
+			if err := addFixedWorkers(c.MemoryWorkloads.HashWorkers); err != nil {
+				return err
+			}
+		}
 	}
 	if c.Safety.ProfileCapGB < 1 || c.Safety.ProfileCapGB > 2048 {
 		return fmt.Errorf("safety.profile_cap_gb must be between 1 and 2048")

@@ -250,6 +250,182 @@ func TestParseCLIArgsSupportsScenarioDurationAndDryRun(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsSupportsFixedWorkerOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		args      []string
+		workers   int
+		tpWorkers int
+		apWorkers int
+	}{
+		{
+			name:    "101 TP workers",
+			args:    []string{"run", "101", "--workers", "7", "--duration", "30s"},
+			workers: 7,
+		},
+		{
+			name:    "102 AP workers",
+			args:    []string{"run", "--scenario", "102", "--workers=5"},
+			workers: 5,
+		},
+		{
+			name:    "101 and 102 shared workers",
+			args:    []string{"run", "--scenario", "101,102", "--workers", "3"},
+			workers: 3,
+		},
+		{
+			name:      "103 independent lanes",
+			args:      []string{"run", "103", "--tp-workers", "4", "--ap-workers", "2"},
+			tpWorkers: 4,
+			apWorkers: 2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options, err := ParseCLIArgs(test.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if options.Workers != test.workers ||
+				options.TPWorkers != test.tpWorkers ||
+				options.APWorkers != test.apWorkers {
+				t.Fatalf("worker options=%+v", options)
+			}
+		})
+	}
+}
+
+func TestParseCLIArgsSupportsMemoryWorkloadOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		args      []string
+		workers   int
+		workMemKB int64
+	}{
+		{
+			name:      "201 positional scenario",
+			args:      []string{"run", "201", "--workers", "7", "--work-mem", "256MB", "--duration", "30s"},
+			workers:   7,
+			workMemKB: 256 * 1024,
+		},
+		{
+			name:      "202 named scenario",
+			args:      []string{"run", "--scenario", "memory_workmem_hash", "--workers=5", "--work-mem=1GB"},
+			workers:   5,
+			workMemKB: 1024 * 1024,
+		},
+		{
+			name:      "work mem without worker override",
+			args:      []string{"run", "202", "--work-mem=128MB"},
+			workMemKB: 128 * 1024,
+		},
+		{
+			name:    "workers without work mem override",
+			args:    []string{"run", "201", "--workers=2"},
+			workers: 2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options, err := ParseCLIArgs(test.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if options.Workers != test.workers ||
+				options.WorkMemKB != test.workMemKB {
+				t.Fatalf(
+					"memory options workers=%d work_mem_kB=%d want workers=%d work_mem_kB=%d",
+					options.Workers,
+					options.WorkMemKB,
+					test.workers,
+					test.workMemKB,
+				)
+			}
+		})
+	}
+}
+
+func TestParseCLIArgsRejectsInvalidMemoryWorkloadOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "below minimum", args: []string{"run", "201", "--work-mem=63kB"}},
+		{name: "zero", args: []string{"run", "201", "--work-mem=0kB"}},
+		{name: "negative", args: []string{"run", "201", "--work-mem=-1MB"}},
+		{name: "fractional", args: []string{"run", "201", "--work-mem=1.5MB"}},
+		{name: "missing unit", args: []string{"run", "201", "--work-mem=256"}},
+		{name: "unknown unit", args: []string{"run", "201", "--work-mem=1TB"}},
+		{name: "overflow", args: []string{"run", "201", "--work-mem=9223372036854775807GB"}},
+		{name: "byte conversion overflow", args: []string{"run", "201", "--work-mem=9223372036854775807kB"}},
+		{name: "unsafe suffix", args: []string{"run", "201", "--work-mem=64kB;RESET ALL"}},
+		{name: "CPU scenario", args: []string{"run", "101", "--work-mem=256MB"}},
+		{name: "other memory scenario", args: []string{"run", "203", "--work-mem=256MB"}},
+		{name: "memory plus CPU", args: []string{"run", "201,101", "--work-mem=256MB"}},
+		{name: "memory plus another scenario", args: []string{"run", "201,203", "--workers=2"}},
+		{name: "two memory scenarios share unsafe override", args: []string{"run", "201,202", "--workers=2", "--work-mem=64MB"}},
+		{name: "three memory inputs", args: []string{"run", "201,202,201", "--workers=2"}},
+		{name: "lane workers", args: []string{"run", "201", "--tp-workers=2", "--ap-workers=1"}},
+		{name: "non-run command", args: []string{"doctor", "--work-mem=256MB"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ParseCLIArgs(test.args); err == nil {
+				t.Fatalf("ParseCLIArgs(%v) accepted invalid memory override", test.args)
+			}
+		})
+	}
+}
+
+func TestParseCLIArgsRejectsInvalidFixedWorkerOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "zero workers", args: []string{"run", "101", "--workers=0"}},
+		{name: "negative workers", args: []string{"run", "102", "--workers=-1"}},
+		{name: "zero TP workers", args: []string{"run", "103", "--tp-workers=0", "--ap-workers=1"}},
+		{name: "negative AP workers", args: []string{"run", "103", "--tp-workers=1", "--ap-workers=-1"}},
+		{name: "missing AP pair", args: []string{"run", "103", "--tp-workers=1"}},
+		{name: "missing TP pair", args: []string{"run", "103", "--ap-workers=1"}},
+		{name: "generic workers for 103", args: []string{"run", "103", "--workers=2"}},
+		{name: "lane workers for 101", args: []string{"run", "101", "--tp-workers=2", "--ap-workers=1"}},
+		{name: "mixed override forms", args: []string{"run", "103", "--workers=2", "--tp-workers=2", "--ap-workers=1"}},
+		{name: "fixed plus unrelated scenario", args: []string{"run", "101,201", "--workers=2"}},
+		{name: "103 plus another scenario", args: []string{"run", "103,101", "--tp-workers=2", "--ap-workers=1"}},
+		{name: "non-run command", args: []string{"doctor", "--workers=2"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ParseCLIArgs(test.args); err == nil {
+				t.Fatalf("ParseCLIArgs(%v) accepted invalid worker override", test.args)
+			}
+		})
+	}
+}
+
+func TestParseCLIArgsRejectsNonPositivePressureDuration(t *testing.T) {
+	for _, value := range []string{"0s", "-1s"} {
+		if _, err := ParseCLIArgs([]string{
+			"run", "101", "--workers=1", "--duration=" + value,
+		}); err == nil {
+			t.Fatalf("accepted non-positive pressure duration %q", value)
+		}
+	}
+}
+
+func TestCLIHelpDocumentsFixedWorkerParameters(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := RunCLI(context.Background(), []string{"help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	for _, token := range []string{
+		"--workers N", "--work-mem VALUE", "--tp-workers N", "--ap-workers N",
+		"gsbench run 101 --workers", "gsbench run 103 --tp-workers",
+		"gsbench run 201 --workers", "gsbench run 202 --workers",
+	} {
+		if !strings.Contains(stdout.String(), token) {
+			t.Errorf("help missing %q:\n%s", token, stdout.String())
+		}
+	}
+}
+
 func TestParseCLIArgsRejectsCleanupDataWithRunID(t *testing.T) {
 	_, err := ParseCLIArgs([]string{
 		"cleanup", "--data", "--run-id", "run-1",

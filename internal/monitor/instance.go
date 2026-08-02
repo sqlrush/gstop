@@ -62,6 +62,16 @@ type InstanceMonitor struct {
 	// goroutine; guarded by ioMu because it crosses goroutines.
 	ioMu     sync.Mutex
 	ioRecord string
+
+	queryFn func(string) []dbconn.Row
+}
+
+type instanceSampleState struct {
+	lastTime time.Time
+	interval float64
+	prevTPS  int64
+	prevQPS  int64
+	prevXlog uint64
 }
 
 // NewInstanceMonitor builds the instance panel.
@@ -111,7 +121,7 @@ func (m *InstanceMonitor) parseConfig() error {
 // startup on failure; Init cannot return an error, so we log and leave it at zero,
 // which the CONNECTION cell then guards against dividing by.
 func (m *InstanceMonitor) initMaxConnections() {
-	rows := m.deps.DB.Query(getMaxConnectionsSQL)
+	rows := m.query(getMaxConnectionsSQL)
 	if len(rows) == 0 {
 		m.deps.Logger.Error("Failed to get max connections")
 		return
@@ -124,6 +134,7 @@ func (m *InstanceMonitor) initMaxConnections() {
 // Refresh recomputes every cell for the current cycle. A failed query aborts the
 // whole cycle (as in the Python refresh), leaving the previous snapshot intact.
 func (m *InstanceMonitor) Refresh() {
+	saved := m.captureSampleState()
 	values := make([]string, len(m.items))
 	for i := range values {
 		values[i] = "0"
@@ -132,6 +143,7 @@ func (m *InstanceMonitor) Refresh() {
 	var sessionRow dbconn.Row
 	for i, item := range m.items {
 		if !m.refreshCell(i, item, values, &sessionRow) {
+			m.restoreSampleState(saved)
 			return
 		}
 	}
@@ -141,6 +153,24 @@ func (m *InstanceMonitor) Refresh() {
 	m.mu.Unlock()
 
 	m.checkAndReportAlarm(m.items, values)
+}
+
+func (m *InstanceMonitor) captureSampleState() instanceSampleState {
+	return instanceSampleState{
+		lastTime: m.lastTime,
+		interval: m.interval,
+		prevTPS:  m.prevTPS,
+		prevQPS:  m.prevQPS,
+		prevXlog: m.prevXlog,
+	}
+}
+
+func (m *InstanceMonitor) restoreSampleState(saved instanceSampleState) {
+	m.lastTime = saved.lastTime
+	m.interval = saved.interval
+	m.prevTPS = saved.prevTPS
+	m.prevQPS = saved.prevQPS
+	m.prevXlog = saved.prevXlog
 }
 
 // refreshCell resolves one cell, returning false when a query failed and the whole
@@ -176,7 +206,7 @@ func (m *InstanceMonitor) refreshCell(i int, item string, values []string, sessi
 // refreshTime updates the sampling interval from consecutive current_timestamp(3)
 // readings. The time cell itself carries no display value.
 func (m *InstanceMonitor) refreshTime(i int) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.query(m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -198,13 +228,17 @@ func (m *InstanceMonitor) refreshTime(i int) bool {
 // refreshSession runs the combined session-count query and fills the SN cell; the
 // AN/ASC/ASI/IDL cells later read the same row.
 func (m *InstanceMonitor) refreshSession(i int, values []string, sessionRow *dbconn.Row) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.query(m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
 	}
-	if len(rows) == 0 {
-		m.deps.Logger.Error("Exec query for monitor_item %s returned no rows.", m.items[i])
+	if len(rows) != 1 {
+		m.deps.Logger.Error("Exec query for monitor_item %s returned %d rows, want 1.", m.items[i], len(rows))
+		return false
+	}
+	if !validSessionAggregateRow(rows[0]) {
+		m.deps.Logger.Error("Exec query for monitor_item %s returned an invalid aggregate row.", m.items[i])
 		return false
 	}
 	*sessionRow = rows[0]
@@ -212,9 +246,26 @@ func (m *InstanceMonitor) refreshSession(i int, values []string, sessionRow *dbc
 	return true
 }
 
+func validSessionAggregateRow(row dbconn.Row) bool {
+	if len(row) != 5 {
+		return false
+	}
+	counts := make([]int64, len(row))
+	for i := range row {
+		value, ok := row.Int(i)
+		if !ok || value < 0 {
+			return false
+		}
+		counts[i] = value
+	}
+	total, active, activeCPU, activeIO, idle :=
+		counts[0], counts[1], counts[2], counts[3], counts[4]
+	return active+idle <= total && activeCPU+activeIO <= active
+}
+
 // refreshCounter turns a cumulative counter (TPS or QPS) into a per-second rate.
 func (m *InstanceMonitor) refreshCounter(i int, item string, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.query(m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -242,7 +293,7 @@ func (m *InstanceMonitor) refreshCounter(i int, item string, values []string) bo
 // refreshPercentile renders a response-time percentile in milliseconds with five
 // significant figures.
 func (m *InstanceMonitor) refreshPercentile(i int, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.query(m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -257,20 +308,20 @@ func (m *InstanceMonitor) refreshPercentile(i int, values []string) bool {
 
 // refreshXlog turns the current xlog insert LSN into a kB/s throughput.
 func (m *InstanceMonitor) refreshXlog(i int, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.query(m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
 	}
-	raw := ""
-	if len(rows) > 0 {
-		raw = rows[len(rows)-1].Str(0)
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		m.deps.Logger.Error("Exec query for monitor_item %s returned an invalid xlog result.", m.items[i])
+		return false
 	}
+	raw := rows[0].Str(0)
 	cur, ok := parseLSN(raw)
 	if !ok {
 		m.deps.Logger.Warning("Unparseable xlog LSN %q for %s", raw, m.items[i])
-		values[i] = "0"
-		return true
+		return false
 	}
 	values[i] = "0"
 	if m.prevXlog != 0 && cur >= m.prevXlog && m.interval > 0 {
@@ -295,7 +346,7 @@ func (m *InstanceMonitor) setConnection(i int, values []string) {
 // refreshThreadpool aggregates every worker group's actual/idle counts into a busy
 // percentage, or "None" when no group reports.
 func (m *InstanceMonitor) refreshThreadpool(i int, values []string) bool {
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.query(m.methods[i])
 	if rows == nil {
 		m.deps.Logger.Error("Exec query for monitor_item %s returned None.", m.items[i])
 		return false
@@ -317,6 +368,13 @@ func (m *InstanceMonitor) refreshThreadpool(i int, values []string) bool {
 		values[i] = "None"
 	}
 	return true
+}
+
+func (m *InstanceMonitor) query(query string) []dbconn.Row {
+	if m.queryFn != nil {
+		return m.queryFn(query)
+	}
+	return m.deps.DB.Query(query)
 }
 
 // readIORecord returns the latest MB/s sample under the io lock.

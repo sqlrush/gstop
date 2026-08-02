@@ -70,7 +70,7 @@ validation_enabled = false
 ```
 
 - `scenarios`：默认场景编号或规范名称，逗号分隔；命令行 `-s` 会覆盖它。
-- `duration`：ramp 与 hold 合计总时长；命令行 `-d` 会覆盖它。
+- `duration`：101–103、201–202 的持续加压时长，从所有固定 worker 就绪后开始计时；命令行 `-d` 会覆盖它。其他场景仍按各自的 ramp/hold 生命周期执行。
 - `ramp_interval`：控制器调节间隔，必须大于 0。
 - `profile`：只允许 `quick` 或 `stress`。
 - `dry_run`：只展示/检查动作，不执行工作负载修改；命令行 `--dry-run` 会覆盖它。
@@ -126,7 +126,6 @@ physical_size_provider = auto
 
 ```ini
 [safety]
-cpu_target_percent = 95
 max_connections = 800
 max_workers = 640
 query_timeout = 30s
@@ -141,8 +140,7 @@ allow_database_restart = false
 restart_command =
 ```
 
-- `cpu_target_percent`：101 TP CPU 场景默认目标，范围 1–100。
-- `max_connections`、`max_workers`：连接与 worker 的全局上限，必须为正数；环境上限低于目标时应报告实际 ceiling，不能伪造达标。
+- `max_connections`、`max_workers`：连接与 worker 的全局硬上限，必须为正数。101–103 只在启动前检查用户输入是否超过上限，运行中绝不会动态调整 worker 数。
 - `query_timeout`、`restore_timeout`：查询和恢复超时，必须大于 0。
 - `profile_cap_gb`：数据集硬上限，1–2048 GiB；必须不小于 `init --size`。
 - `restore_on_exit`：必须为 `true`；设为 `false` 会被拒绝。
@@ -165,20 +163,22 @@ type = none
 
 `ledger_path` 留空时，会在配置目录的 `logs/` 中创建按配置文件身份隔离的恢复 JSON；显式相对路径仍以配置目录解析。不要把 ledger 指向共享业务文件、符号链接或非 JSON 路径。
 
-## 场景专用阈值
+## 场景专用参数
 
 发布样例包含当前实现会读取的专用参数：
 
 | 配置段 | 参数 | 样例值 | 含义 |
 |---|---|---:|---|
-| `scenario.ap_cpu` | `cpu_target_percent` | 70 | 102 AP CPU 目标百分比 |
-|  | `max_workers` | 8 | AP worker 上限 |
-|  | `scan_rows` | 1000000 | AP 扫描行数 |
-| `scenario.mixed_cpu` | `cpu_target_percent` | 70 | 103 混合 CPU 目标百分比 |
-|  | `tp_percent` | 80 | 混合负载中 TP 比例 |
-|  | `max_workers` | 20 | 混合负载总 worker 上限 |
-|  | `max_ap_workers` | 4 | 混合负载 AP worker 上限 |
-|  | `scan_rows` | 1000000 | AP 部分扫描行数 |
+| `scenario.tp_cpu` | `workers` | 1 | 101 固定 TP worker 数 |
+| `scenario.ap_cpu` | `workers` | 1 | 102 固定 AP worker 数 |
+|  | `scan_rows` | 1000000 | 每个 AP 查询最多扫描行数 |
+| `scenario.mixed_cpu` | `tp_workers` | 1 | 103 固定 TP worker 数 |
+|  | `ap_workers` | 1 | 103 固定 AP worker 数 |
+|  | `scan_rows` | 1000000 | AP 部分每个查询最多扫描行数 |
+| `scenario.memory_workmem_sort` | `workers` | 1 | 201 固定排序 worker 数 |
+|  | `work_mem` | 256MB | 每个 201 worker 的 `work_mem`；支持整数 kB/MB/GB，最小 64kB |
+| `scenario.memory_workmem_hash` | `workers` | 1 | 202 固定 Hash worker 数 |
+|  | `work_mem` | 256MB | 每个 202 worker 的 `work_mem`；支持整数 kB/MB/GB，最小 64kB |
 | `scenario.memory_total_pressure` | `workers` | 4 | 有界内存压力 worker 数，不代表主机内存百分比 |
 | `scenario.connection_pool` | `target_percent` | 95 | 401 连接池目标百分比 |
 |  | `idle_percent` | 60 | 目标连接中的 idle 比例 |
@@ -188,7 +188,19 @@ type = none
 |  | `allow_vacuum_full` | false | 是否允许高风险 `VACUUM FULL` |
 |  | `minimum_slowdown` | 1.5 | 严格验证时的最小变慢倍数 |
 
-所有百分比都是目标，不是无条件承诺；实际数据库参数、拓扑、可用连接、CPU 配额和 worker ceiling 会限制可达到的值。应以场景 EVIDENCE 和 gstop 同步采样为准。
+101–103 不再设置或追踪 CPU 百分比目标。它们按 sysbench 模型固定创建 worker，每个 worker 完成一笔请求后立即执行下一笔，到达 `duration` 后不再开始新请求。CPU 仅由 gstop 观测，不参与控制或成功判定。其他带百分比参数的场景仍受实际数据库参数、拓扑和容量限制。
+
+命令行示例：
+
+```sh
+gsbench run 101 --workers 16 --duration 60s
+gsbench run 102 --workers 4 --duration 60s
+gsbench run 103 --tp-workers 12 --ap-workers 2 --duration 60s
+```
+
+CLI worker 参数覆盖上述场景配置。103 的总并发为 `tp_workers + ap_workers`；所有 worker 先建立独立 tagged session 并等待同一个启动屏障，加压计时开始后才统一执行。
+
+201/202 的命令行覆盖一次只允许选择一个场景，例如 `gsbench run 201 --workers 8 --work-mem 256MB --duration 1m`。配置文件可以同时选择 201 和 202，并分别使用各自的 `workers/work_mem`；配置校验会累计两者 worker 数。固定 worker 场景不能与其他并发模型的场景混跑，避免实际连接数突破 `safety.max_workers` 或 `safety.max_connections`。
 
 ## 20 GiB 专用配置要点
 

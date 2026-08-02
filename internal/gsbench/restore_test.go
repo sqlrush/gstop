@@ -1391,7 +1391,7 @@ func TestWaitForRestoreDatabaseHonorsContextCancellation(t *testing.T) {
 	}
 }
 
-func TestDatabaseRestoreBackendWaitsForExactRunSessionsAndLocks(
+func TestDatabaseRestoreBackendTreatsConfirmedQuiescenceAsSuccess(
 	t *testing.T,
 ) {
 	var events []string
@@ -1422,15 +1422,42 @@ func TestDatabaseRestoreBackendWaitsForExactRunSessionsAndLocks(
 		restorePollInterval: time.Millisecond,
 	}
 
-	err := backend.StopTaggedSessions(context.Background(), "run-1")
-	if err == nil || !strings.Contains(err.Error(), "cancel signal") {
-		t.Fatalf("StopTaggedSessions() error=%v", err)
+	if err := backend.StopTaggedSessions(context.Background(), "run-1"); err != nil {
+		t.Fatalf("StopTaggedSessions() retained a transient cancel error: %v", err)
 	}
 	want := []string{
 		"cancel", "terminate", "poll:2:3", "poll:1:1", "poll:0:0",
 	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events=%v want=%v", events, want)
+	}
+}
+
+func TestDatabaseRestoreBackendDropsTransientStateErrorAfterQuiescence(
+	t *testing.T,
+) {
+	stateCalls := 0
+	backend := &databaseRestoreBackend{
+		cancelTagged:    func(context.Context, string) error { return nil },
+		terminateTagged: func(context.Context, string) error { return nil },
+		taggedSessionState: func(
+			context.Context,
+			string,
+		) (int, int, error) {
+			stateCalls++
+			if stateCalls == 1 {
+				return 0, 0, errors.New("transient state query failure")
+			}
+			return 0, 0, nil
+		},
+		restorePollInterval: time.Millisecond,
+	}
+
+	if err := backend.StopTaggedSessions(context.Background(), "run-1"); err != nil {
+		t.Fatalf("StopTaggedSessions() retained a transient state error: %v", err)
+	}
+	if stateCalls != 2 {
+		t.Fatalf("tagged state calls=%d, want 2", stateCalls)
 	}
 }
 
