@@ -1,6 +1,9 @@
 package gsbench
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // LockScenario adapts a declarative lock definition to the common scenario
 // lifecycle. Definitions are resolved during Prepare because the schema and
@@ -18,15 +21,37 @@ func (s *LockScenario) Code() ScenarioCode { return s.definition.Code }
 func (s *LockScenario) Name() string       { return s.definition.Name }
 func (s *LockScenario) Strategy() string   { return "transaction_safe_lock" }
 
-func (s *LockScenario) Prepare(ctx context.Context, rt *Runtime) error {
+func (s *LockScenario) configureDefinition(rt *Runtime) error {
+	if rt == nil {
+		return fmt.Errorf("lock runtime is unavailable")
+	}
 	definition, ok := lockDefinitionForCode(
 		s.definition.Code, rt.Config.Data.Schema, rt.RunID,
 	)
 	if !ok {
 		return errLockDefinitionUnavailable(s.definition.Code)
 	}
+	if s.definition.Code >= 501 && s.definition.Code <= 503 {
+		configured, err := configureLockDefinition(
+			definition,
+			rt.Config.LockWorkloads,
+			rt.Config.Data.Schema,
+			rt.RunID,
+		)
+		if err != nil {
+			return fmt.Errorf("configure lock workload: %w", err)
+		}
+		definition = configured
+	}
 	s.definition = definition
-	s.engine = NewLockEngine(definition)
+	return nil
+}
+
+func (s *LockScenario) Prepare(ctx context.Context, rt *Runtime) error {
+	if err := s.configureDefinition(rt); err != nil {
+		return err
+	}
+	s.engine = NewLockEngine(s.definition)
 	return s.engine.Prepare(ctx, rt)
 }
 

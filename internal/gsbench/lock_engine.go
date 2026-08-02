@@ -35,6 +35,11 @@ type LockDefinition struct {
 	WaiterTransactional bool
 	ChainRows           []int
 	ChainTags           []string
+	Waiters             []LockWaiterRole
+	ExpectedEdges       []LockExpectedEdge
+	RequestedSessions   int
+	RequestedChainDepth int
+	BranchLengths       []int
 }
 
 type LockEvidence struct {
