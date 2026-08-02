@@ -1,11 +1,23 @@
 package gsbench
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestNewLockScenarioUsesDefinitionIdentity(t *testing.T) {
 	scenario := NewLockScenario(LockDefinition{Code: 502, Name: "lock_table_exclusive"})
 	if scenario.Code() != 502 || scenario.Name() != "lock_table_exclusive" {
 		t.Fatalf("scenario=%d/%s", scenario.Code(), scenario.Name())
+	}
+}
+
+func TestLockScenarioStopIsSafeBeforeEngineInitialization(t *testing.T) {
+	scenario := &LockScenario{
+		definition: LockDefinition{Code: 501, Name: "lock_row_chain"},
+	}
+	if err := scenario.Stop(context.Background(), nil); err != nil {
+		t.Fatalf("stop before engine initialization: %v", err)
 	}
 }
 
@@ -70,5 +82,22 @@ func TestLockScenarioReportsRuntimeEvidenceWhenValidationIsDisabled(t *testing.T
 		metrics["lock_waiters"].Target != 2 ||
 		metrics["lock_waiters"].Actual != 2 {
 		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestOnlyConfigurableLockScenariosOwnWorkloadDuration(t *testing.T) {
+	for _, test := range []struct {
+		code ScenarioCode
+		want bool
+	}{
+		{code: 501, want: true},
+		{code: 502, want: true},
+		{code: 503, want: true},
+		{code: 504, want: false},
+	} {
+		scenario := &LockScenario{definition: LockDefinition{Code: test.code}}
+		if got := scenario.OwnsWorkloadDuration(); got != test.want {
+			t.Fatalf("scenario %d owns duration=%v want=%v", test.code, got, test.want)
+		}
 	}
 }

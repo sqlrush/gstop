@@ -51,9 +51,11 @@ func configureLockDefinition(
 				"scenario 501 requires sessions >= chain_depth + 1",
 			)
 		}
-		if sessions > lockTargetRows {
+		requiredRows := rowChainRequiredRows(sessions, depth)
+		if requiredRows > lockTargetRows {
 			return LockDefinition{}, fmt.Errorf(
-				"scenario 501 sessions exceed 10,000 lock_targets rows",
+				"scenario 501 requires %d unique lock_targets rows but only 10,000 are available",
+				requiredRows,
 			)
 		}
 	}
@@ -80,45 +82,63 @@ func configureLockDefinition(
 	return definition, nil
 }
 
+func rowChainRequiredRows(sessions, depth int) int {
+	waiters := sessions - 1
+	branches := (waiters + depth - 1) / depth
+	return waiters + branches
+}
+
 func configureRowChainWaiters(
 	definition *LockDefinition,
 	schema string,
 	sessions, maxDepth int,
 ) {
-	for index := 0; index < sessions-1; index++ {
-		branch := index/maxDepth + 1
-		depth := index%maxDepth + 1
-		row := index + 2
-		blockerRow := 1
-		blockerTag := definition.HolderTag
-		if depth > 1 {
-			blockerRow = row - 1
-			blockerTag = fmt.Sprintf("chain-%d-%d", branch, depth-1)
+	definition.HolderSQL = nil
+	remainingWaiters := sessions - 1
+	nextRow := 1
+	for branch := 1; remainingWaiters > 0; branch++ {
+		branchLength := maxDepth
+		if remainingWaiters < branchLength {
+			branchLength = remainingWaiters
 		}
-		tag := fmt.Sprintf("chain-%d-%d", branch, depth)
-		definition.Waiters = append(definition.Waiters, LockWaiterRole{
-			Tag:           tag,
-			SetupSQL:      []string{rowUpdate(schema, "lock_targets", row)},
-			WaitSQL:       []string{rowUpdate(schema, "lock_targets", blockerRow)},
-			Transactional: true,
-			BlockerTag:    blockerTag,
-			Branch:        branch,
-			Depth:         depth,
-		})
-		definition.ExpectedEdges = append(
-			definition.ExpectedEdges,
-			LockExpectedEdge{
-				BlockerTag: blockerTag,
-				WaiterTag:  tag,
-				Branch:     branch,
-				Depth:      depth,
-			},
+		rootRow := nextRow
+		nextRow++
+		definition.HolderSQL = append(
+			definition.HolderSQL,
+			rowUpdate(schema, "lock_targets", rootRow),
 		)
-		if depth == 1 {
-			definition.BranchLengths = append(definition.BranchLengths, 1)
-		} else {
-			definition.BranchLengths[len(definition.BranchLengths)-1]++
+		definition.BranchLengths = append(
+			definition.BranchLengths,
+			branchLength,
+		)
+		blockerRow := rootRow
+		blockerTag := definition.HolderTag
+		for depth := 1; depth <= branchLength; depth++ {
+			row := nextRow
+			nextRow++
+			tag := fmt.Sprintf("chain-%d-%d", branch, depth)
+			definition.Waiters = append(definition.Waiters, LockWaiterRole{
+				Tag:           tag,
+				SetupSQL:      []string{rowUpdate(schema, "lock_targets", row)},
+				WaitSQL:       []string{rowUpdate(schema, "lock_targets", blockerRow)},
+				Transactional: true,
+				BlockerTag:    blockerTag,
+				Branch:        branch,
+				Depth:         depth,
+			})
+			definition.ExpectedEdges = append(
+				definition.ExpectedEdges,
+				LockExpectedEdge{
+					BlockerTag: blockerTag,
+					WaiterTag:  tag,
+					Branch:     branch,
+					Depth:      depth,
+				},
+			)
+			blockerRow = row
+			blockerTag = tag
 		}
+		remainingWaiters -= branchLength
 	}
 }
 

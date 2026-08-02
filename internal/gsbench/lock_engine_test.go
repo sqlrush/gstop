@@ -325,26 +325,26 @@ func TestConfiguredLockEvidenceCountsUniqueWaiterTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidenceFor := func(waiter string) LockEvidence {
+	evidenceFor := func(waiter, waiterMode string) LockEvidence {
 		return LockEvidence{
 			Granted:    false,
 			LockType:   "relation",
 			Object:     "lock_ddl_targets",
 			HolderMode: "RowExclusive",
-			WaiterMode: "AccessExclusive",
+			WaiterMode: waiterMode,
 			BlockerTag: "gsbench/run-1/lock_ddl_wait/blocker",
 			WaiterTag:  "gsbench/run-1/lock_ddl_wait/" + waiter,
 		}
 	}
 	evidence := []LockEvidence{
-		evidenceFor("waiter-1"),
-		evidenceFor("waiter-1"),
-		evidenceFor("waiter-2"),
+		evidenceFor("waiter-1", "AccessExclusive"),
+		evidenceFor("waiter-1", "AccessExclusive"),
+		evidenceFor("waiter-2", "AccessShare"),
 	}
 	if got := verifyLock(definition, evidence); got.Outcome == OutcomeSuccess {
 		t.Fatalf("duplicate waiter satisfied target: %+v", got)
 	}
-	evidence = append(evidence, evidenceFor("waiter-3"))
+	evidence = append(evidence, evidenceFor("waiter-3", "AccessShare"))
 	got := verifyLock(definition, evidence)
 	if got.Outcome != OutcomeSuccess {
 		t.Fatalf("three unique waiters failed: %+v", got)
@@ -384,6 +384,90 @@ func TestConfiguredLockEvidenceMatchesCompleteRoleNotPrefix(t *testing.T) {
 	if result.Outcome == OutcomeSuccess {
 		t.Fatalf("one waiter with a shared prefix satisfied ten: %+v", result)
 	}
+}
+
+func TestConfiguredLockEvidenceMatchesCompressedWorkerRoles(t *testing.T) {
+	t.Run("row chain", func(t *testing.T) {
+		runID := strings.Repeat("r", 31)
+		definition, err := configureLockDefinition(
+			businessLockDefinitionForTest(t, 501),
+			LockWorkloadConfig{RowChainSessions: 4, RowChainDepth: 2},
+			"gsbench",
+			runID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence := make([]LockEvidence, 0, len(definition.ExpectedEdges))
+		compressed := false
+		for _, edge := range definition.ExpectedEdges {
+			blocker, err := ApplicationName(runID, definition.Name, edge.BlockerTag)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waiter, err := ApplicationName(runID, definition.Name, edge.WaiterTag)
+			if err != nil {
+				t.Fatal(err)
+			}
+			compressed = compressed ||
+				!strings.HasSuffix(blocker, "/"+edge.BlockerTag) ||
+				!strings.HasSuffix(waiter, "/"+edge.WaiterTag)
+			evidence = append(evidence, LockEvidence{
+				Granted: false, LockType: "transactionid",
+				Object:     definition.Object,
+				HolderMode: definition.HolderMode,
+				WaiterMode: definition.WaiterMode,
+				BlockerTag: blocker,
+				WaiterTag:  waiter,
+			})
+		}
+		if !compressed {
+			t.Fatal("test run ID did not force a compressed worker role")
+		}
+		if got := verifyLock(definition, evidence); got.Outcome != OutcomeSuccess {
+			t.Fatalf("compressed row-chain evidence=%+v", got)
+		}
+	})
+
+	t.Run("table waiters", func(t *testing.T) {
+		runID := strings.Repeat("r", 26)
+		definition, err := configureLockDefinition(
+			businessLockDefinitionForTest(t, 502),
+			LockWorkloadConfig{TableExclusiveSessions: 3},
+			"gsbench",
+			runID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocker, err := ApplicationName(
+			runID, definition.Name, definition.HolderTag,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence := make([]LockEvidence, 0, len(definition.Waiters))
+		for _, role := range definition.Waiters {
+			waiter, err := ApplicationName(runID, definition.Name, role.Tag)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasSuffix(waiter, "/"+role.Tag) {
+				t.Fatalf("worker role %q was not compressed in %q", role.Tag, waiter)
+			}
+			evidence = append(evidence, LockEvidence{
+				Granted: false, LockType: "relation",
+				Object:     definition.Object,
+				HolderMode: definition.HolderMode,
+				WaiterMode: definition.WaiterMode,
+				BlockerTag: blocker,
+				WaiterTag:  waiter,
+			})
+		}
+		if got := verifyLock(definition, evidence); got.Outcome != OutcomeSuccess {
+			t.Fatalf("compressed table-waiter evidence=%+v", got)
+		}
+	})
 }
 
 func TestConfiguredLockEvidenceTimeoutIsBoundedByQueryTimeout(t *testing.T) {

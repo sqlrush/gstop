@@ -20,6 +20,9 @@ func NewLockScenario(definition LockDefinition) Scenario {
 func (s *LockScenario) Code() ScenarioCode { return s.definition.Code }
 func (s *LockScenario) Name() string       { return s.definition.Name }
 func (s *LockScenario) Strategy() string   { return "transaction_safe_lock" }
+func (s *LockScenario) OwnsWorkloadDuration() bool {
+	return s.definition.Code >= 501 && s.definition.Code <= 503
+}
 
 func (s *LockScenario) configureDefinition(rt *Runtime) error {
 	if rt == nil {
@@ -75,6 +78,9 @@ func (s *LockScenario) RuntimeEvidence() []Evidence {
 }
 
 func (s *LockScenario) Stop(ctx context.Context, rt *Runtime) error {
+	if s.engine == nil {
+		return nil
+	}
 	return s.engine.Stop(ctx, rt)
 }
 

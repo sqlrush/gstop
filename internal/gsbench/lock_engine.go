@@ -607,7 +607,8 @@ func (e *LockEngine) captureExpectedEvidence(ctx context.Context, rt *Runtime) e
 		e.mu.Lock()
 		evidence := append([]LockEvidence(nil), e.evidence...)
 		e.mu.Unlock()
-		if verifyLock(e.definition, evidence).Outcome == OutcomeSuccess {
+		result := verifyLock(e.definition, evidence)
+		if result.Outcome == OutcomeSuccess {
 			return nil
 		}
 		observer := e.observe
@@ -622,7 +623,8 @@ func (e *LockEngine) captureExpectedEvidence(ctx context.Context, rt *Runtime) e
 		e.evidence = appendExpectedLockEvidence(e.definition, e.evidence, observed)
 		evidence = append([]LockEvidence(nil), e.evidence...)
 		e.mu.Unlock()
-		if verifyLock(e.definition, evidence).Outcome == OutcomeSuccess {
+		result = verifyLock(e.definition, evidence)
+		if result.Outcome == OutcomeSuccess {
 			return nil
 		}
 		select {
@@ -674,8 +676,21 @@ func appendExpectedLockEvidence(
 }
 
 func isExpectedLockEvidence(definition LockDefinition, item LockEvidence) bool {
-	if item.Granted || item.Object != definition.Object ||
-		!lockModeMatches(item.HolderMode, definition.HolderMode) ||
+	if item.Granted || item.Object != definition.Object {
+		return false
+	}
+	if len(definition.Waiters) > 0 && definition.Code == 503 {
+		if item.LockType != "relation" {
+			return false
+		}
+		for _, waiter := range definition.Waiters {
+			if lockRoleMatches(item.WaiterTag, waiter.Tag) {
+				return true
+			}
+		}
+		return false
+	}
+	if !lockModeMatches(item.HolderMode, definition.HolderMode) ||
 		!lockModeMatches(item.WaiterMode, definition.WaiterMode) {
 		return false
 	}
@@ -815,8 +830,21 @@ func verifyConfiguredLock(
 	matchedEdges := make(map[string]bool, len(definition.ExpectedEdges))
 	actualDepth := 0
 	for _, item := range evidence {
-		if item.Granted || item.Object != definition.Object ||
-			!lockModeMatches(item.HolderMode, definition.HolderMode) ||
+		if item.Granted || item.Object != definition.Object {
+			continue
+		}
+		if definition.Code == 503 {
+			if item.LockType != "relation" {
+				continue
+			}
+			for _, waiter := range definition.Waiters {
+				if lockRoleMatches(item.WaiterTag, waiter.Tag) {
+					matchedWaiters[waiter.Tag] = true
+				}
+			}
+			continue
+		}
+		if !lockModeMatches(item.HolderMode, definition.HolderMode) ||
 			!lockModeMatches(item.WaiterMode, definition.WaiterMode) {
 			continue
 		}
@@ -902,8 +930,24 @@ func verifyConfiguredLock(
 }
 
 func lockRoleMatches(applicationName, role string) bool {
-	return applicationName == role ||
-		strings.HasSuffix(applicationName, "/"+role)
+	if applicationName == role ||
+		strings.HasSuffix(applicationName, "/"+role) {
+		return true
+	}
+	separator := strings.LastIndexByte(applicationName, '/')
+	if separator < 0 {
+		return false
+	}
+	prefix := applicationName[:separator+1]
+	maxRoleBytes := applicationNameMaxBytes - len(prefix)
+	if maxRoleBytes <= len(applicationCompressedTokenMark) {
+		return false
+	}
+	roleToken, err := applicationToken("worker id", role, maxRoleBytes)
+	if err != nil {
+		return false
+	}
+	return applicationName == prefix+roleToken
 }
 
 func verifyRowChain(definition LockDefinition, evidence []LockEvidence) Result {

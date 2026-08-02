@@ -80,6 +80,23 @@ func TestConfigureRowChainDefinitionBuildsSharedRootBranches(t *testing.T) {
 					len(configured.ExpectedEdges),
 				)
 			}
+			if len(configured.HolderSQL) != len(test.branches) {
+				t.Fatalf(
+					"holder roots=%v want one per branch %v",
+					configured.HolderSQL,
+					test.branches,
+				)
+			}
+			for index, rootID := range []string{"id=1", "id=5", "id=9"} {
+				if !strings.Contains(configured.HolderSQL[index], rootID) {
+					t.Fatalf(
+						"holder SQL %d=%q want %s",
+						index,
+						configured.HolderSQL[index],
+						rootID,
+					)
+				}
+			}
 			gotTags := make([]string, len(configured.Waiters))
 			for index, waiter := range configured.Waiters {
 				gotTags[index] = waiter.Tag
@@ -105,8 +122,8 @@ func TestConfigureRowChainDefinitionAssignsUniqueOwnedAndUpstreamRows(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantSetup := []string{"id=2", "id=3", "id=4", "id=5", "id=6", "id=7", "id=8"}
-	wantWait := []string{"id=1", "id=2", "id=3", "id=1", "id=5", "id=6", "id=1"}
+	wantSetup := []string{"id=2", "id=3", "id=4", "id=6", "id=7", "id=8", "id=10"}
+	wantWait := []string{"id=1", "id=2", "id=3", "id=5", "id=6", "id=7", "id=9"}
 	wantBlocker := []string{
 		"blocker", "chain-1-1", "chain-1-2",
 		"blocker", "chain-2-1", "chain-2-2", "blocker",

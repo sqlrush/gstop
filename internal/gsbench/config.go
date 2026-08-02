@@ -625,6 +625,15 @@ func (c BenchConfig) Validate() error {
 			"scenario 501 requires sessions >= chain_depth + 1",
 		)
 	}
+	if requiredRows := rowChainRequiredRows(
+		c.LockWorkloads.RowChainSessions,
+		c.LockWorkloads.RowChainDepth,
+	); requiredRows > lockTargetRows {
+		return fmt.Errorf(
+			"scenario 501 requires %d unique lock_targets rows but only 10,000 are available",
+			requiredRows,
+		)
+	}
 	selectedFixedWorkers := 0
 	selectedConnections := 0
 	addFixedWorkers := func(workers int) error {

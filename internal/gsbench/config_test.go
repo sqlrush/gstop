@@ -653,6 +653,27 @@ func TestConfigRejectsInvalidLockWorkloadSettings(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsRowChainTopologyExceedingAvailableRows(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 501",
+		1,
+	) + `
+[safety]
+max_workers = 1
+max_connections = 6000
+
+[scenario.lock_row_chain]
+sessions = 5002
+chain_depth = 1
+`
+	_, err := LoadConfig(writeTestConfig(t, body), Overrides{})
+	if err == nil || !strings.Contains(err.Error(), "10,000") {
+		t.Fatalf("row-chain capacity error=%v", err)
+	}
+}
+
 func TestConfigIgnoresLegacyCPUTargetSetting(t *testing.T) {
 	body := minimalConfig() + "\n[safety]\ncpu_target_percent = 0\n"
 	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {

@@ -311,7 +311,7 @@ type LockExpectedEdge struct {
 }
 ```
 
-For 501 iterate waiter index `0..sessions-2`, use `branch := index/depth+1`, `level := index%depth+1`, `row := index+2`, and `blockerRow := 1` at level 1 or `row-1` otherwise. Use tag `chain-<branch>-<level>`, append a branch length at each level 1, and increment it at deeper levels.
+For 501, allocate branches sequentially. The single holder transaction receives one distinct root row per branch; waiter rows follow that branch root. Within each branch, level 1 waits on its root row and every deeper level waits on the previous waiter-owned row. Use tag `chain-<branch>-<level>`. This avoids openGauss serializing multiple first-level UPDATE requests behind one tuple lock on a shared row while preserving one shared holder session.
 
 For 502 create tags `waiter-1` through `waiter-(sessions-1)` with copied SELECT SQL. For 503 create the same tags with:
 
@@ -320,7 +320,7 @@ column := fmt.Sprintf("ddl_%s_%d", lockRunToken(runID), index+1)
 waitSQL := []string{addColumnSQL(schema, "lock_ddl_targets", column)}
 ```
 
-Return errors for unsupported codes, unsafe schema/run IDs, invalid sessions/depth, and more than 10,000 501 sessions because `lock_targets` contains 10,000 fixed rows.
+Return errors for unsupported codes, unsafe schema/run IDs, invalid sessions/depth, and a 501 topology where `(sessions-1)+ceil((sessions-1)/depth)` exceeds the 10,000 fixed `lock_targets` rows.
 
 - [ ] **Step 4: Apply the topology during scenario Prepare**
 
