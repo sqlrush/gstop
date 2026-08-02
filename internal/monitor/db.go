@@ -56,6 +56,8 @@ type DBMonitor struct {
 	lastBusy []busyResult
 
 	dbInfo *model.DBInfo
+
+	queryFn func(string) []dbconn.Row
 }
 
 // NewDBMonitor builds the database panel.
@@ -114,7 +116,10 @@ func (m *DBMonitor) Refresh() {
 		if m.shortCircuit(i, item, tmp) {
 			continue
 		}
-		processData := m.phaseQuery(i, item)
+		processData, ok := m.phaseQuery(i, item)
+		if !ok {
+			return
+		}
 		m.phaseCommand(i, processData, tmp)
 		m.phasePost(i, item, tmp)
 	}
@@ -160,25 +165,32 @@ func (m *DBMonitor) shortCircuit(i int, item string, tmp []string) bool {
 
 // phaseQuery runs the cell's SQL (if any) and returns the scalar text to feed the
 // shell phase. For db% it caches the (cpu,db,ts) sample instead.
-func (m *DBMonitor) phaseQuery(i int, item string) string {
+func (m *DBMonitor) phaseQuery(i int, item string) (string, bool) {
 	if m.methods[i] == "" {
-		return ""
+		return "", true
 	}
-	rows := m.deps.DB.Query(m.methods[i])
+	rows := m.query(m.methods[i])
 	if rows == nil {
-		return ""
+		return "", true
 	}
 	if item == "db%" {
-		if len(rows) > 0 {
-			m.busy = parseBusy(rows[0])
+		if len(rows) != 1 {
+			m.deps.Logger.Error("Exec query for monitor_item %s returned %d rows, want 1.", item, len(rows))
+			return "", false
 		}
-		return ""
+		sample := parseBusy(rows[0])
+		if !sample.valid {
+			m.deps.Logger.Error("Exec query for monitor_item %s returned an invalid busy sample.", item)
+			return "", false
+		}
+		m.busy = sample
+		return "", true
 	}
 	var processData string
 	for _, row := range rows {
 		processData = row.Str(0)
 	}
-	return processData
+	return processData, true
 }
 
 // phaseCommand runs the cell's shell command (if any), optionally piping the SQL
@@ -315,10 +327,24 @@ func (m *DBMonitor) LogFields() (items []string, values []string, widths []int) 
 }
 
 func parseBusy(row dbconn.Row) busyResult {
-	cpu, _ := row.Float(0)
-	db, _ := row.Float(1)
-	ts, _ := row.Time(2)
+	if len(row) != 3 {
+		return busyResult{}
+	}
+	cpu, cpuOK := row.Float(0)
+	db, dbOK := row.Float(1)
+	ts, tsOK := row.Time(2)
+	if !cpuOK || !dbOK || !tsOK || cpu < 0 || db < 0 ||
+		math.IsNaN(cpu) || math.IsNaN(db) || math.IsInf(cpu, 0) || math.IsInf(db, 0) {
+		return busyResult{}
+	}
 	return busyResult{cpuTime: cpu, dbTime: db, ts: ts, valid: true}
+}
+
+func (m *DBMonitor) query(query string) []dbconn.Row {
+	if m.queryFn != nil {
+		return m.queryFn(query)
+	}
+	return m.deps.DB.Query(query)
 }
 
 // formatMB rounds a raw MB value to two decimals and renders it with six

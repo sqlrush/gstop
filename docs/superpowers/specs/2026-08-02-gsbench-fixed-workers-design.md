@@ -68,10 +68,12 @@ Scenario mapping:
 - 103 creates independent fixed TP and AP worker groups and releases both at
   the same start boundary. Its AP workers execute the same AP workload as 102.
 
-The existing Runner's shared workload context remains the authoritative timer.
-101–103 bind their worker groups to that timed context at Ramp time rather than
-starting traffic in Prepare. This preserves the invariant that preparation and
-session initialization do not consume the requested pressure duration.
+101–103 explicitly own their pressure timer. The Runner lets them stage their
+workers during Ramp without inheriting its shared ramp-plus-hold deadline. Hold
+starts the timer and releases the shared start gate in that order. This
+preserves the invariant that preparation and session initialization do not
+consume the requested pressure duration, while all other scenarios retain the
+existing Runner deadline behavior.
 
 ## Removed behavior
 
@@ -96,9 +98,10 @@ operations, errors, elapsed pressure time, throughput, and latency. Scenario 103
 reports TP and AP counts separately as well as their total.
 
 A run fails if worker/session initialization fails, a non-cancellation workload
-error occurs, no operation completes for a requested group, the requested
-worker count is not reached, or cleanup/restoration fails. CPU utilization does
-not determine success.
+error occurs, the requested worker count is not reached, or cleanup/restoration
+fails. A long AP request may legitimately remain in flight for the complete
+duration and be canceled at the deadline, so zero completed operations alone is
+not a failure. CPU utilization does not determine success.
 
 Deadline cancellation is expected control flow and is not counted as a
 workload error. The deadline must stop injection before Verify begins.

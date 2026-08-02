@@ -26,10 +26,10 @@ import (
 
 const driverName = "opengauss"
 
-// maxPoolConns bounds the shared connection pool. Enough for the five resident
-// monitors plus the emergency scenarios to run concurrently, small enough to be
-// a negligible session count on the server.
-const maxPoolConns = 8
+// maxPoolConns preserves the original gstop gateway's single-connection
+// semantics. database/sql safely queues concurrent monitor callers until the
+// current query's complete result stream has been consumed.
+const maxPoolConns = 1
 
 // DB is the shared database gateway. It is safe for concurrent use.
 type DB struct {
@@ -72,9 +72,9 @@ func (d *DB) ensure() *sql.DB {
 			d.logger.Error("open database failed: %v", err)
 			return nil
 		}
-		// Allow a small pool so the concurrently-refreshed monitors and the
-		// concurrently-analysed emergency scenarios do not serialise on a single
-		// connection (a slow query would otherwise stall all monitoring).
+		// The original Python monitor shared one psycopg connection. Keep one
+		// physical connection here too, avoiding concurrent result streams through
+		// the openGauss connector/server thread-pool compatibility boundary.
 		pool.SetMaxOpenConns(maxPoolConns)
 		pool.SetMaxIdleConns(maxPoolConns)
 		d.pool = pool

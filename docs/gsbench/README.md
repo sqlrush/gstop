@@ -48,8 +48,12 @@ gsbench restore
 场景参数以 `configs/gsbench.cfg` 中的实际键为准；先执行 `doctor`，再在测试环境用短时运行验证。
 
 ```bash
-# 内存、I/O、网络资源场景
-gsbench run -s 201,301,321 -d 2m
+# work_mem 排序/Hash：固定 worker、每 worker 的 work_mem、持续时间
+gsbench run 201 --workers 8 --work-mem 256MB --duration 1m
+gsbench run 202 --workers 8 --work-mem 256MB --duration 1m
+
+# I/O、网络资源场景
+gsbench run -s 301,321 -d 2m
 
 # 两个独立锁场景；或一个锁冲突矩阵场景
 gsbench run -s 501,504 -d 2m
@@ -63,7 +67,9 @@ gsbench run -s 621,624 -d 2m
 
 601–606 会修改同一组 `plan_data` 计划状态，必须每次只选择一个并逐个串行运行；配置层会拒绝在同一次 run 中组合其中两个或更多场景。
 
-`run` 也接受完整名称和逗号组合，例如 `gsbench run -s memory_workmem_sort,io_sequential_read -d 2m`。
+`run` 也接受完整名称和逗号组合，例如 `gsbench run -s io_sequential_read,network_client_egress -d 2m`。101–103、201–202 是可精确预算的固定 worker 场景，不能与其他并发模型的场景放在同一次运行中；201/202 使用命令行 worker/work_mem 覆盖时一次只能选择其中一个。
+
+201/202 会先用 `sort_data` 自动标定有界工作集，只接受实际 Sort/Hash 内存达到输入 `work_mem` 的 90%–97% 且不落盘的结果。随后每个 worker 建立一个服务端游标并完成首次 `FETCH`；所有 worker 就绪后才开始计算 `--duration`。第一次 Ctrl+C 会立即结束本地进程，数据库通过连接断开释放对应事务和游标；之后可执行 `gsbench restore --run-id RUN_ID` 收敛运行状态。
 
 ## 生命周期与恢复
 

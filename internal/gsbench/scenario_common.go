@@ -3,100 +3,12 @@ package gsbench
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 )
-
-type CPUSampler interface {
-	SampleCPU(context.Context) (float64, bool)
-}
-
-type DatabaseCPUSampler struct {
-	db   *Database
-	mu   sync.Mutex
-	busy float64
-	idle float64
-	have bool
-}
-
-func NewDatabaseCPUSampler(db *Database) *DatabaseCPUSampler {
-	return &DatabaseCPUSampler{db: db}
-}
-
-func (s *DatabaseCPUSampler) SampleCPU(ctx context.Context) (float64, bool) {
-	value, available, _ := s.SampleCPUResult(ctx)
-	return value, available
-}
-
-// SampleCPUResult preserves real database/scan failures for continuous
-// controllers while SampleCPU keeps the legacy two-result interface usable by
-// callers that only distinguish available from unavailable metrics.
-func (s *DatabaseCPUSampler) SampleCPUResult(ctx context.Context) (float64, bool, error) {
-	rows, err := s.db.Query(ctx, `SELECT name,value FROM dbe_perf.os_runtime WHERE name IN ('BUSY_TIME','IDLE_TIME')`)
-	if err != nil {
-		return 0, false, err
-	}
-	defer rows.Close()
-	var busy, idle float64
-	var haveBusy, haveIdle bool
-	for rows.Next() {
-		var name string
-		var value float64
-		if err := rows.Scan(&name, &value); err != nil {
-			return 0, false, err
-		}
-		switch name {
-		case "BUSY_TIME":
-			busy = value
-			haveBusy = true
-		case "IDLE_TIME":
-			idle = value
-			haveIdle = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return 0, false, err
-	}
-	if !haveBusy || !haveIdle {
-		return 0, false, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.have {
-		s.busy, s.idle, s.have = busy, idle, true
-		return 0, false, nil
-	}
-	deltaBusy, deltaIdle := busy-s.busy, idle-s.idle
-	s.busy, s.idle = busy, idle
-	if deltaBusy < 0 || deltaIdle < 0 || deltaBusy+deltaIdle <= 0 {
-		return 0, false, nil
-	}
-	return deltaBusy / (deltaBusy + deltaIdle) * 100, true, nil
-}
-
-type cpuResultSampler interface {
-	SampleCPUResult(context.Context) (float64, bool, error)
-}
-
-func sampleCPU(ctx context.Context, sampler CPUSampler, snapshot WorkerSnapshot) Sample {
-	sample := Sample{Errors: snapshot.Errors}
-	if snapshot.Errors > 0 {
-		sample.Err = workerSnapshotError(snapshot)
-		return sample
-	}
-	if sampler == nil {
-		return sample
-	}
-	if detailed, ok := sampler.(cpuResultSampler); ok {
-		value, available, err := detailed.SampleCPUResult(ctx)
-		sample.Value, sample.Available, sample.Err = value, available, err
-		return sample
-	}
-	sample.Value, sample.Available = sampler.SampleCPU(ctx)
-	return sample
-}
 
 func workerSnapshotError(snapshot WorkerSnapshot) error {
 	if snapshot.Errors <= 0 {
@@ -192,28 +104,67 @@ func nonContextControlError(err error) error {
 type SQLWorkerOp func(context.Context, *sql.Conn, int) error
 
 type sqlWorkload struct {
-	runtime *Runtime
-	name    string
-	group   *WorkerGroup
-	op      SQLWorkerOp
+	runtime       *Runtime
+	name          string
+	group         *WorkerGroup
+	op            SQLWorkerOp
+	sessionOpener func(context.Context, int) (*TaggedConn, error)
 
 	disableOperationTimeout bool
 	cleanup                 SQLWorkerOp
 	mu                      sync.Mutex
 	sessions                map[int]*TaggedConn
+	canceledWorkers         map[int]bool
 	retireErrMu             sync.Mutex
 	retireErr               error
 }
 
 func newSQLWorkload(ctx context.Context, runtime *Runtime, name string, maxWorkers int, op SQLWorkerOp) *sqlWorkload {
-	w := &sqlWorkload{runtime: runtime, name: name, op: op, sessions: map[int]*TaggedConn{}}
+	w := &sqlWorkload{
+		runtime: runtime, name: name, op: op,
+		sessions:        map[int]*TaggedConn{},
+		canceledWorkers: map[int]bool{},
+	}
 	w.group = NewWorkerGroup(ctx, maxWorkers, w.run)
+	w.group.SetRetireHook(w.retireSession)
+	return w
+}
+
+func newSQLWorkloadWithStartGate(
+	ctx context.Context,
+	runtime *Runtime,
+	name string,
+	maxWorkers int,
+	op SQLWorkerOp,
+	start <-chan struct{},
+) *sqlWorkload {
+	w := &sqlWorkload{
+		runtime: runtime, name: name, op: op,
+		sessions:        map[int]*TaggedConn{},
+		canceledWorkers: map[int]bool{},
+	}
+	w.group = NewWorkerGroupWithStartGate(ctx, maxWorkers, w.run, start)
 	w.group.SetRetireHook(w.retireSession)
 	return w
 }
 
 func newSQLWorkloadWithoutOperationTimeout(ctx context.Context, runtime *Runtime, name string, maxWorkers int, op SQLWorkerOp) *sqlWorkload {
 	workload := newSQLWorkload(ctx, runtime, name, maxWorkers, op)
+	workload.disableOperationTimeout = true
+	return workload
+}
+
+func newSQLWorkloadWithoutOperationTimeoutWithStartGate(
+	ctx context.Context,
+	runtime *Runtime,
+	name string,
+	maxWorkers int,
+	op SQLWorkerOp,
+	start <-chan struct{},
+) *sqlWorkload {
+	workload := newSQLWorkloadWithStartGate(
+		ctx, runtime, name, maxWorkers, op, start,
+	)
 	workload.disableOperationTimeout = true
 	return workload
 }
@@ -227,35 +178,104 @@ func newSQLWorkloadWithCleanup(ctx context.Context, runtime *Runtime, name strin
 func (w *sqlWorkload) Target() int              { return w.group.Target() }
 func (w *sqlWorkload) SetTarget(n int) error    { return w.group.SetTarget(n) }
 func (w *sqlWorkload) Snapshot() WorkerSnapshot { return w.group.Snapshot() }
+func (w *sqlWorkload) WaitReady(ctx context.Context, n int) error {
+	return w.group.WaitReady(ctx, n)
+}
+
+func (w *sqlWorkload) SetRunDeadline(deadline time.Time) error {
+	return w.group.SetRunDeadline(deadline)
+}
+
+func (w *sqlWorkload) PrepareSessions(ctx context.Context, workers int) error {
+	if workers <= 0 {
+		return fmt.Errorf("fixed worker session count must be positive")
+	}
+	if w == nil || w.group == nil {
+		return fmt.Errorf("SQL workload is unavailable")
+	}
+	if workers > w.group.max {
+		return fmt.Errorf("worker target %d exceeds range 0..%d", workers, w.group.max)
+	}
+	prepareCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for workerID := range workers {
+		workerID := workerID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := w.session(prepareCtx, workerID); err != nil {
+				errs <- fmt.Errorf("prepare worker %d session: %w", workerID, err)
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	var result error
+	for err := range errs {
+		result = errors.Join(result, err)
+	}
+	return result
+}
 
 func (w *sqlWorkload) run(ctx context.Context, workerID int) error {
+	defer func() {
+		if ctx.Err() == nil {
+			return
+		}
+		w.mu.Lock()
+		w.canceledWorkers[workerID] = true
+		w.mu.Unlock()
+	}()
 	conn, err := w.session(ctx, workerID)
 	if err != nil {
 		return err
 	}
 	if w.disableOperationTimeout {
-		return w.op(ctx, conn.Conn, workerID)
+		err = w.op(ctx, conn.Conn, workerID)
+	} else {
+		timeout := w.runtime.Config.Safety.QueryTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		opCtx, cancel := context.WithTimeout(ctx, timeout)
+		err = w.op(opCtx, conn.Conn, workerID)
+		cancel()
 	}
-	timeout := w.runtime.Config.Safety.QueryTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	opCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return w.op(opCtx, conn.Conn, workerID)
+	return err
 }
 
 func (w *sqlWorkload) session(ctx context.Context, workerID int) (*TaggedConn, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if conn := w.sessions[workerID]; conn != nil {
+		w.mu.Unlock()
 		return conn, nil
 	}
-	conn, err := w.runtime.Database.OpenTagged(ctx, w.runtime.RunID, w.name, fmt.Sprint(workerID))
+	w.mu.Unlock()
+	var conn *TaggedConn
+	var err error
+	if w.sessionOpener != nil {
+		conn, err = w.sessionOpener(ctx, workerID)
+	} else if w.runtime == nil || w.runtime.Database == nil {
+		err = sql.ErrConnDone
+	} else {
+		conn, err = w.runtime.Database.OpenTagged(ctx, w.runtime.RunID, w.name, fmt.Sprint(workerID))
+	}
 	if err != nil {
 		return nil, err
 	}
+	w.mu.Lock()
+	if existing := w.sessions[workerID]; existing != nil {
+		w.mu.Unlock()
+		if closeErr := conn.Close(); closeErr != nil {
+			return nil, closeErr
+		}
+		return existing, nil
+	}
 	w.sessions[workerID] = conn
+	w.mu.Unlock()
 	return conn, nil
 }
 
@@ -264,12 +284,21 @@ func (w *sqlWorkload) Stop(ctx context.Context) error {
 	w.mu.Lock()
 	sessions := w.sessions
 	w.sessions = map[int]*TaggedConn{}
+	canceledWorkers := w.canceledWorkers
+	w.canceledWorkers = map[int]bool{}
 	w.mu.Unlock()
 	for id, conn := range sessions {
 		if w.cleanup != nil {
-			err = errors.Join(err, w.cleanup(ctx, conn.Conn, id))
+			cleanupErr := w.cleanup(ctx, conn.Conn, id)
+			err = errors.Join(err, normalizeCanceledWorkerConnectionError(
+				cleanupErr,
+				canceledWorkers[id],
+			))
 		}
-		err = errors.Join(err, conn.Close())
+		err = errors.Join(err, normalizeCanceledWorkerConnectionError(
+			conn.Close(),
+			canceledWorkers[id],
+		))
 	}
 	w.retireErrMu.Lock()
 	err = errors.Join(err, w.retireErr)
@@ -281,6 +310,8 @@ func (w *sqlWorkload) retireSession(id int) {
 	w.mu.Lock()
 	conn := w.sessions[id]
 	delete(w.sessions, id)
+	canceled := w.canceledWorkers[id]
+	delete(w.canceledWorkers, id)
 	w.mu.Unlock()
 	if conn == nil {
 		return
@@ -293,20 +324,50 @@ func (w *sqlWorkload) retireSession(id int) {
 	defer cancel()
 	var retireErr error
 	if w.cleanup != nil {
-		retireErr = errors.Join(retireErr, w.cleanup(ctx, conn.Conn, id))
+		retireErr = errors.Join(retireErr, normalizeCanceledWorkerConnectionError(
+			w.cleanup(ctx, conn.Conn, id),
+			canceled,
+		))
 	}
-	retireErr = errors.Join(retireErr, conn.Close())
+	retireErr = errors.Join(retireErr, normalizeCanceledWorkerConnectionError(
+		conn.Close(),
+		canceled,
+	))
 	if retireErr == nil {
 		return
 	}
 	w.retireErrMu.Lock()
 	w.retireErr = errors.Join(w.retireErr, retireErr)
 	w.retireErrMu.Unlock()
-	w.mu.Lock()
-	if w.sessions[id] == nil {
-		w.sessions[id] = conn
+}
+
+func normalizeCanceledWorkerConnectionError(err error, canceled bool) error {
+	if canceled && isCanceledConnectionErrorTree(err) {
+		return nil
 	}
-	w.mu.Unlock()
+	return err
+}
+
+func isCanceledConnectionErrorTree(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !isCanceledConnectionErrorTree(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return isCanceledConnectionErrorTree(wrapped.Unwrap())
+	}
+	return err == driver.ErrBadConn || err == sql.ErrConnDone
 }
 
 func consumeRows(rows *sql.Rows) error {
@@ -325,63 +386,6 @@ func consumeRows(rows *sql.Rows) error {
 		}
 	}
 	return rows.Err()
-}
-
-func verifyCPUResult(name string, target float64, available bool, control ControlResult, snapshot WorkerSnapshot) Result {
-	result := Result{Scenario: name, Outcome: OutcomeFailed}
-	measured := available && control.Measured
-	reachable := control.ReachableMax
-	if control.Actual > reachable {
-		reachable = control.Actual
-	}
-	result.Evidence = []Evidence{{Metric: "db_host_cpu_percent", Target: target, Actual: control.Actual, Available: measured}, {
-		Metric: "reachable_max_percent", Target: target, Actual: reachable, Available: measured,
-	}, {
-		Metric: "operations", Actual: float64(snapshot.Operations), Available: true,
-	}}
-	switch {
-	case measured && control.Reached:
-		result.Outcome = OutcomeSuccess
-		result.Message = fmt.Sprintf("database host CPU sustained %.1f%% with %d workers", control.Actual, control.Workers)
-	case !measured && control.Ceiling && snapshot.Operations > 0:
-		result.Outcome = OutcomeDegraded
-		result.Message = "CPU metric unavailable; workload reached the configured worker ceiling"
-	case measured && control.Ceiling:
-		result.Message = fmt.Sprintf("CPU target %.1f%% is unreachable; measured ceiling %.1f%%", target, reachable)
-	default:
-		result.Message = fmt.Sprintf("CPU target %.1f%% was not reached", target)
-	}
-	return result
-}
-
-func cpuRuntimeEvidence(
-	target float64,
-	available bool,
-	control ControlResult,
-) []Evidence {
-	measured := available && control.Measured
-	reachable := control.ReachableMax
-	if control.Actual > reachable {
-		reachable = control.Actual
-	}
-	return []Evidence{
-		{
-			Metric: "db_host_cpu_percent", Target: target,
-			Actual: control.Actual, Available: measured,
-			Details: map[string]any{
-				"target_reached": control.Reached,
-				"ceiling":        control.Ceiling,
-			},
-		},
-		{
-			Metric: "reachable_max_percent", Target: target,
-			Actual: reachable, Available: measured,
-		},
-		{
-			Metric: "workers", Actual: float64(control.Workers),
-			Available: true,
-		},
-	}
 }
 
 func verifyCapacityResult(name string, target, actual float64, real bool, operations int64) Result {

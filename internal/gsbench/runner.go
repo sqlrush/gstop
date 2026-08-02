@@ -20,7 +20,6 @@ type Runtime struct {
 	Journal          *Journal
 	Log              *RunLog
 	RunID            string
-	CPU              CPUSampler
 	ReportPhase      func(context.Context, string, Phase)
 	PlanPreflight    func(context.Context, string, []string) error
 	RiskPreflight    func(context.Context, ScenarioDefinition) error
@@ -50,6 +49,13 @@ type ScenarioFactory func(
 
 type ScenarioStrategy interface {
 	Strategy() string
+}
+
+// workloadDurationOwner marks scenarios that start their duration only after
+// their fixed workers have initialized behind a start barrier. Other scenarios
+// retain the Runner's shared ramp+hold deadline.
+type workloadDurationOwner interface {
+	OwnsWorkloadDuration() bool
 }
 
 type executionReporter interface {
@@ -505,17 +511,21 @@ func (r *Runner) runOne(
 		fail(failurePhase, prepareErr)
 	} else {
 		verify := false
+		phaseCtx := workloadCtx
+		if owner, ok := scenario.(workloadDurationOwner); ok && owner.OwnsWorkloadDuration() {
+			phaseCtx = ctx
+		}
 		report(PhaseRamp)
-		if err := scenario.Ramp(workloadCtx, r.runtime); err != nil {
-			if runDurationElapsed(ctx, workloadCtx, err) {
+		if err := scenario.Ramp(phaseCtx, r.runtime); err != nil {
+			if runDurationElapsed(ctx, phaseCtx, err) {
 				verify = true
 			} else {
 				fail(PhaseRamp, err)
 			}
 		} else {
 			report(PhaseHold)
-			if err := scenario.Hold(workloadCtx, r.runtime); err != nil {
-				if runDurationElapsed(ctx, workloadCtx, err) {
+			if err := scenario.Hold(phaseCtx, r.runtime); err != nil {
+				if runDurationElapsed(ctx, phaseCtx, err) {
 					verify = true
 				} else {
 					fail(PhaseHold, err)

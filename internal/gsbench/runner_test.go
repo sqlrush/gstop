@@ -48,6 +48,14 @@ type durationScenario struct {
 	rampDelay time.Duration
 }
 
+type fixedWorkerDurationScenario struct {
+	fakeScenario
+	rampDelay       time.Duration
+	holdStartedAt   time.Time
+	holdEndedAt     time.Time
+	holdHadDeadline bool
+}
+
 type executionReportingScenario struct {
 	fakeScenario
 	snapshot WorkerSnapshot
@@ -83,6 +91,11 @@ type testCodeScenario struct {
 }
 
 func (s testCodeScenario) Code() ScenarioCode { return s.code }
+
+func (s testCodeScenario) OwnsWorkloadDuration() bool {
+	owner, ok := s.Scenario.(workloadDurationOwner)
+	return ok && owner.OwnsWorkloadDuration()
+}
 
 type testCodeExecutionScenario struct {
 	testCodeScenario
@@ -200,6 +213,34 @@ func (s *durationScenario) Hold(ctx context.Context, _ *Runtime) error {
 	}
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+func (s *fixedWorkerDurationScenario) OwnsWorkloadDuration() bool { return true }
+
+func (s *fixedWorkerDurationScenario) Ramp(
+	ctx context.Context,
+	_ *Runtime,
+) error {
+	if err := s.record(PhaseRamp); err != nil {
+		return err
+	}
+	return waitContext(ctx, s.rampDelay)
+}
+
+func (s *fixedWorkerDurationScenario) Hold(
+	ctx context.Context,
+	rt *Runtime,
+) error {
+	if err := s.record(PhaseHold); err != nil {
+		return err
+	}
+	_, s.holdHadDeadline = ctx.Deadline()
+	s.holdStartedAt = time.Now()
+	if err := waitContext(ctx, rt.Config.Run.Duration); err != nil {
+		return err
+	}
+	s.holdEndedAt = time.Now()
+	return nil
 }
 
 type resourceLifetimeScenario struct {
@@ -1008,6 +1049,34 @@ func TestRunnerDurationIncludesRampAndHold(t *testing.T) {
 	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseVerify, PhaseStop}
 	if !reflect.DeepEqual(s.phases, want) {
 		t.Fatalf("phases=%v want=%v", s.phases, want)
+	}
+	if summary.Outcome != OutcomeSuccess {
+		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+func TestRunnerFixedWorkerDurationStartsAfterRampReadiness(t *testing.T) {
+	s := &fixedWorkerDurationScenario{
+		fakeScenario: fakeScenario{name: "tp_cpu", outcome: OutcomeSuccess},
+		rampDelay:    30 * time.Millisecond,
+	}
+	runtime := &Runtime{Config: BenchConfig{
+		Run:    RunConfig{Duration: 80 * time.Millisecond},
+		Safety: SafetyConfig{QueryTimeout: 100 * time.Millisecond},
+	}}
+	started := time.Now()
+	summary := runTestScenarios(t, context.Background(), runtime, []Scenario{s})
+	elapsed := time.Since(started)
+	holdElapsed := s.holdEndedAt.Sub(s.holdStartedAt)
+
+	if elapsed < 100*time.Millisecond || elapsed > 300*time.Millisecond {
+		t.Fatalf("elapsed=%s, want ramp readiness plus full pressure duration", elapsed)
+	}
+	if holdElapsed < 75*time.Millisecond || holdElapsed > 200*time.Millisecond {
+		t.Fatalf("hold elapsed=%s, want full fixed-worker duration", holdElapsed)
+	}
+	if s.holdHadDeadline {
+		t.Fatal("fixed-worker Hold inherited the Runner ramp+hold deadline")
 	}
 	if summary.Outcome != OutcomeSuccess {
 		t.Fatalf("summary=%+v", summary)

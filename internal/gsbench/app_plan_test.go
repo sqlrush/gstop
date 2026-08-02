@@ -327,6 +327,38 @@ func TestWithPlanScenarioDatabaseLockReleasesAfterWork(t *testing.T) {
 	}
 }
 
+func TestCommandRunDryRunPlanScenarioSkipsDatabaseLock(t *testing.T) {
+	var output bytes.Buffer
+	log, err := NewRunLog(&output, "", Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	cfg := BenchConfig{
+		Data: DataConfig{Schema: "Bench"},
+		Run: RunConfig{
+			ScenarioCodes: []ScenarioCode{601},
+			DryRun:        true,
+		},
+	}
+
+	if code := commandRun(
+		context.Background(),
+		nil,
+		cfg,
+		Environment{},
+		Capabilities{},
+		RiskA,
+		log,
+		"dry-run",
+	); code != 0 {
+		t.Fatalf("exit code=%d output=%s", code, output.String())
+	}
+	if !strings.Contains(output.String(), "run SUCCESS (dry run") {
+		t.Fatalf("dry-run success not reported: %s", output.String())
+	}
+}
+
 func TestWithPlanDatabaseLockUsesSharedSchemaIdentity(t *testing.T) {
 	cfg := BenchConfig{
 		Database: DatabaseConfig{Database: "postgres"},
@@ -1056,6 +1088,37 @@ func TestWithPlanRunPreparationDatabaseLockProtectsStaleRestore(
 	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events=%v want=%v", events, want)
+	}
+}
+
+func TestWithPlanRunPreparationDatabaseLockFailsBusyBeforeStaleRestore(
+	t *testing.T,
+) {
+	cfg := BenchConfig{
+		Database: DatabaseConfig{Database: "postgres"},
+		Data:     DataConfig{Schema: "Bench"},
+	}
+	wantErr := errors.New("plan lock busy")
+	staleRestoreCalls := 0
+
+	_, err := withPlanRunPreparationDatabaseLock(
+		context.Background(),
+		nil,
+		cfg,
+		false,
+		func(context.Context, *Database, string) (func() error, error) {
+			return nil, wantErr
+		},
+		func() int {
+			staleRestoreCalls++
+			return 0
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error=%v want=%v", err, wantErr)
+	}
+	if staleRestoreCalls != 0 {
+		t.Fatalf("stale restore calls=%d want=0", staleRestoreCalls)
 	}
 }
 

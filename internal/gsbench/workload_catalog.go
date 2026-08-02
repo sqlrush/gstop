@@ -13,10 +13,10 @@ func ScenarioWorkloadStatements(runtime *Runtime, scenario string) ([]string, er
 	case "tp_cpu":
 		return TPStatements(schema, 42, 9001, 1000), nil
 	case "ap_cpu":
-		scanRows := runtimeInt(runtime, "scenario.ap_cpu.scan_rows", defaultAPSafety.ScanRows)
+		scanRows := runtimeInt(runtime, "scenario.ap_cpu.scan_rows", defaultAPScanRows)
 		return APStatements(schema, scanRows)
 	case "mixed_cpu":
-		scanRows := runtimeInt(runtime, "scenario.mixed_cpu.scan_rows", 1_000_000)
+		scanRows := runtimeInt(runtime, "scenario.mixed_cpu.scan_rows", defaultAPScanRows)
 		ap, err := APStatements(schema, scanRows)
 		if err != nil {
 			return nil, err
@@ -51,6 +51,24 @@ func ScenarioWorkloadStatements(runtime *Runtime, scenario string) ([]string, er
 		return []string{statement}, nil
 	}
 	if definition, err := DefaultScenarioCatalog().Resolve(scenario); err == nil {
+		if definition.Code == 201 || definition.Code == 202 {
+			kind := workMemSort
+			targetKB := runtime.Config.MemoryWorkloads.SortWorkMemKB
+			if definition.Code == 202 {
+				kind = workMemHash
+				targetKB = runtime.Config.MemoryWorkloads.HashWorkMemKB
+			}
+			if targetKB < minWorkMemKB {
+				targetKB = defaultWorkMemKB
+			}
+			statement, statementErr := workMemCursorSQL(
+				kind, schema, initialWorkMemRange(targetKB, kind),
+			)
+			if statementErr != nil {
+				return nil, statementErr
+			}
+			return []string{statement}, nil
+		}
 		if lifecycle, lifecycleErr := memoryLifecycleFor(definition.Code); lifecycleErr == nil {
 			statements := make([]string, 0, len(lifecycle.AllocationCodes))
 			for _, code := range lifecycle.AllocationCodes {

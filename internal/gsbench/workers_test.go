@@ -32,6 +32,127 @@ func TestWorkerGroupCancellationIsBounded(t *testing.T) {
 	}
 }
 
+func TestWorkerGroupStagesFixedWorkersUntilSharedStart(t *testing.T) {
+	start := make(chan struct{})
+	var operations atomic.Int64
+	group := NewWorkerGroupWithStartGate(
+		context.Background(),
+		3,
+		func(ctx context.Context, _ int) error {
+			operations.Add(1)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return nil
+			}
+		},
+		start,
+	)
+	if err := group.SetTarget(3); err != nil {
+		t.Fatal(err)
+	}
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), time.Second)
+	defer cancelReady()
+	if err := group.WaitReady(readyCtx, 3); err != nil {
+		t.Fatal(err)
+	}
+	if got := operations.Load(); got != 0 {
+		t.Fatalf("operations before shared start=%d, want zero", got)
+	}
+	snapshot := group.Snapshot()
+	if snapshot.Started != 3 || snapshot.PeakActive != 3 || snapshot.Active != 3 {
+		t.Fatalf("staged snapshot=%+v, want three initialized workers", snapshot)
+	}
+
+	close(start)
+	deadline := time.Now().Add(time.Second)
+	for operations.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if operations.Load() == 0 {
+		t.Fatal("workers did not execute after shared start")
+	}
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	if err := group.Stop(stopCtx); err != nil {
+		t.Fatal(err)
+	}
+	stoppedAt := operations.Load()
+	time.Sleep(10 * time.Millisecond)
+	if got := operations.Load(); got != stoppedAt {
+		t.Fatalf("operations continued after stop: before=%d after=%d", stoppedAt, got)
+	}
+}
+
+func TestWorkerGroupWaitReadyHonorsCancellation(t *testing.T) {
+	start := make(chan struct{})
+	group := NewWorkerGroupWithStartGate(
+		context.Background(),
+		2,
+		func(context.Context, int) error { return nil },
+		start,
+	)
+	if err := group.SetTarget(1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := group.WaitReady(ctx, 2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitReady error=%v, want context cancellation", err)
+	}
+	if err := group.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerGroupDeadlineClosesInjectionBeforeAnotherOperation(t *testing.T) {
+	start := make(chan struct{})
+	operationStarts := make(chan time.Time, 1024)
+	group := NewWorkerGroupWithStartGate(
+		context.Background(),
+		1,
+		func(ctx context.Context, _ int) error {
+			operationStarts <- time.Now()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Millisecond):
+				return nil
+			}
+		},
+		start,
+	)
+	if err := group.SetTarget(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := group.WaitReady(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(25 * time.Millisecond)
+	if err := group.SetRunDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	close(start)
+	time.Sleep(50 * time.Millisecond)
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	if err := group.Stop(stopCtx); err != nil {
+		t.Fatal(err)
+	}
+	close(operationStarts)
+	count := 0
+	for startedAt := range operationStarts {
+		count++
+		if !startedAt.Before(deadline) {
+			t.Fatalf("operation started at %s, deadline was %s", startedAt, deadline)
+		}
+	}
+	if count == 0 {
+		t.Fatal("worker did not execute before deadline")
+	}
+}
+
 func TestWorkerGroupHonorsMaximum(t *testing.T) {
 	group := NewWorkerGroup(context.Background(), 2, func(ctx context.Context, _ int) error {
 		<-ctx.Done()
