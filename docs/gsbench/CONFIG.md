@@ -140,7 +140,7 @@ allow_database_restart = false
 restart_command =
 ```
 
-- `max_connections`、`max_workers`：连接与 worker 的全局硬上限，必须为正数。101–103 只在启动前检查用户输入是否超过上限，运行中绝不会动态调整 worker 数。
+- `max_connections`、`max_workers`：连接与 worker 的全局硬上限，必须为正数。固定 worker 和 501–503 的 workload 会话在启动前累计检查；运行中绝不会动态调整请求的并发数。
 - `query_timeout`、`restore_timeout`：查询和恢复超时，必须大于 0。
 - `profile_cap_gb`：数据集硬上限，1–2048 GiB；必须不小于 `init --size`。
 - `restore_on_exit`：必须为 `true`；设为 `false` 会被拒绝。
@@ -179,6 +179,10 @@ type = none
 |  | `work_mem` | 256MB | 每个 201 worker 的 `work_mem`；支持整数 kB/MB/GB，最小 64kB |
 | `scenario.memory_workmem_hash` | `workers` | 1 | 202 固定 Hash worker 数 |
 |  | `work_mem` | 256MB | 每个 202 worker 的 `work_mem`；支持整数 kB/MB/GB，最小 64kB |
+| `scenario.lock_row_chain` | `sessions` | 2 | 501 workload 会话总数，包含 1 个 holder 和其余 waiter |
+|  | `chain_depth` | 1 | 501 每条人工等待链的最大深度，范围 1–5 |
+| `scenario.lock_table_exclusive` | `sessions` | 2 | 502 workload 会话总数，包含 1 个 holder 和其余 waiter |
+| `scenario.lock_ddl_wait` | `sessions` | 2 | 503 workload 会话总数，包含 1 个 holder 和其余 waiter |
 | `scenario.memory_total_pressure` | `workers` | 4 | 有界内存压力 worker 数，不代表主机内存百分比 |
 | `scenario.connection_pool` | `target_percent` | 95 | 401 连接池目标百分比 |
 |  | `idle_percent` | 60 | 目标连接中的 idle 比例 |
@@ -196,11 +200,16 @@ type = none
 gsbench run 101 --workers 16 --duration 60s
 gsbench run 102 --workers 4 --duration 60s
 gsbench run 103 --tp-workers 12 --ap-workers 2 --duration 60s
+gsbench run 501 --sessions 10 --chain-depth 3 --duration 1m
+gsbench run 502 --sessions 10 --duration 1m
+gsbench run 503 --sessions 10 --duration 1m
 ```
 
 CLI worker 参数覆盖上述场景配置。103 的总并发为 `tp_workers + ap_workers`；所有 worker 先建立独立 tagged session 并等待同一个启动屏障，加压计时开始后才统一执行。
 
-201/202 的命令行覆盖一次只允许选择一个场景，例如 `gsbench run 201 --workers 8 --work-mem 256MB --duration 1m`。配置文件可以同时选择 201 和 202，并分别使用各自的 `workers/work_mem`；配置校验会累计两者 worker 数。固定 worker 场景不能与其他并发模型的场景混跑，避免实际连接数突破 `safety.max_workers` 或 `safety.max_connections`。
+201/202 的命令行覆盖一次只允许选择一个场景，例如 `gsbench run 201 --workers 8 --work-mem 256MB --duration 1m`。配置文件可以同时选择 201 和 202，并分别使用各自的 `workers/work_mem`；配置校验会累计两者 worker 数。固定 worker 场景不能与未纳入并发预算的场景混跑；501–503 已纳入连接预算，可以与固定 worker 场景组合，但所有 worker 和锁 workload 会话的总数必须不超过 `safety.max_connections`。
+
+`--sessions` 只允许所选场景全部属于 501–503，并对每个所选场景分别生效。`--chain-depth` 要求选择中包含 501，只影响 501；502、503 不人工构造多层等待链。501 还要求 `sessions >= chain_depth + 1`。gsbench 自身的控制、元数据和观测连接不计入 `sessions`。
 
 ## 20 GiB 专用配置要点
 
