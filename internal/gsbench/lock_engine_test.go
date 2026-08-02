@@ -260,6 +260,187 @@ func TestRowChainRequiresTwoTransactionIDWaitEdges(t *testing.T) {
 	}
 }
 
+func TestConfiguredRowChainRequiresEveryExpectedEdge(t *testing.T) {
+	definition, err := configureLockDefinition(
+		businessLockDefinitionForTest(t, 501),
+		LockWorkloadConfig{RowChainSessions: 8, RowChainDepth: 3},
+		"gsbench",
+		"run-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairs := [][2]string{
+		{"blocker", "chain-1-1"},
+		{"chain-1-1", "chain-1-2"},
+		{"chain-1-2", "chain-1-3"},
+		{"blocker", "chain-2-1"},
+		{"chain-2-1", "chain-2-2"},
+		{"chain-2-2", "chain-2-3"},
+		{"blocker", "chain-3-1"},
+	}
+	evidence := make([]LockEvidence, 0, len(pairs))
+	for _, pair := range pairs {
+		evidence = append(evidence, LockEvidence{
+			Granted:    false,
+			LockType:   "transactionid",
+			Object:     "lock_targets",
+			HolderMode: "Exclusive",
+			WaiterMode: "Share",
+			BlockerTag: "gsbench/run-1/lock_row_chain/" + pair[0],
+			WaiterTag:  "gsbench/run-1/lock_row_chain/" + pair[1],
+		})
+	}
+	if got := verifyLock(definition, evidence[:6]); got.Outcome == OutcomeSuccess {
+		t.Fatalf("six of seven edges reported success: %+v", got)
+	}
+	got := verifyLock(definition, evidence)
+	if got.Outcome != OutcomeSuccess {
+		t.Fatalf("all configured edges failed: %+v", got)
+	}
+	metrics := map[string]Evidence{}
+	for _, item := range got.Evidence {
+		metrics[item.Metric] = item
+	}
+	for metric, target := range map[string]float64{
+		"lock_sessions":        8,
+		"lock_waiters":         7,
+		"row_lock_chain_edges": 7,
+		"chain_depth":          3,
+	} {
+		item, ok := metrics[metric]
+		if !ok || item.Target != target || item.Actual != target {
+			t.Fatalf("metric %s=%+v want target/actual %.0f", metric, item, target)
+		}
+	}
+}
+
+func TestConfiguredLockEvidenceCountsUniqueWaiterTags(t *testing.T) {
+	definition, err := configureLockDefinition(
+		businessLockDefinitionForTest(t, 503),
+		LockWorkloadConfig{DDLWaitSessions: 4},
+		"gsbench",
+		"run-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidenceFor := func(waiter string) LockEvidence {
+		return LockEvidence{
+			Granted:    false,
+			LockType:   "relation",
+			Object:     "lock_ddl_targets",
+			HolderMode: "RowExclusive",
+			WaiterMode: "AccessExclusive",
+			BlockerTag: "gsbench/run-1/lock_ddl_wait/blocker",
+			WaiterTag:  "gsbench/run-1/lock_ddl_wait/" + waiter,
+		}
+	}
+	evidence := []LockEvidence{
+		evidenceFor("waiter-1"),
+		evidenceFor("waiter-1"),
+		evidenceFor("waiter-2"),
+	}
+	if got := verifyLock(definition, evidence); got.Outcome == OutcomeSuccess {
+		t.Fatalf("duplicate waiter satisfied target: %+v", got)
+	}
+	evidence = append(evidence, evidenceFor("waiter-3"))
+	got := verifyLock(definition, evidence)
+	if got.Outcome != OutcomeSuccess {
+		t.Fatalf("three unique waiters failed: %+v", got)
+	}
+	metrics := map[string]Evidence{}
+	for _, item := range got.Evidence {
+		metrics[item.Metric] = item
+	}
+	if metrics["lock_sessions"].Target != 4 ||
+		metrics["lock_sessions"].Actual != 4 ||
+		metrics["lock_waiters"].Target != 3 ||
+		metrics["lock_waiters"].Actual != 3 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestConfiguredLockEvidenceMatchesCompleteRoleNotPrefix(t *testing.T) {
+	definition, err := configureLockDefinition(
+		businessLockDefinitionForTest(t, 502),
+		LockWorkloadConfig{TableExclusiveSessions: 11},
+		"gsbench",
+		"run-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := []LockEvidence{{
+		Granted:    false,
+		LockType:   "relation",
+		Object:     "lock_table_targets",
+		HolderMode: "AccessExclusive",
+		WaiterMode: "AccessShare",
+		BlockerTag: "gsbench/run-1/lock_table_exclusive/blocker",
+		WaiterTag:  "gsbench/run-1/lock_table_exclusive/waiter-10",
+	}}
+	result := verifyLock(definition, evidence)
+	if result.Outcome == OutcomeSuccess {
+		t.Fatalf("one waiter with a shared prefix satisfied ten: %+v", result)
+	}
+}
+
+func TestConfiguredLockEvidenceTimeoutIsBoundedByQueryTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		queryTimeout time.Duration
+		want         time.Duration
+	}{
+		{name: "default cap", queryTimeout: 30 * time.Second, want: 5 * time.Second},
+		{name: "smaller query timeout", queryTimeout: 2 * time.Second, want: 2 * time.Second},
+		{name: "missing query timeout", queryTimeout: 0, want: 5 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := &Runtime{Config: BenchConfig{
+				Safety: SafetyConfig{QueryTimeout: test.queryTimeout},
+			}}
+			if got := configuredLockEvidenceTimeout(runtime); got != test.want {
+				t.Fatalf("timeout=%v want=%v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestConfiguredLockEvidenceReturnsWaiterExecutionError(t *testing.T) {
+	definition, err := configureLockDefinition(
+		businessLockDefinitionForTest(t, 502),
+		LockWorkloadConfig{TableExclusiveSessions: 2},
+		"gsbench",
+		"run-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := NewLockEngine(definition)
+	engine.setWaiterError(errors.New(
+		"waiter waiter-1 wait: permission denied",
+	))
+	engine.observe = func(
+		context.Context,
+		*Runtime,
+		LockDefinition,
+	) ([]LockEvidence, error) {
+		return nil, nil
+	}
+	runtime := &Runtime{Config: BenchConfig{
+		Safety: SafetyConfig{QueryTimeout: 10 * time.Millisecond},
+	}}
+	err = engine.captureExpectedEvidence(
+		context.Background(),
+		runtime,
+	)
+	if err == nil || !strings.Contains(err.Error(), "waiter-1") ||
+		!strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestRowChainVerifyRetainsEvidenceAfterWorkloadDeadline(t *testing.T) {
 	definition := LockDefinition{
 		Code: 501, Name: "lock_row_chain", Object: "lock_targets", ExpectedKind: "row_chain",

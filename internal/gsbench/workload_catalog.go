@@ -22,6 +22,14 @@ func ScenarioWorkloadStatements(runtime *Runtime, scenario string) ([]string, er
 			return nil, err
 		}
 		return append(TPStatements(schema, 42, 9001, 1000), ap...), nil
+	case "lock_row_chain":
+		return []string{rowUpdate(schema, "lock_targets", 1)}, nil
+	case "lock_table_exclusive":
+		return []string{
+			"SELECT count(*) FROM " + schema + ".lock_table_targets",
+		}, nil
+	case "lock_ddl_wait":
+		return []string{rowUpdate(schema, "lock_ddl_targets", 1)}, nil
 	case "connection_pool":
 		return []string{"SELECT 1", "SELECT pg_sleep(1)"}, nil
 	case "thread_pool":

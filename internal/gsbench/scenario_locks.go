@@ -67,6 +67,13 @@ func (s *LockScenario) Verify(ctx context.Context, rt *Runtime) (Result, error) 
 	return s.engine.Verify(ctx, rt)
 }
 
+func (s *LockScenario) RuntimeEvidence() []Evidence {
+	if s.engine == nil {
+		return nil
+	}
+	return s.engine.RuntimeEvidence()
+}
+
 func (s *LockScenario) Stop(ctx context.Context, rt *Runtime) error {
 	return s.engine.Stop(ctx, rt)
 }

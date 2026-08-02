@@ -32,3 +32,43 @@ func TestLockScenarioCompilesRuntimeSessionTopology(t *testing.T) {
 		t.Fatalf("definition=%+v", scenario.definition)
 	}
 }
+
+func TestLockScenarioReportsRuntimeEvidenceWhenValidationIsDisabled(t *testing.T) {
+	definition, err := configureLockDefinition(
+		businessLockDefinitionForTest(t, 502),
+		LockWorkloadConfig{TableExclusiveSessions: 3},
+		"gsbench",
+		"run-1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := NewLockEngine(definition)
+	engine.evidence = []LockEvidence{
+		{
+			Granted: false, LockType: "relation",
+			Object:     "lock_table_targets",
+			HolderMode: "AccessExclusive", WaiterMode: "AccessShare",
+			BlockerTag: "gsbench/run-1/lock_table_exclusive/blocker",
+			WaiterTag:  "gsbench/run-1/lock_table_exclusive/waiter-1",
+		},
+		{
+			Granted: false, LockType: "relation",
+			Object:     "lock_table_targets",
+			HolderMode: "AccessExclusive", WaiterMode: "AccessShare",
+			BlockerTag: "gsbench/run-1/lock_table_exclusive/blocker",
+			WaiterTag:  "gsbench/run-1/lock_table_exclusive/waiter-2",
+		},
+	}
+	scenario := &LockScenario{definition: definition, engine: engine}
+	metrics := map[string]Evidence{}
+	for _, item := range scenario.RuntimeEvidence() {
+		metrics[item.Metric] = item
+	}
+	if metrics["lock_sessions"].Target != 3 ||
+		metrics["lock_sessions"].Actual != 3 ||
+		metrics["lock_waiters"].Target != 2 ||
+		metrics["lock_waiters"].Actual != 2 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}

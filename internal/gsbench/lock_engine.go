@@ -451,6 +451,13 @@ func (e *LockEngine) Verify(ctx context.Context, rt *Runtime) (Result, error) {
 	return verifyLock(e.definition, evidence), nil
 }
 
+func (e *LockEngine) RuntimeEvidence() []Evidence {
+	e.mu.Lock()
+	evidence := append([]LockEvidence(nil), e.evidence...)
+	e.mu.Unlock()
+	return verifyLock(e.definition, evidence).Evidence
+}
+
 func (e *LockEngine) verifyDeadlock(ctx context.Context, rt *Runtime) Result {
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
@@ -579,9 +586,24 @@ func (e *LockEngine) captureEvidence(ctx context.Context, rt *Runtime) error {
 // Verify intentionally consumes this retained direct evidence later because
 // the runner has already cancelled workloadCtx then.
 func (e *LockEngine) captureExpectedEvidence(ctx context.Context, rt *Runtime) error {
-	deadline := time.NewTimer(500 * time.Millisecond)
+	timeout := 500 * time.Millisecond
+	if len(e.definition.Waiters) > 0 {
+		timeout = configuredLockEvidenceTimeout(rt)
+	}
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
+		if len(e.definition.Waiters) > 0 {
+			e.mu.Lock()
+			waiterErr := e.waiterErr
+			e.mu.Unlock()
+			if waiterErr != nil {
+				return fmt.Errorf(
+					"configured lock waiter failed: %w",
+					waiterErr,
+				)
+			}
+		}
 		e.mu.Lock()
 		evidence := append([]LockEvidence(nil), e.evidence...)
 		e.mu.Unlock()
@@ -611,6 +633,17 @@ func (e *LockEngine) captureExpectedEvidence(ctx context.Context, rt *Runtime) e
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func configuredLockEvidenceTimeout(rt *Runtime) time.Duration {
+	const maximum = 5 * time.Second
+	if rt != nil {
+		configured := rt.Config.Safety.QueryTimeout
+		if configured > 0 && configured < maximum {
+			return configured
+		}
+	}
+	return maximum
 }
 
 func appendLockEvidence(existing, observed []LockEvidence) []LockEvidence {
@@ -644,6 +677,27 @@ func isExpectedLockEvidence(definition LockDefinition, item LockEvidence) bool {
 	if item.Granted || item.Object != definition.Object ||
 		!lockModeMatches(item.HolderMode, definition.HolderMode) ||
 		!lockModeMatches(item.WaiterMode, definition.WaiterMode) {
+		return false
+	}
+	if len(definition.Waiters) > 0 {
+		if definition.ExpectedKind == "row_chain" {
+			if item.LockType != "transactionid" {
+				return false
+			}
+			for _, edge := range definition.ExpectedEdges {
+				if lockRoleMatches(item.BlockerTag, edge.BlockerTag) &&
+					lockRoleMatches(item.WaiterTag, edge.WaiterTag) {
+					return true
+				}
+			}
+			return false
+		}
+		for _, waiter := range definition.Waiters {
+			if lockRoleMatches(item.BlockerTag, waiter.BlockerTag) &&
+				lockRoleMatches(item.WaiterTag, waiter.Tag) {
+				return true
+			}
+		}
 		return false
 	}
 	if definition.ExpectedKind != "row_chain" {
@@ -723,6 +777,9 @@ func lockEvidenceQuery(distributed bool) string {
 }
 
 func verifyLock(definition LockDefinition, evidence []LockEvidence) Result {
+	if len(definition.Waiters) > 0 {
+		return verifyConfiguredLock(definition, evidence)
+	}
 	if definition.ExpectedKind == "row_chain" {
 		return verifyRowChain(definition, evidence)
 	}
@@ -742,6 +799,111 @@ func verifyLock(definition LockDefinition, evidence []LockEvidence) Result {
 	result.Message = "required direct lock waiter evidence was not observed"
 	result.Evidence = []Evidence{{Metric: "lock_waiter", Target: 1, Actual: 0, Available: false}}
 	return result
+}
+
+func verifyConfiguredLock(
+	definition LockDefinition,
+	evidence []LockEvidence,
+) Result {
+	result := Result{
+		ScenarioCode: definition.Code,
+		Scenario:     definition.Name,
+		Outcome:      OutcomeFailed,
+	}
+	targetWaiters := len(definition.Waiters)
+	matchedWaiters := make(map[string]bool, targetWaiters)
+	matchedEdges := make(map[string]bool, len(definition.ExpectedEdges))
+	actualDepth := 0
+	for _, item := range evidence {
+		if item.Granted || item.Object != definition.Object ||
+			!lockModeMatches(item.HolderMode, definition.HolderMode) ||
+			!lockModeMatches(item.WaiterMode, definition.WaiterMode) {
+			continue
+		}
+		if definition.ExpectedKind == "row_chain" {
+			if item.LockType != "transactionid" {
+				continue
+			}
+			for _, edge := range definition.ExpectedEdges {
+				if !lockRoleMatches(item.BlockerTag, edge.BlockerTag) ||
+					!lockRoleMatches(item.WaiterTag, edge.WaiterTag) {
+					continue
+				}
+				key := edge.BlockerTag + "->" + edge.WaiterTag
+				matchedEdges[key] = true
+				matchedWaiters[edge.WaiterTag] = true
+				if edge.Depth > actualDepth {
+					actualDepth = edge.Depth
+				}
+			}
+			continue
+		}
+		for _, waiter := range definition.Waiters {
+			if lockRoleMatches(item.BlockerTag, waiter.BlockerTag) &&
+				lockRoleMatches(item.WaiterTag, waiter.Tag) {
+				matchedWaiters[waiter.Tag] = true
+			}
+		}
+	}
+
+	actualWaiters := len(matchedWaiters)
+	actualSessions := 1 + actualWaiters
+	result.Evidence = []Evidence{
+		{
+			Metric:    "lock_sessions",
+			Target:    float64(definition.RequestedSessions),
+			Actual:    float64(actualSessions),
+			Available: true,
+		},
+		{
+			Metric:    "lock_waiters",
+			Target:    float64(targetWaiters),
+			Actual:    float64(actualWaiters),
+			Available: true,
+		},
+	}
+	if definition.ExpectedKind == "row_chain" {
+		result.Evidence = append(result.Evidence,
+			Evidence{
+				Metric:    "row_lock_chain_edges",
+				Target:    float64(len(definition.ExpectedEdges)),
+				Actual:    float64(len(matchedEdges)),
+				Available: true,
+			},
+			Evidence{
+				Metric:    "chain_depth",
+				Target:    float64(definition.RequestedChainDepth),
+				Actual:    float64(actualDepth),
+				Available: true,
+				Details: map[string]any{
+					"branch_lengths": append(
+						[]int(nil), definition.BranchLengths...,
+					),
+				},
+			},
+		)
+		if len(matchedEdges) == len(definition.ExpectedEdges) &&
+			actualWaiters == targetWaiters &&
+			actualDepth == definition.RequestedChainDepth {
+			result.Outcome = OutcomeSuccess
+			result.Message = "configured row wait topology observed"
+			return result
+		}
+		result.Message = "configured row wait topology was not fully observed"
+		return result
+	}
+	if actualWaiters == targetWaiters {
+		result.Outcome = OutcomeSuccess
+		result.Message = "configured lock waiters observed"
+		return result
+	}
+	result.Message = "configured lock waiters were not fully observed"
+	return result
+}
+
+func lockRoleMatches(applicationName, role string) bool {
+	return applicationName == role ||
+		strings.HasSuffix(applicationName, "/"+role)
 }
 
 func verifyRowChain(definition LockDefinition, evidence []LockEvidence) Result {

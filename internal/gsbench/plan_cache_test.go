@@ -217,7 +217,9 @@ func TestScenarioWorkloadStatementsCoverEveryRegisteredScenario(t *testing.T) {
 	}}
 	// These are the catalog entries backed by workload SQL in this stage. Later
 	// scenario-family tasks extend this list as they add their factories.
-	for _, code := range []ScenarioCode{101, 102, 103, 401, 402, 801} {
+	for _, code := range []ScenarioCode{
+		101, 102, 103, 401, 402, 501, 502, 503, 801,
+	} {
 		definition := DefaultScenarioCatalog().MustCode(code)
 		t.Run(definition.Name, func(t *testing.T) {
 			sqls, err := ScenarioWorkloadStatements(runtime, definition.Name)
@@ -230,6 +232,16 @@ func TestScenarioWorkloadStatementsCoverEveryRegisteredScenario(t *testing.T) {
 			for _, sqlText := range sqls {
 				if workloadBindMarkerRE.MatchString(sqlText) {
 					t.Fatalf("workload SQL contains bind marker: %s", sqlText)
+				}
+				if code >= 501 && code <= 503 {
+					upper := strings.ToUpper(strings.TrimSpace(sqlText))
+					if strings.HasPrefix(upper, "LOCK ") ||
+						strings.HasPrefix(upper, "ALTER ") {
+						t.Fatalf(
+							"non-explainable lock preflight SQL: %s",
+							sqlText,
+						)
+					}
 				}
 			}
 		})
