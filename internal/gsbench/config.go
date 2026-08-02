@@ -25,6 +25,8 @@ type Overrides struct {
 	TPWorkers     int
 	APWorkers     int
 	WorkMemKB     int64
+	Sessions      int
+	ChainDepth    int
 	Profile       string
 	DryRun        *bool
 	DatasetBytes  int64
@@ -66,6 +68,28 @@ type MemoryWorkloadConfig struct {
 	HashWorkMemKB int64
 }
 
+type LockWorkloadConfig struct {
+	RowChainSessions       int
+	RowChainDepth          int
+	TableExclusiveSessions int
+	DDLWaitSessions        int
+}
+
+func (c LockWorkloadConfig) For(
+	code ScenarioCode,
+) (sessions, depth int, ok bool) {
+	switch code {
+	case 501:
+		return c.RowChainSessions, c.RowChainDepth, true
+	case 502:
+		return c.TableExclusiveSessions, 1, true
+	case 503:
+		return c.DDLWaitSessions, 1, true
+	default:
+		return 0, 0, false
+	}
+}
+
 type DataConfig struct {
 	Schema                string
 	MaxSizeGB             int
@@ -105,6 +129,7 @@ type BenchConfig struct {
 	Run             RunConfig
 	FixedWorkers    FixedWorkerConfig
 	MemoryWorkloads MemoryWorkloadConfig
+	LockWorkloads   LockWorkloadConfig
 	Data            DataConfig
 	Safety          SafetyConfig
 	FaultProvider   FaultProviderConfig
@@ -226,6 +251,20 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 			),
 			HashWorkMemKB: hashWorkMemKB,
 		},
+		LockWorkloads: LockWorkloadConfig{
+			RowChainSessions: raw.GetInt(
+				"scenario.lock_row_chain.sessions", 2,
+			),
+			RowChainDepth: raw.GetInt(
+				"scenario.lock_row_chain.chain_depth", 1,
+			),
+			TableExclusiveSessions: raw.GetInt(
+				"scenario.lock_table_exclusive.sessions", 2,
+			),
+			DDLWaitSessions: raw.GetInt(
+				"scenario.lock_ddl_wait.sessions", 2,
+			),
+		},
 		Data: DataConfig{
 			Schema:             raw.GetString("data.schema", "gsbench"),
 			MaxSizeGB:          raw.GetInt("data.max_size_gb", 5),
@@ -265,6 +304,9 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 		)
 	}
 	if err := applyFixedWorkerOverrides(&cfg, overrides); err != nil {
+		return BenchConfig{}, err
+	}
+	if err := applyLockOverrides(&cfg, overrides); err != nil {
 		return BenchConfig{}, err
 	}
 	if overrides.Duration > 0 {
@@ -386,6 +428,44 @@ func validateFixedWorkerOverrideCompatibility(
 	return nil
 }
 
+func validateLockOverrideCompatibility(
+	codes []ScenarioCode,
+	sessions, chainDepth int,
+) error {
+	if sessions == 0 && chainDepth == 0 {
+		return nil
+	}
+	if sessions < 0 || chainDepth < 0 {
+		return fmt.Errorf("lock session counts and chain depth must be positive")
+	}
+	has501 := false
+	for _, code := range codes {
+		if code < 501 || code > 503 {
+			return fmt.Errorf(
+				"--sessions/--chain-depth require only scenarios 501-503",
+			)
+		}
+		if code == 501 {
+			has501 = true
+		}
+	}
+	if sessions > 0 && sessions < 2 {
+		return fmt.Errorf("--sessions must be at least 2")
+	}
+	if chainDepth > 5 {
+		return fmt.Errorf("--chain-depth must be between 1 and 5")
+	}
+	if chainDepth > 0 && !has501 {
+		return fmt.Errorf("--chain-depth requires scenario 501")
+	}
+	if sessions > 0 && chainDepth > 0 && sessions < chainDepth+1 {
+		return fmt.Errorf(
+			"scenario 501 requires sessions >= chain_depth + 1",
+		)
+	}
+	return nil
+}
+
 func applyFixedWorkerOverrides(cfg *BenchConfig, overrides Overrides) error {
 	if cfg == nil {
 		return fmt.Errorf("benchmark config is required")
@@ -430,6 +510,35 @@ func applyFixedWorkerOverrides(cfg *BenchConfig, overrides Overrides) error {
 	return nil
 }
 
+func applyLockOverrides(cfg *BenchConfig, overrides Overrides) error {
+	if cfg == nil {
+		return fmt.Errorf("benchmark config is required")
+	}
+	if err := validateLockOverrideCompatibility(
+		cfg.Run.ScenarioCodes,
+		overrides.Sessions,
+		overrides.ChainDepth,
+	); err != nil {
+		return err
+	}
+	if overrides.Sessions > 0 {
+		for _, code := range cfg.Run.ScenarioCodes {
+			switch code {
+			case 501:
+				cfg.LockWorkloads.RowChainSessions = overrides.Sessions
+			case 502:
+				cfg.LockWorkloads.TableExclusiveSessions = overrides.Sessions
+			case 503:
+				cfg.LockWorkloads.DDLWaitSessions = overrides.Sessions
+			}
+		}
+	}
+	if overrides.ChainDepth > 0 {
+		cfg.LockWorkloads.RowChainDepth = overrides.ChainDepth
+	}
+	return nil
+}
+
 func (c BenchConfig) Validate() error {
 	if !identifierRE.MatchString(c.Data.Schema) {
 		return fmt.Errorf("data.schema %q is not a safe SQL identifier", c.Data.Schema)
@@ -469,6 +578,7 @@ func (c BenchConfig) Validate() error {
 		switch code {
 		case 101, 102, 103, 201, 202:
 			fixedWorkerSelected = true
+		case 501, 502, 503:
 		default:
 			unbudgetedSelected = true
 		}
@@ -500,7 +610,23 @@ func (c BenchConfig) Validate() error {
 		c.MemoryWorkloads.HashWorkMemKB < minWorkMemKB {
 		return fmt.Errorf("memory workload work_mem must be at least %dkB", minWorkMemKB)
 	}
+	if c.LockWorkloads.RowChainSessions < 2 ||
+		c.LockWorkloads.TableExclusiveSessions < 2 ||
+		c.LockWorkloads.DDLWaitSessions < 2 {
+		return fmt.Errorf("lock workload sessions must be at least 2")
+	}
+	if c.LockWorkloads.RowChainDepth < 1 ||
+		c.LockWorkloads.RowChainDepth > 5 {
+		return fmt.Errorf("lock row chain depth must be between 1 and 5")
+	}
+	if c.LockWorkloads.RowChainSessions <
+		c.LockWorkloads.RowChainDepth+1 {
+		return fmt.Errorf(
+			"scenario 501 requires sessions >= chain_depth + 1",
+		)
+	}
 	selectedFixedWorkers := 0
+	selectedConnections := 0
 	addFixedWorkers := func(workers int) error {
 		if workers > c.Safety.MaxWorkers-selectedFixedWorkers {
 			return fmt.Errorf(
@@ -508,13 +634,24 @@ func (c BenchConfig) Validate() error {
 				c.Safety.MaxWorkers,
 			)
 		}
-		if workers > c.Safety.MaxConnections-selectedFixedWorkers {
+		if workers > c.Safety.MaxConnections-selectedConnections {
 			return fmt.Errorf(
 				"selected fixed workers exceed safety.max_connections %d",
 				c.Safety.MaxConnections,
 			)
 		}
 		selectedFixedWorkers += workers
+		selectedConnections += workers
+		return nil
+	}
+	addLockSessions := func(sessions int) error {
+		if sessions > c.Safety.MaxConnections-selectedConnections {
+			return fmt.Errorf(
+				"selected workload sessions exceed safety.max_connections %d",
+				c.Safety.MaxConnections,
+			)
+		}
+		selectedConnections += sessions
 		return nil
 	}
 	for _, code := range c.Run.ScenarioCodes {
@@ -540,6 +677,18 @@ func (c BenchConfig) Validate() error {
 			}
 		case 202:
 			if err := addFixedWorkers(c.MemoryWorkloads.HashWorkers); err != nil {
+				return err
+			}
+		case 501:
+			if err := addLockSessions(c.LockWorkloads.RowChainSessions); err != nil {
+				return err
+			}
+		case 502:
+			if err := addLockSessions(c.LockWorkloads.TableExclusiveSessions); err != nil {
+				return err
+			}
+		case 503:
+			if err := addLockSessions(c.LockWorkloads.DDLWaitSessions); err != nil {
 				return err
 			}
 		}

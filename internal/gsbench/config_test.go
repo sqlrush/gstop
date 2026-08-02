@@ -172,6 +172,14 @@ func TestConfigLoadsDefaultsAndDurations(t *testing.T) {
 	}) {
 		t.Fatalf("memory workload defaults = %+v", cfg.MemoryWorkloads)
 	}
+	if cfg.LockWorkloads != (LockWorkloadConfig{
+		RowChainSessions:       2,
+		RowChainDepth:          1,
+		TableExclusiveSessions: 2,
+		DDLWaitSessions:        2,
+	}) {
+		t.Fatalf("lock workload defaults = %+v", cfg.LockWorkloads)
+	}
 	if got := cfg.Run.ScenarioCodes; !reflect.DeepEqual(got, []ScenarioCode{101}) {
 		t.Fatalf("scenario codes = %v", got)
 	}
@@ -233,6 +241,33 @@ work_mem = 1GB
 	}
 	if cfg.MemoryWorkloads != want {
 		t.Fatalf("memory workloads=%+v want=%+v", cfg.MemoryWorkloads, want)
+	}
+}
+
+func TestConfigLoadsLockWorkloadScenarioSettings(t *testing.T) {
+	body := minimalConfig() + `
+[scenario.lock_row_chain]
+sessions = 10
+chain_depth = 3
+
+[scenario.lock_table_exclusive]
+sessions = 8
+
+[scenario.lock_ddl_wait]
+sessions = 6
+`
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := LockWorkloadConfig{
+		RowChainSessions:       10,
+		RowChainDepth:          3,
+		TableExclusiveSessions: 8,
+		DDLWaitSessions:        6,
+	}
+	if cfg.LockWorkloads != want {
+		t.Fatalf("lock workloads=%+v want=%+v", cfg.LockWorkloads, want)
 	}
 }
 
@@ -325,6 +360,41 @@ work_mem = 512MB
 	}
 }
 
+func TestConfigLockOverridesFollowFinalScenarios(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 501,503",
+		1,
+	) + `
+[scenario.lock_row_chain]
+sessions = 4
+chain_depth = 2
+
+[scenario.lock_table_exclusive]
+sessions = 3
+
+[scenario.lock_ddl_wait]
+sessions = 5
+`
+	configured, err := LoadConfig(writeTestConfig(t, body), Overrides{
+		Sessions:   10,
+		ChainDepth: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := LockWorkloadConfig{
+		RowChainSessions:       10,
+		RowChainDepth:          3,
+		TableExclusiveSessions: 3,
+		DDLWaitSessions:        10,
+	}
+	if configured.LockWorkloads != want {
+		t.Fatalf("lock overrides=%+v want=%+v", configured.LockWorkloads, want)
+	}
+}
+
 func TestCLIConfigOverridesPropagateMemoryTuning(t *testing.T) {
 	options := CLIOptions{
 		ScenarioCodes: []ScenarioCode{201, 202},
@@ -346,6 +416,34 @@ func TestCLIConfigOverridesPropagateMemoryTuning(t *testing.T) {
 		overrides.DatasetBytes != options.DatasetBytes ||
 		overrides.DatasetSize != options.DatasetSize {
 		t.Fatalf("CLI overrides were not propagated: options=%+v overrides=%+v", options, overrides)
+	}
+}
+
+func TestCLIConfigOverridesPropagateLockTuning(t *testing.T) {
+	options := CLIOptions{
+		ScenarioCodes: []ScenarioCode{501},
+		Sessions:      10,
+		ChainDepth:    3,
+	}
+	overrides := configOverridesFromCLI(options)
+	if !reflect.DeepEqual(overrides.ScenarioCodes, options.ScenarioCodes) ||
+		overrides.Sessions != options.Sessions ||
+		overrides.ChainDepth != options.ChainDepth {
+		t.Fatalf("CLI lock overrides were not propagated: options=%+v overrides=%+v", options, overrides)
+	}
+}
+
+func TestConfigRejectsLockOverridesIncompatibleWithFinalScenarios(t *testing.T) {
+	path := writeTestConfig(t, minimalConfig())
+	for _, override := range []Overrides{
+		{ScenarioCodes: []ScenarioCode{101}, Sessions: 2},
+		{ScenarioCodes: []ScenarioCode{502}, ChainDepth: 2},
+		{ScenarioCodes: []ScenarioCode{501, 504}, Sessions: 3},
+		{ScenarioCodes: []ScenarioCode{501}, Sessions: 2, ChainDepth: 2},
+	} {
+		if _, err := LoadConfig(path, override); err == nil {
+			t.Fatalf("accepted incompatible lock override %+v", override)
+		}
 	}
 }
 
@@ -425,6 +523,64 @@ func TestConfigValidatesFixedWorkerTotalsAgainstBothHardCaps(t *testing.T) {
 	}
 }
 
+func TestConfigValidatesLockSessionTotalsAgainstConnectionCap(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		scenarios string
+		settings  string
+		maxConns  int
+	}{
+		{
+			name:      "two lock scenarios exceed cap",
+			scenarios: "501,502",
+			settings: "[scenario.lock_row_chain]\nsessions = 4\nchain_depth = 2\n" +
+				"[scenario.lock_table_exclusive]\nsessions = 4\n",
+			maxConns: 7,
+		},
+		{
+			name:      "fixed worker and lock sessions exceed cap",
+			scenarios: "101,501",
+			settings: "[scenario.tp_cpu]\nworkers = 2\n" +
+				"[scenario.lock_row_chain]\nsessions = 4\nchain_depth = 2\n",
+			maxConns: 5,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := strings.Replace(
+				minimalConfig(),
+				"scenarios = tp_cpu",
+				"scenarios = "+test.scenarios,
+				1,
+			) + "\n[safety]\nmax_workers = 20\nmax_connections = " +
+				strconv.Itoa(test.maxConns) + "\n" + test.settings
+			_, err := LoadConfig(writeTestConfig(t, body), Overrides{})
+			if err == nil || !strings.Contains(err.Error(), "max_connections") {
+				t.Fatalf("connection-cap error=%v", err)
+			}
+		})
+	}
+}
+
+func TestConfigDoesNotCountLockSessionsAsWorkers(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 501",
+		1,
+	) + `
+[safety]
+max_workers = 1
+max_connections = 4
+
+[scenario.lock_row_chain]
+sessions = 4
+chain_depth = 2
+`
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+		t.Fatalf("lock sessions incorrectly consumed worker budget: %v", err)
+	}
+}
+
 func TestConfigRejectsFixedWorkersCombinedWithUnbudgetedScenarios(t *testing.T) {
 	for _, scenarios := range []string{"101,203", "201,203", "202,301"} {
 		body := strings.Replace(
@@ -468,6 +624,30 @@ func TestConfigRejectsInvalidMemoryWorkloadSettings(t *testing.T) {
 				(!strings.Contains(err.Error(), "workers") &&
 					!strings.Contains(err.Error(), "work_mem")) {
 				t.Fatalf("invalid memory setting error=%v", err)
+			}
+		})
+	}
+}
+
+func TestConfigRejectsInvalidLockWorkloadSettings(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		settings string
+	}{
+		{name: "row chain sessions below two", settings: "[scenario.lock_row_chain]\nsessions = 1\n"},
+		{name: "row chain depth below one", settings: "[scenario.lock_row_chain]\nchain_depth = 0\n"},
+		{name: "row chain depth above five", settings: "[scenario.lock_row_chain]\nsessions = 7\nchain_depth = 6\n"},
+		{name: "row chain depth exceeds waiter count", settings: "[scenario.lock_row_chain]\nsessions = 2\nchain_depth = 2\n"},
+		{name: "table sessions below two", settings: "[scenario.lock_table_exclusive]\nsessions = 1\n"},
+		{name: "DDL sessions below two", settings: "[scenario.lock_ddl_wait]\nsessions = 1\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := LoadConfig(
+				writeTestConfig(t, minimalConfig()+"\n"+test.settings),
+				Overrides{},
+			)
+			if err == nil {
+				t.Fatalf("accepted invalid lock settings %q", test.settings)
 			}
 		})
 	}

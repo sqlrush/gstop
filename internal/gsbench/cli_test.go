@@ -343,6 +343,65 @@ func TestParseCLIArgsSupportsMemoryWorkloadOverrides(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsSupportsLockWorkloadOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		args       []string
+		sessions   int
+		chainDepth int
+	}{
+		{
+			name:       "501 sessions and depth",
+			args:       []string{"run", "501", "--sessions=10", "--chain-depth=3"},
+			sessions:   10,
+			chainDepth: 3,
+		},
+		{
+			name:     "502 sessions",
+			args:     []string{"run", "502", "--sessions=8"},
+			sessions: 8,
+		},
+		{
+			name:       "shared lock family override",
+			args:       []string{"run", "501,503", "--sessions=6", "--chain-depth=2"},
+			sessions:   6,
+			chainDepth: 2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options, err := ParseCLIArgs(test.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if options.Sessions != test.sessions ||
+				options.ChainDepth != test.chainDepth {
+				t.Fatalf("options=%+v", options)
+			}
+		})
+	}
+}
+
+func TestParseCLIArgsRejectsInvalidLockWorkloadOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "one session", args: []string{"run", "501", "--sessions=1"}},
+		{name: "depth exceeds sessions", args: []string{"run", "501", "--sessions=2", "--chain-depth=2"}},
+		{name: "zero depth", args: []string{"run", "501", "--chain-depth=0"}},
+		{name: "depth above five", args: []string{"run", "501", "--chain-depth=6"}},
+		{name: "depth on 502", args: []string{"run", "502", "--chain-depth=2"}},
+		{name: "sessions on CPU scenario", args: []string{"run", "101", "--sessions=2"}},
+		{name: "non-run command", args: []string{"doctor", "--sessions=2"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ParseCLIArgs(test.args); err == nil {
+				t.Fatalf("ParseCLIArgs(%v) accepted invalid lock override", test.args)
+			}
+		})
+	}
+}
+
 func TestParseCLIArgsRejectsInvalidMemoryWorkloadOverrides(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -419,6 +478,22 @@ func TestCLIHelpDocumentsFixedWorkerParameters(t *testing.T) {
 		"--workers N", "--work-mem VALUE", "--tp-workers N", "--ap-workers N",
 		"gsbench run 101 --workers", "gsbench run 103 --tp-workers",
 		"gsbench run 201 --workers", "gsbench run 202 --workers",
+	} {
+		if !strings.Contains(stdout.String(), token) {
+			t.Errorf("help missing %q:\n%s", token, stdout.String())
+		}
+	}
+}
+
+func TestCLIHelpDocumentsLockWorkloadParameters(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := RunCLI(context.Background(), []string{"help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	for _, token := range []string{
+		"--sessions N", "--chain-depth N",
+		"gsbench run 501 --sessions", "gsbench run 502 --sessions",
+		"gsbench run 503 --sessions",
 	} {
 		if !strings.Contains(stdout.String(), token) {
 			t.Errorf("help missing %q:\n%s", token, stdout.String())

@@ -42,6 +42,8 @@ type CLIOptions struct {
 	TPWorkers     int
 	APWorkers     int
 	WorkMemKB     int64
+	Sessions      int
+	ChainDepth    int
 	Profile       string
 	DryRun        bool
 	WithData      bool
@@ -124,6 +126,8 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	flags.IntVar(&options.TPWorkers, "tp-workers", 0, "fixed TP workers for scenario 103")
 	flags.IntVar(&options.APWorkers, "ap-workers", 0, "fixed AP workers for scenario 103")
 	flags.StringVar(&workMemText, "work-mem", "", "work_mem for scenarios 201/202 (kB, MB, or GB)")
+	flags.IntVar(&options.Sessions, "sessions", 0, "total holder plus waiter sessions for scenarios 501-503")
+	flags.IntVar(&options.ChainDepth, "chain-depth", 0, "row wait chain depth for scenario 501 (1-5)")
 	flags.StringVar(&options.Profile, "profile", "", "data profile")
 	flags.BoolVar(&options.DryRun, "dry-run", false, "show actions without mutation")
 	flags.BoolVar(&options.WithData, "data", false, "include benchmark data")
@@ -145,6 +149,8 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	tpWorkersSet := false
 	apWorkersSet := false
 	workMemSet := false
+	sessionsSet := false
+	chainDepthSet := false
 	flags.Visit(func(value *flag.Flag) {
 		switch value.Name {
 		case "size":
@@ -159,11 +165,16 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 			apWorkersSet = true
 		case "work-mem":
 			workMemSet = true
+		case "sessions":
+			sessionsSet = true
+		case "chain-depth":
+			chainDepthSet = true
 		}
 	})
 	workerOverrideSet := workersSet || tpWorkersSet || apWorkersSet
-	if (workerOverrideSet || workMemSet) && command != "run" {
-		return CLIOptions{}, fmt.Errorf("worker and work_mem overrides are only valid with run")
+	lockOverrideSet := sessionsSet || chainDepthSet
+	if (workerOverrideSet || workMemSet || lockOverrideSet) && command != "run" {
+		return CLIOptions{}, fmt.Errorf("workload overrides are only valid with run")
 	}
 	if (workersSet && options.Workers <= 0) ||
 		(tpWorkersSet && options.TPWorkers <= 0) ||
@@ -175,6 +186,12 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	}
 	if workersSet && (tpWorkersSet || apWorkersSet) {
 		return CLIOptions{}, fmt.Errorf("--workers cannot be combined with --tp-workers or --ap-workers")
+	}
+	if sessionsSet && options.Sessions < 2 {
+		return CLIOptions{}, fmt.Errorf("--sessions must be at least 2")
+	}
+	if chainDepthSet && (options.ChainDepth < 1 || options.ChainDepth > 5) {
+		return CLIOptions{}, fmt.Errorf("--chain-depth must be between 1 and 5")
 	}
 	if workMemSet {
 		workMemKB, err := ParseWorkMemKB(workMemText)
@@ -248,6 +265,15 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 			options.TPWorkers,
 			options.APWorkers,
 			options.WorkMemKB,
+		); err != nil {
+			return CLIOptions{}, err
+		}
+	}
+	if lockOverrideSet && len(options.ScenarioCodes) > 0 {
+		if err := validateLockOverrideCompatibility(
+			options.ScenarioCodes,
+			options.Sessions,
+			options.ChainDepth,
 		); err != nil {
 			return CLIOptions{}, err
 		}
@@ -410,6 +436,9 @@ func printUsage(w io.Writer) {
   gsbench run 103 --tp-workers N --ap-workers N --duration DURATION
   gsbench run 201 --workers N --work-mem VALUE --duration DURATION
   gsbench run 202 --workers N --work-mem VALUE --duration DURATION
+  gsbench run 501 --sessions N --chain-depth N --duration DURATION
+  gsbench run 502 --sessions N --duration DURATION
+  gsbench run 503 --sessions N --duration DURATION
   gsbench restore [--run-id RUN_ID]
 	gsbench cleanup [--data]
   gsbench init --size 100GB
@@ -422,6 +451,8 @@ Options:
       --tp-workers N     fixed TP workers for scenario 103 (use with --ap-workers)
       --ap-workers N     fixed AP workers for scenario 103 (use with --tp-workers)
       --work-mem VALUE   work_mem for scenarios 201/202: integer kB, MB, or GB (minimum 64kB)
+      --sessions N       total holder plus waiter sessions for scenarios 501-503
+      --chain-depth N    row wait chain depth for scenario 501 (1-5, default 1)
       --profile VALUE    data profile: quick or stress
       --dry-run          validate and show actions without workload mutation
       --run-id ID        select one run for status, stop, or restore; cannot combine with cleanup --data

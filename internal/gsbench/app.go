@@ -53,6 +53,7 @@ func configOverridesFromCLI(options CLIOptions) Overrides {
 		ScenarioCodes: options.ScenarioCodes, Duration: options.Duration,
 		Workers: options.Workers, TPWorkers: options.TPWorkers,
 		APWorkers: options.APWorkers, WorkMemKB: options.WorkMemKB,
+		Sessions: options.Sessions, ChainDepth: options.ChainDepth,
 		Profile: options.Profile, DatasetBytes: options.DatasetBytes,
 		DatasetSize: options.DatasetSize,
 	}
