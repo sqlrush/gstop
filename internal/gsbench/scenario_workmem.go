@@ -102,6 +102,14 @@ func (s *workMemScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if err != nil {
 		return err
 	}
+	if rt.Log != nil && !calibrated.TargetMet {
+		rt.Log.Warn(
+			"scenario=%s work_mem calibration target=70%%..97%% not reached requested=%dkB observed=%dkB observed_percent=%.2f calibrated_range=1..%d attempts=%d continuing_with_best_non_spilling_range=true",
+			s.Name(), s.targetKB, calibrated.Observation.UsedKB,
+			workMemObservedPercent(calibrated.Observation.UsedKB, s.targetKB),
+			calibrated.RangeEnd, calibrated.Attempts,
+		)
+	}
 	s.ready = make(chan int, s.workers)
 	operation, cleanup, err := workMemWorkerOperations(
 		s.kind,
@@ -129,9 +137,11 @@ func (s *workMemScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	}
 	if rt.Log != nil {
 		rt.Log.Info(
-			"scenario=%s workers=%d duration=%s work_mem=%dkB calibrated_range=1..%d operator_memory=%dkB operator_count=%d attempts=%d spill=false query_timeout=disabled",
+			"scenario=%s workers=%d duration=%s work_mem=%dkB calibrated_range=1..%d operator_memory=%dkB observed_percent=%.2f target_met=%t operator_count=%d attempts=%d spill=false query_timeout=disabled",
 			s.Name(), s.workers, rt.Config.Run.Duration, s.targetKB,
 			s.calibrated.RangeEnd, s.calibrated.Observation.UsedKB,
+			workMemObservedPercent(s.calibrated.Observation.UsedKB, s.targetKB),
+			s.calibrated.TargetMet,
 			s.calibrated.Observation.OperatorCount, s.calibrated.Attempts,
 		)
 	}
@@ -235,9 +245,22 @@ func (s *workMemScenario) calibrationEvidence() []Evidence {
 				"total_used_kb":  observation.TotalUsedKB,
 				"spilled":        observation.Spilled,
 				"batches":        observation.Batches,
+				"target_met":     s.calibrated.TargetMet,
+				"observed_percent": workMemObservedPercent(
+					observation.UsedKB, s.targetKB,
+				),
+				"target_lower_percent": workMemCalibrationLowerPercent,
+				"target_upper_percent": workMemCalibrationUpperPercent,
 			},
 		},
 	}
+}
+
+func workMemObservedPercent(usedKB, targetKB int64) float64 {
+	if targetKB <= 0 {
+		return 0
+	}
+	return float64(usedKB) * 100 / float64(targetKB)
 }
 
 func (s *workMemScenario) Stop(ctx context.Context, _ *Runtime) error {

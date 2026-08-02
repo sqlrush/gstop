@@ -49,6 +49,18 @@ func TestRunLogRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestRunLogWritesWarnLevel(t *testing.T) {
+	var screen bytes.Buffer
+	logger, err := NewRunLog(&screen, "", "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.Warn("calibration target missed")
+	if !strings.Contains(screen.String(), "WARN calibration target missed") {
+		t.Fatalf("screen=%q want WARN record", screen.String())
+	}
+}
+
 func TestRunLogPathTrimsIdentityAndStaysUnderConfigLogs(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "release", "configs")
 	got, err := runLogPath(configDir, "  run-1  ")

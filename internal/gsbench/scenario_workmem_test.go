@@ -412,6 +412,32 @@ func TestCalibrateWorkMemRangeFailsWithoutNonSpillingObservation(t *testing.T) {
 	}
 }
 
+func TestWorkMemCalibrationEvidenceReportsTargetMiss(t *testing.T) {
+	scenario := &workMemScenario{
+		kind:     workMemSort,
+		targetKB: 256 * 1024,
+		calibrated: workMemCalibration{
+			RangeEnd: 3455,
+			Attempts: 13,
+			Observation: workMemObservation{
+				UsedKB: 47095, TotalUsedKB: 47095, OperatorCount: 1,
+			},
+		},
+	}
+	details := scenario.calibrationEvidence()[0].Details
+	if details["target_met"] != false {
+		t.Fatalf("details=%v want target_met=false", details)
+	}
+	observedPercent, ok := details["observed_percent"].(float64)
+	if !ok || observedPercent < 17.9 || observedPercent > 18.0 {
+		t.Fatalf("observed_percent=%v want about 17.97", details["observed_percent"])
+	}
+	if details["target_lower_percent"] != int64(70) ||
+		details["target_upper_percent"] != int64(97) {
+		t.Fatalf("details=%v want target band 70..97", details)
+	}
+}
+
 func TestWorkMemWorkerHoldsOneCalibratedCursorUntilCancellation(t *testing.T) {
 	state := &resourceExecTestState{}
 	conn := openResourceExecTestConn(t, state)
