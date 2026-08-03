@@ -44,6 +44,10 @@ type Mutation struct {
 	InverseSessionSQL []string
 	VerifySQL         string
 	VerifyValue       string
+	// SkipInverseWhenRestored is reserved for inverse operations that are not
+	// safe to execute when the forward action never ran (for example CREATE
+	// INDEX when the original index is still present).
+	SkipInverseWhenRestored bool
 }
 
 // JournalEntry remains as a source-compatibility data shape for callers that
@@ -163,6 +167,23 @@ func (j *Journal) restoreActions(ctx context.Context, actions []Action) error {
 		}
 		if !claimed {
 			continue
+		}
+		// A crash can leave a skip-marked action planned before the forward
+		// mutation, or restoring/restore_failed after its inverse completed but
+		// before the restored state was persisted. When baseline verification
+		// already succeeds, repeating that non-idempotent inverse would create a
+		// new mutation instead of restoring one.
+		if actionSkipsPlannedInverseWhenRestored(action) {
+			if err := j.exec.VerifyRestored(ctx, action); err == nil {
+				if err := j.setActionState(
+					ctx, action, MutationRestored, "",
+				); err != nil {
+					errs = append(errs, fmt.Errorf(
+						"mark action %d restored: %w", action.Sequence, err,
+					))
+				}
+				continue
+			}
 		}
 		if err := j.exec.Restore(ctx, action); err != nil {
 			errs = append(errs, j.markRestoreFailed(ctx, action, "restore", err))

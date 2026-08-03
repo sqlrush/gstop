@@ -351,6 +351,19 @@ func (d *Database) execMaintenance(
 func (d *Database) ExecSession(parent context.Context, statements ...string) error {
 	ctx, cancel := d.operationContext(parent)
 	defer cancel()
+	return d.execSession(ctx, statements...)
+}
+
+func (d *Database) ExecMaintenanceSession(
+	parent context.Context,
+	statements ...string,
+) error {
+	ctx, cancel := d.maintenanceContext(parent)
+	defer cancel()
+	return d.execSession(ctx, statements...)
+}
+
+func (d *Database) execSession(ctx context.Context, statements ...string) error {
 	conn, err := d.pool.Conn(ctx)
 	if err != nil {
 		return err

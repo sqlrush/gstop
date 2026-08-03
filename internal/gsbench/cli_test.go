@@ -176,7 +176,7 @@ func TestCLIVersionPrintsAuthor(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Author: WangYingJie <sqlrush@gmail.com>") {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.2\n") {
+	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.3\n") {
 		t.Fatalf("version=%q", stdout.String())
 	}
 }
@@ -361,6 +361,8 @@ func TestParseCLIArgsRejectsInvalidThreePhasePlanCommands(t *testing.T) {
 		{name: "fault worker", args: []string{"run", "601", "fault", "--worker", "1"}, want: "does not accept"},
 		{name: "recover duration", args: []string{"run", "601", "recover", "--duration", "1m"}, want: "does not accept"},
 		{name: "worker aliases together", args: []string{"run", "601", "init", "--worker", "1", "--workers", "1", "--duration", "1m"}, want: "cannot be combined"},
+		{name: "plan run id", args: []string{"run", "601", "fault", "--run-id", "manual"}, want: "does not accept --run-id"},
+		{name: "plan dry run", args: []string{"run", "605", "fault", "--dry-run"}, want: "does not support --dry-run"},
 		{name: "singular worker non plan", args: []string{"run", "101", "--worker", "1"}, want: "only valid for scenarios 601-606"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -841,6 +843,19 @@ func TestVerifyRestorePlanBaselineSkipsNonPlanActions(t *testing.T) {
 		[]Action{action},
 	); err != nil {
 		t.Fatalf("non-plan restore checked plan baseline: %v", err)
+	}
+}
+
+func TestVerifyRestorePlanBaselineHonorsDisabledValidation(t *testing.T) {
+	backend := &databaseRestoreBackend{
+		cfg: BenchConfig{Run: RunConfig{ValidationEnabled: false}},
+	}
+	action := Action{ScenarioCode: 601}
+	if err := backend.verifyPlanBaselineForActions(
+		context.Background(),
+		[]Action{action},
+	); err != nil {
+		t.Fatalf("disabled validation checked plan baseline: %v", err)
 	}
 }
 

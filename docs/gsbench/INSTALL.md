@@ -1,6 +1,6 @@
-# gsbench v1.1.1 Linux ARM64 安装与操作手册
+# gsbench v1.1.3 Linux ARM64 安装与操作手册
 
-本文适用于 `gsbench v1.1.1` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
+本文适用于 `gsbench v1.1.3` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
 
 ## 1. 安装
 
@@ -13,8 +13,8 @@ uname -m
 输出应为 `aarch64` 或 `arm64`。将发布包复制到测试主机后执行：
 
 ```sh
-tar -xzf gsbench-v1.1.1-linux-arm64-20260801.tar.gz
-cd gsbench-v1.1.1-linux-arm64-20260801
+tar -xzf gsbench-v1.1.3-linux-arm64-20260803.tar.gz
+cd gsbench-v1.1.3-linux-arm64-20260803
 sha256sum -c SHA256SUMS
 chmod 0755 bin/gsbench
 chmod 0600 configs/gsbench.cfg
@@ -24,7 +24,7 @@ file bin/gsbench
 ./bin/gsbench scenarios
 ```
 
-`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.1`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
+`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.3`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
 
 ## 2. 配置数据库连接
 
@@ -86,11 +86,26 @@ GSBENCH_CFG="$PWD/configs/gsbench.cfg"
 ./bin/gsbench status --config "$GSBENCH_CFG"
 ```
 
-`-d` 是包含 ramp 与 hold 的总时长。601–606 会修改同一组执行计划状态，每次只能选择一个并逐个串行运行；配置层会拒绝将其中两个或更多放进同一次 run。
+`-d` 是普通场景包含 ramp 与 hold 的总时长。
+
+601–606 改用两个终端、三个阶段的命令。以 601 为例：
+
+```sh
+# 终端一：持续造流
+./bin/gsbench run 601 init --worker 10 --duration 1m --config "$GSBENCH_CFG"
+
+# 终端二：等终端一显示 RUNNING 后执行
+./bin/gsbench run 601 fault --config "$GSBENCH_CFG"
+./bin/gsbench run 601 recover --config "$GSBENCH_CFG"
+```
+
+602–606 只需将三条命令换成同一编号。这六个场景会修改同一组执行计划状态，一次只能运行一个。`--duration` 从终端一显示 `RUNNING`、worker 开始造流时计时，不包含此前的基线准备时间，并需覆盖故障与恢复观察时间；在终端一第一次按 Ctrl+C 会立即停止流量并退出。
+
+`fault` 必须在同编号 `init` 仍存活时执行，它同步完成一次故障注入后退出。`recover` 同步、幂等地恢复同编号场景后退出；即使 `init` 已因 duration 到期或 Ctrl+C 退出，仍可执行 `recover`。
 
 ## 4. 恢复与清理
 
-每次 `run` 返回前都会调用统一恢复协调器。看到 `RESTORE_FAILED`、stale run，或运行被异常中断时，按以下顺序处理：
+普通场景的 `run` 返回前会调用统一恢复协调器；601–606 的故障使用同编号 `run <code> recover` 恢复。看到 `RESTORE_FAILED`、stale run，或普通场景被异常中断时，按以下顺序处理：
 
 ```sh
 ./bin/gsbench restore --config "$GSBENCH_CFG" --dry-run
@@ -118,7 +133,7 @@ GSBENCH_CFG="$PWD/configs/gsbench.cfg"
 validation_enabled = false
 ```
 
-这只关闭模型预估、场景结果门槛和数据布局一致性校验，不会关闭容量与物理大小检查、未知数据库版本拒绝、真实 DDL/DML/负载错误，也不会关闭恢复锁、journal/ledger 持久化、逆操作和恢复安全边界。关闭验证不能把真实失败变成成功。
+这只关闭模型预估、场景结果门槛、数据布局一致性和执行计划形态校验，不会关闭容量与物理大小检查、未知数据库版本拒绝、真实 DDL/DML/负载错误，也不会关闭恢复锁、journal/ledger 持久化、逆操作、计划基线修复和其他恢复安全边界。关闭验证不能把真实失败变成成功。
 
 需要严格验收负载目标时，将其设为 `true`；此时未取得严格证据的运行不能算目标通过。
 
@@ -153,4 +168,4 @@ GSBENCH_E2E_CFG=/absolute/path/gsbench-e2e.cfg
 
 应以 gsbench 输出的物理大小证据确认结果，而不能只按估算行数判断。完整的 65 场景串行运行、gstop 同步采样、19–21 GiB 判定和安全清理流程见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
 
-本手册描述的是目标 Linux/GaussDB 环境中的执行方法；当前 macOS 构建环境未完成 GaussDB live 连接、20 GiB 初始化或全场景负载验收。编译和单元测试通过不能替代现场 live 验证。
+本版本已在本地 `og5` openGauss 容器及既有 100GB 数据集上完成 601 的 `init → fault → recover` 实测；这不替代客户目标版本、拓扑和数据规模上的现场验证。

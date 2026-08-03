@@ -86,6 +86,14 @@ func (t *planTraffic) Run(
 	ctx context.Context,
 	duration time.Duration,
 ) (WorkerSnapshot, error) {
+	return t.RunWithReady(ctx, duration, nil)
+}
+
+func (t *planTraffic) RunWithReady(
+	ctx context.Context,
+	duration time.Duration,
+	onReady func(context.Context) error,
+) (WorkerSnapshot, error) {
 	if t == nil || t.workload == nil {
 		return WorkerSnapshot{}, fmt.Errorf("plan traffic is unavailable")
 	}
@@ -103,6 +111,15 @@ func (t *planTraffic) Run(
 	if err := t.workload.WaitReady(ctx, t.workers); err != nil {
 		_ = t.stop()
 		return t.workload.Snapshot(), err
+	}
+	if onReady != nil {
+		if err := onReady(ctx); err != nil {
+			_ = t.stop()
+			return t.workload.Snapshot(), fmt.Errorf(
+				"announce plan traffic readiness: %w",
+				err,
+			)
+		}
 	}
 	deadline := time.Now().Add(duration)
 	if err := t.workload.SetRunDeadline(deadline); err != nil {

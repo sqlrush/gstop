@@ -1544,10 +1544,10 @@ func journalInsertStatement(schema string) string {
 		target_node,target_endpoint,original_state,forward_action,
 		inverse_action,verify_action,verify_value,state,last_error
 	)
-	SELECT $1,COALESCE(max(j.action_id),0)+1,
+	SELECT CAST($1 AS varchar(96)),COALESCE(max(j.action_id),0)+1,
 		$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
 	FROM ` + table + ` j
-	WHERE j.run_id=$1
+	WHERE j.run_id=CAST($1 AS varchar(96))
 	RETURNING action_id`
 }
 
@@ -1774,10 +1774,19 @@ type actionSQLSessionDatabase interface {
 type dbActionExecutor struct{ db actionSQLDatabase }
 
 type sqlActionPayload struct {
-	SQL        string   `json:"sql,omitempty"`
-	SessionSQL []string `json:"session_sql,omitempty"`
-	Expected   string   `json:"expected,omitempty"`
-	Comparison string   `json:"comparison,omitempty"`
+	SQL                     string   `json:"sql,omitempty"`
+	SessionSQL              []string `json:"session_sql,omitempty"`
+	Expected                string   `json:"expected,omitempty"`
+	Comparison              string   `json:"comparison,omitempty"`
+	SkipInverseWhenRestored bool     `json:"skip_inverse_when_restored,omitempty"`
+}
+
+func actionSkipsPlannedInverseWhenRestored(action Action) bool {
+	if len(action.Verify) == 0 {
+		return false
+	}
+	payload, err := decodeSQLActionPayload(action.Verify)
+	return err == nil && payload.SkipInverseWhenRestored
 }
 
 func (e dbActionExecutor) Preflight(_ context.Context, action Action) error {

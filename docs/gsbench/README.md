@@ -59,23 +59,32 @@ gsbench run -s 301,321 -d 2m
 gsbench run -s 501,504 -d 2m
 gsbench run -s 520 -d 2m
 
-# 执行计划变化与硬解析
-gsbench run -s 601 -d 2m
-gsbench run -s 605 -d 2m
+# 执行计划变化：终端一持续造流
+gsbench run 601 init --worker 10 --duration 1m
+
+# 终端二：等同编号 init 进入 RUNNING 后注入并恢复
+gsbench run 601 fault
+gsbench run 601 recover
+
+# 硬解析
 gsbench run -s 621,624 -d 2m
 ```
 
-601–606 会修改同一组 `plan_data` 计划状态，必须每次只选择一个并逐个串行运行；配置层会拒绝在同一次 run 中组合其中两个或更多场景。
+601–606 会修改同一组 `plan_data` 计划状态，一次只能运行一个场景；602–606 使用时只需将上述三条命令换成同一编号。`init` 在终端一中使用固定 worker 持续造流；`--duration` 从终端一显示 `RUNNING`、worker 开始造流时计时，不包含此前的基线准备时间，并需覆盖故障与恢复观察时间。第一次 Ctrl+C 会立即停止流量并退出 `init`，不需要再输入一次。
 
-`run` 也接受完整名称和逗号组合，例如 `gsbench run -s io_sequential_read,network_client_egress -d 2m`。101–103、201–202 是可精确预算的固定 worker 场景，不能与其他并发模型的场景放在同一次运行中；201/202 使用命令行 worker/work_mem 覆盖时一次只能选择其中一个。
+`fault` 必须在同编号 `init` 仍存活时执行；它同步完成一次故障注入后退出，不会停止终端一的流量。`recover` 同步、幂等地恢复同编号场景后退出；即使 `init` 已因 duration 到期或 Ctrl+C 退出，仍可单独执行 `recover`。
+
+六个场景的故障动作、状态和异常恢复说明见[601–606 三阶段执行计划跳变手册](PLAN_601_606_CN.md)。
+
+`run` 也接受完整名称和逗号组合，例如 `gsbench run -s io_sequential_read,network_client_egress -d 2m`；601–606 的三阶段语法除外。101–103、201–202 是可精确预算的固定 worker 场景，不能与其他并发模型的场景放在同一次运行中；201/202 使用命令行 worker/work_mem 覆盖时一次只能选择其中一个。
 
 201/202 会先用 `sort_data` 自动标定有界工作集，只接受实际 Sort/Hash 内存达到输入 `work_mem` 的 90%–97% 且不落盘的结果。随后每个 worker 建立一个服务端游标并完成首次 `FETCH`；所有 worker 就绪后才开始计算 `--duration`。第一次 Ctrl+C 会立即结束本地进程，数据库通过连接断开释放对应事务和游标；之后可执行 `gsbench restore --run-id RUN_ID` 收敛运行状态。
 
 ## 生命周期与恢复
 
-推荐顺序是 `scenarios`、`doctor`、`init --dry-run`、`init`、`run --dry-run`、`run`、`status`。发布配置默认 `run.validation_enabled=false`，运行按 `preflight → prepare → ramp → hold → stop → restore` 执行；改为 `true` 后增加计划/场景验证和恢复结果验证阶段。新的变更型运行会先恢复 stale run。
+推荐顺序是 `scenarios`、`doctor`、`init --dry-run`、`init`、`run --dry-run`、`run`、`status`。发布配置默认 `run.validation_enabled=false`，普通场景按 `preflight → prepare → ramp → hold → stop → restore` 执行；601–606 改用上述 `init → fault → recover` 三阶段。改为 `true` 后增加计划/场景验证和恢复结果验证阶段。新的变更型运行会先恢复 stale run。
 
-`gsbench restore` 是所有场景共用的恢复入口。无 `--run-id` 时，它发现全部活动/失败运行和未完成动作；指定 `--run-id RUN_ID` 时只处理该运行。每次 `gsbench run` 完成时都会无条件调用同一个恢复协调器。恢复前可先 dry-run：
+`gsbench restore` 是普通场景的统一恢复入口。无 `--run-id` 时，它发现全部活动/失败运行和未完成动作；指定 `--run-id RUN_ID` 时只处理该运行。普通 `gsbench run` 完成时会无条件调用同一恢复协调器；601–606 的人工故障则使用同编号 `gsbench run <code> recover`。恢复前可先 dry-run：
 
 ```bash
 gsbench restore --dry-run
@@ -91,7 +100,7 @@ Risk A 无额外开关。Risk B 还要求 `safety.allow_admin_mutation=true` 和
 
 配置只包含实际读取的键：`database.*`、`run.*`、`data.*`、`safety.*`、`fault_provider.*`，以及现有 CPU、连接池、线程池和 vacuum 场景的 `scenario.*` 参数。不要在配置中写密码；使用 `database.password_env=GSBENCH_PASSWORD`，或以 `database.password_config` 引用同发布目录的 gstop 配置。日志会脱敏 DSN 密码，但配置文件仍应限制权限。
 
-`run.validation_enabled=false` 只跳过模型预估、场景结果门槛和数据布局一致性判断。容量检查、物理大小测量、未知数据库版本拒绝、真实 DDL/DML/负载错误，以及恢复锁、journal/ledger 持久化、逆操作和其他恢复安全边界仍然强制执行；关闭验证不能把这些失败降级为成功。需要模型、结果和布局的严格判定时设置：
+`run.validation_enabled=false` 只跳过模型预估、场景结果门槛、数据布局一致性和执行计划形态校验。容量检查、物理大小测量、未知数据库版本拒绝、真实 DDL/DML/负载错误，以及恢复锁、journal/ledger 持久化、逆操作、计划基线修复和其他恢复安全边界仍然强制执行；关闭验证不能把这些失败降级为成功。需要模型、结果、布局和计划形态的严格判定时设置：
 
 ```ini
 [run]

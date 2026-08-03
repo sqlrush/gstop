@@ -30,6 +30,20 @@ func TestPlanBaselinePlanVerificationRequiresExpectedToken(t *testing.T) {
 	}
 }
 
+func TestSelectPlanBaselineDefinitionsScopesStrictVerification(t *testing.T) {
+	definitions, err := PlanScenarioDefinitions("gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := selectPlanBaselineDefinitions(
+		definitions,
+		[]ScenarioCode{605, 601, 605},
+	)
+	if len(selected) != 2 || selected[0].Code != 601 || selected[1].Code != 605 {
+		t.Fatalf("selected=%+v", selected)
+	}
+}
+
 func TestPlanBaselineRepairSQLIsScopedAndComplete(t *testing.T) {
 	steps, err := PlanBaselineRepairSteps("gsbench")
 	if err != nil {
@@ -49,6 +63,36 @@ func TestPlanBaselineRepairSQLIsScopedAndComplete(t *testing.T) {
 	if strings.Contains(joined, "pg_catalog.pg_statistic SET") ||
 		strings.Contains(joined, "pg_index SET") {
 		t.Fatalf("repair directly updates catalogs: %s", joined)
+	}
+}
+
+func TestPlanBaselineRepairRefreshesWholeTableCardinality(t *testing.T) {
+	steps, err := PlanBaselineRepairSteps("gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `ANALYZE "gsbench".plan_data`
+	fullAt := -1
+	lastTargetedAt := -1
+	for index, step := range steps {
+		if step == want {
+			fullAt = index
+		}
+		if strings.HasPrefix(step, `ANALYZE "gsbench".plan_data(`) ||
+			strings.HasPrefix(step, `ANALYZE "gsbench".plan_data ((`) {
+			lastTargetedAt = index
+		}
+	}
+	if fullAt < 0 {
+		t.Fatalf("repair steps do not contain full-table %q: %v", want, steps)
+	}
+	if fullAt <= lastTargetedAt {
+		t.Fatalf(
+			"full-table ANALYZE at %d must follow targeted ANALYZE at %d: %v",
+			fullAt,
+			lastTargetedAt,
+			steps,
+		)
 	}
 }
 

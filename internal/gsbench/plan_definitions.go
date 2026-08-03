@@ -146,6 +146,13 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 		}, nil
 	case "planchange_stats_extended":
 		verify := `SELECT count(*) FROM pg_statistic_ext WHERE starelid='` + table + `'::regclass`
+		extended := base(
+			"statistics_extended", table+".(stats_corr_a,stats_corr_b)",
+			"ALTER TABLE "+table+" DELETE STATISTICS ((stats_corr_a,stats_corr_b))",
+			"ALTER TABLE "+table+" ADD STATISTICS ((stats_corr_a,stats_corr_b))",
+			verify, "1",
+		)
+		extended.SkipInverseWhenRestored = true
 		analyze := base(
 			"statistics_extended_analyze", table+".(stats_corr_a,stats_corr_b) analyze",
 			"ANALYZE "+table+"(stats_corr_a,stats_corr_b)",
@@ -158,12 +165,7 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 			"RESET default_statistics_target",
 		}
 		return []Mutation{
-			base(
-				"statistics_extended", table+".(stats_corr_a,stats_corr_b)",
-				"ALTER TABLE "+table+" DELETE STATISTICS ((stats_corr_a,stats_corr_b))",
-				"ALTER TABLE "+table+" ADD STATISTICS ((stats_corr_a,stats_corr_b))",
-				verify, "1",
-			),
+			extended,
 			analyze,
 		}, nil
 	case "planchange_index_drop":
@@ -180,12 +182,14 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 			return nil, err
 		}
 		index := quotedSchema + "." + definition.Name
-		return []Mutation{base(
+		mutation := base(
 			"index_drop", index,
 			"DROP INDEX "+index,
 			createIndex,
 			verifyIndex, createIndex,
-		)}, nil
+		)
+		mutation.SkipInverseWhenRestored = true
+		return []Mutation{mutation}, nil
 	case "planchange_index_shape":
 		goodDefinition, ok := planIndexDefinitionByName(
 			"plan_index_shape_good_idx",
@@ -213,13 +217,15 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 		}
 		good := quotedSchema + "." + goodDefinition.Name
 		bad := quotedSchema + "." + badDefinition.Name
+		dropGood := base(
+			"index_shape_drop_good", good,
+			"DROP INDEX "+good,
+			goodCreate,
+			verifyGood, goodCreate,
+		)
+		dropGood.SkipInverseWhenRestored = true
 		return []Mutation{
-			base(
-				"index_shape_drop_good", good,
-				"DROP INDEX "+good,
-				goodCreate,
-				verifyGood, goodCreate,
-			),
+			dropGood,
 			base(
 				"index_shape_create_bad", bad,
 				badCreate,

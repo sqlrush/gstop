@@ -64,6 +64,13 @@ func configOverridesFromCLI(options CLIOptions) Overrides {
 	return overrides
 }
 
+func runCommandNeedsGeneratedRunID(options CLIOptions) bool {
+	if options.Command != "run" {
+		return false
+	}
+	return options.PlanAction == "" || options.PlanAction == PlanRunInit
+}
+
 func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.Writer) int {
 	overrides := configOverridesFromCLI(options)
 	cfg, err := LoadConfig(options.ConfigPath, overrides)
@@ -71,8 +78,17 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 		fmt.Fprintln(stderr, "load config:", err)
 		return 1
 	}
+	if options.Command == "run" && options.PlanAction == "" &&
+		scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes) {
+		fmt.Fprintln(
+			stderr,
+			"plan scenarios 601-606 require init, fault, or recover; "+
+				"for example: gsbench run 601 init --worker 10 --duration 1m",
+		)
+		return 1
+	}
 	runID := strings.TrimSpace(options.RunID)
-	if runID == "" && options.Command == "run" {
+	if runID == "" && runCommandNeedsGeneratedRunID(options) {
 		runID = newRunID()
 	}
 	if runID != "" {
@@ -83,7 +99,11 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 	}
 	logIdentity := runID
 	if logIdentity == "" {
-		logIdentity = options.Command
+		if options.Command == "run" {
+			logIdentity = newRunID()
+		} else {
+			logIdentity = options.Command
+		}
 	}
 	logPath := ""
 	if !commandIsReadOnly(options.Command, cfg.Run.DryRun) {
@@ -138,6 +158,18 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 	case "init":
 		return commandInit(ctx, db, cfg, environment, caps, logger)
 	case "run":
+		if options.PlanAction != "" {
+			return commandPlanRunAction(
+				ctx,
+				db,
+				cfg,
+				environment,
+				caps,
+				logger,
+				options,
+				runID,
+			)
+		}
 		return commandRun(
 			ctx,
 			db,
@@ -2500,7 +2532,7 @@ func (b *databaseRestoreBackend) verifyPlanBaselineForActions(
 	ctx context.Context,
 	actions []Action,
 ) error {
-	if !restoreActionsContainPlanChange(actions) {
+	if !b.cfg.Run.ValidationEnabled || !restoreActionsContainPlanChange(actions) {
 		return nil
 	}
 	exists, err := b.planBaselineExists(ctx)
@@ -2510,7 +2542,24 @@ func (b *databaseRestoreBackend) verifyPlanBaselineForActions(
 	if !exists {
 		return nil
 	}
-	if err := VerifyPlanBaseline(ctx, b.db, b.cfg.Data.Schema); err != nil {
+	codes := make([]ScenarioCode, 0, len(actions))
+	seen := make(map[ScenarioCode]struct{}, len(actions))
+	for _, action := range actions {
+		if !isPlanChangeCode(action.ScenarioCode) {
+			continue
+		}
+		if _, ok := seen[action.ScenarioCode]; ok {
+			continue
+		}
+		seen[action.ScenarioCode] = struct{}{}
+		codes = append(codes, action.ScenarioCode)
+	}
+	if err := VerifyPlanBaselineScenarios(
+		ctx,
+		b.db,
+		b.cfg.Data.Schema,
+		codes,
+	); err != nil {
 		return fmt.Errorf("verify benchmark baseline: %w", err)
 	}
 	return nil
@@ -2609,6 +2658,9 @@ func commandCleanup(ctx context.Context, db *Database, cfg BenchConfig, log *Run
 		callbackCtx context.Context,
 		lock RestoreLock,
 	) error {
+		if err := ensureNoPlanWorkload(callbackCtx, db, cfg); err != nil {
+			return err
+		}
 		return cleanupDataAfterRestore(callbackCtx, lock, cfg, log)
 	}
 	code := commandRestoreOperation(
@@ -2619,6 +2671,27 @@ func commandCleanup(ctx context.Context, db *Database, cfg BenchConfig, log *Run
 	}
 	log.Info("cleanup SUCCESS")
 	return 0
+}
+
+func ensureNoPlanWorkload(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+) error {
+	held, err := DatabaseRunLockHeld(
+		ctx,
+		db,
+		planActivityLockIdentity(cfg),
+	)
+	if err != nil {
+		return fmt.Errorf("inspect active plan workload: %w", err)
+	}
+	if held {
+		return fmt.Errorf(
+			"plan workload is running; stop its init process before cleanup --data",
+		)
+	}
+	return nil
 }
 
 func cleanupDataAfterRestore(

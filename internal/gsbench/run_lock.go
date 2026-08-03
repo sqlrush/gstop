@@ -9,6 +9,8 @@ import (
 	"sync"
 )
 
+var errDatabaseRunLockBusy = errors.New("database run lock is busy")
+
 type runLockSession interface {
 	TryLock(context.Context, string) (bool, error)
 	Unlock(context.Context, string) (bool, error)
@@ -172,6 +174,7 @@ func acquireDatabaseRunLock(
 	if !acquired {
 		return nil, errors.Join(
 			fmt.Errorf("operation already running for lock %q", identity),
+			errDatabaseRunLockBusy,
 			session.Close(),
 		)
 	}

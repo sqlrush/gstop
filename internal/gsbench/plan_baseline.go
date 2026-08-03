@@ -36,6 +36,7 @@ func PlanBaselineRepairSteps(schema string) ([]string, error) {
 		"ANALYZE "+table+"(stats_target_key)",
 		"ANALYZE "+table+"(stats_ndistinct_key)",
 		"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
+		"ANALYZE "+table,
 	)
 	return steps, nil
 }
@@ -62,7 +63,7 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 		results = append(results, BaselineRepairResult{Target: target, Status: status})
 	}
 	exec := func(target, statement string) bool {
-		if _, err := db.Exec(ctx, statement); err != nil {
+		if _, err := db.execMaintenance(ctx, statement); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", target, err))
 			record(target, "FAILED")
 			return false
@@ -187,12 +188,13 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 	} else {
 		record("analyze extended_statistics", "RESTORED")
 	}
+	exec("analyze plan_data", "ANALYZE "+table)
 
 	return results, errors.Join(errs...)
 }
 
 func AnalyzeExtendedStatistics(ctx context.Context, db *Database, table string) error {
-	return db.ExecSession(ctx,
+	return db.ExecMaintenanceSession(ctx,
 		"SET default_statistics_target=-2",
 		"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
 		"RESET default_statistics_target",
@@ -200,6 +202,24 @@ func AnalyzeExtendedStatistics(ctx context.Context, db *Database, table string) 
 }
 
 func VerifyPlanBaseline(ctx context.Context, db *Database, schema string) error {
+	return verifyPlanBaseline(ctx, db, schema, nil)
+}
+
+func VerifyPlanBaselineScenarios(
+	ctx context.Context,
+	db *Database,
+	schema string,
+	codes []ScenarioCode,
+) error {
+	return verifyPlanBaseline(ctx, db, schema, codes)
+}
+
+func verifyPlanBaseline(
+	ctx context.Context,
+	db *Database,
+	schema string,
+	codes []ScenarioCode,
+) error {
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {
 		return fmt.Errorf("unsafe schema %q", schema)
@@ -273,10 +293,34 @@ func VerifyPlanBaseline(ctx context.Context, db *Database, schema string) error 
 	definitions, err := PlanScenarioDefinitions(schema)
 	if err != nil {
 		errs = append(errs, err)
-	} else if err := verifyPlanBaselinePlans(ctx, databasePlanBaselineExplainer{db}, definitions); err != nil {
+	} else if err := verifyPlanBaselinePlans(
+		ctx,
+		databasePlanBaselineExplainer{db},
+		selectPlanBaselineDefinitions(definitions, codes),
+	); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+func selectPlanBaselineDefinitions(
+	definitions []PlanScenarioDefinition,
+	codes []ScenarioCode,
+) []PlanScenarioDefinition {
+	if len(codes) == 0 {
+		return definitions
+	}
+	selectedCodes := make(map[ScenarioCode]struct{}, len(codes))
+	for _, code := range codes {
+		selectedCodes[code] = struct{}{}
+	}
+	selected := make([]PlanScenarioDefinition, 0, len(selectedCodes))
+	for _, definition := range definitions {
+		if _, ok := selectedCodes[definition.Code]; ok {
+			selected = append(selected, definition)
+		}
+	}
+	return selected
 }
 
 type planBaselineExplainer interface {

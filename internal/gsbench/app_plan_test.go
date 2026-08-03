@@ -1020,6 +1020,34 @@ func TestCleanupAfterRestoreUsesProtectedLockSession(t *testing.T) {
 	}
 }
 
+func TestCleanupRejectsLiveThreePhasePlanWorkload(t *testing.T) {
+	cfg := BenchConfig{
+		Database: DatabaseConfig{Database: "postgres"},
+		Data:     DataConfig{Schema: "Bench"},
+		Safety:   SafetyConfig{QueryTimeout: time.Second},
+	}
+	identity := planActivityLockIdentity(cfg)
+	state := &advisoryLockTestState{
+		tryResults:   map[string]bool{identity: false},
+		tryErrors:    map[string]error{},
+		unlockResult: map[string]bool{},
+		unlockErrors: map[string]error{},
+	}
+	backend := newAdvisoryLockTestBackend(t, state)
+	backend.cfg = cfg
+	backend.db.cfg = cfg
+
+	err := ensureNoPlanWorkload(
+		context.Background(), backend.db, cfg,
+	)
+	if err == nil || !strings.Contains(err.Error(), "plan workload") {
+		t.Fatalf("error=%v", err)
+	}
+	if !reflect.DeepEqual(state.events, []string{"try " + identity}) {
+		t.Fatalf("events=%v", state.events)
+	}
+}
+
 func TestWithPlanRunPreparationDatabaseLockDoesNotReacquireHeldLock(
 	t *testing.T,
 ) {

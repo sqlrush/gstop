@@ -1,4 +1,4 @@
-# gsbench v1.1.1 配置手册
+# gsbench v1.1.3 配置手册
 
 发布包的基准配置是 [`configs/gsbench.cfg`](../../configs/gsbench.cfg)。建议复制后修改并保持 `0600` 权限；不要新增程序未读取的“占位配置”。安装和命令流程见[安装手册](INSTALL.md)。
 
@@ -70,7 +70,7 @@ validation_enabled = false
 ```
 
 - `scenarios`：默认场景编号或规范名称，逗号分隔；命令行 `-s` 会覆盖它。
-- `duration`：101–103、201–202 的持续加压时长，从所有固定 worker 就绪后开始计时；命令行 `-d` 会覆盖它。其他场景仍按各自的 ramp/hold 生命周期执行。
+- `duration`：101–103、201–202 以及 601–606 `init` 的持续加压时长，从所有固定 worker 就绪后开始计时；命令行 `-d`/`--duration` 会覆盖它。其他场景仍按各自的 ramp/hold 生命周期执行。
 - `ramp_interval`：控制器调节间隔，必须大于 0。
 - `profile`：只允许 `quick` 或 `stress`。
 - `dry_run`：只展示/检查动作，不执行工作负载修改；命令行 `--dry-run` 会覆盖它。
@@ -81,6 +81,7 @@ validation_enabled = false
 - 模型预估；
 - 场景结果门槛；
 - 数据布局一致性判断。
+- 执行计划形态严格校验。
 
 以下安全与真实性检查不会随之关闭：
 
@@ -92,12 +93,18 @@ validation_enabled = false
 
 关闭验证不能把错误降级为成功。需要判定“是否达到 CPU/连接池/线程池目标”或执行全场景验收时必须设置 `validation_enabled=true`；详见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
 
-601–606 共用计划基线，每次只能选择一个并串行运行。例如：
+601–606 共用计划基线，每次只能选择一个并串行运行。它们不再接受原来的单条 `run -s 601 -d 2m`；使用两个终端的三阶段命令，例如：
 
 ```sh
-gsbench run --config /absolute/path/gsbench.cfg -s 601 -d 2m
-gsbench run --config /absolute/path/gsbench.cfg -s 602 -d 2m
+# 终端一，RUNNING 后开始计算 duration
+gsbench run 601 init --worker 10 --duration 2m --config /absolute/path/gsbench.cfg
+
+# 终端二
+gsbench run 601 fault --config /absolute/path/gsbench.cfg
+gsbench run 601 recover --config /absolute/path/gsbench.cfg
 ```
+
+602–606 使用相同语法并替换为同一个编号。`fault` 必须在对应 `init` 存活且显示 `RUNNING` 后启动；`recover` 在 `init` 退出后仍可执行。三阶段命令不接受 `--dry-run`，避免把没有真实执行的故障或恢复误报为预览成功。
 
 ## `[data]` 数据集
 

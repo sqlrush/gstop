@@ -4,6 +4,8 @@ set -u
 
 scenario_codes='101 102 103 201 202 203 204 205 207 208 301 302 303 304 321 322 331 332 333 401 402 403 404 501 502 503 504 505 506 508 509 510 520 521 522 523 524 525 526 527 528 529 530 531 532 533 534 535 536 537 538 539 540 601 602 603 604 605 606 621 622 623 624 625 801'
 required_schema=gsbench_e2e_20260801
+plan_workers=10
+plan_ready_timeout=300
 
 fail() {
 	printf 'ERROR: %s\n' "$*" >&2
@@ -115,6 +117,43 @@ duration_for() {
 	esac
 }
 
+plan_name_for() {
+	case "$1" in
+		601) printf '%s\n' planchange_stats_target ;;
+		602) printf '%s\n' planchange_index_unusable ;;
+		603) printf '%s\n' planchange_stats_ndistinct ;;
+		604) printf '%s\n' planchange_stats_extended ;;
+		605) printf '%s\n' planchange_index_drop ;;
+		606) printf '%s\n' planchange_index_shape ;;
+		*) return 1 ;;
+	esac
+}
+
+wait_for_plan_baseline() {
+	code=$1
+	init_log=$2
+	init_pid=$3
+	status_log=$4
+	attempt=0
+	while [ "$attempt" -lt "$plan_ready_timeout" ]; do
+		workload_run_id=$(sed -n \
+			's/.*workload_run_id=\([^ ]*\).*/\1/p' "$init_log" | tail -n 1)
+		if [ -n "$workload_run_id" ] &&
+			"$gsbench_bin" status --config "$config_file" \
+				--run-id "$workload_run_id" >"$status_log" 2>&1 &&
+			grep -Fq \
+				"run_id=$workload_run_id scenarios=$code phase=plan_baseline status=workload_running" \
+				"$status_log"; then
+			printf '%s\n' "$workload_run_id"
+			return 0
+		fi
+		kill -0 "$init_pid" 2>/dev/null || return 1
+		sleep 1
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+
 gsbench_arg=
 gstop_arg=
 config_arg=
@@ -183,7 +222,7 @@ schema=$(config_schema "$config_file")
 [ "$schema" = "$required_schema" ] ||
 	fail "live test config schema must be exactly $required_schema"
 [ "${GSBENCH_E2E_SCHEMA-}" = "$required_schema" ] ||
-	fail "set GSBENCH_E2E_SCHEMA=$required_schema to acknowledge init and cleanup"
+	fail "set GSBENCH_E2E_SCHEMA=$required_schema to acknowledge live initialization"
 
 if ! reuse_existing=$(ini_value "$config_file" data reuse_existing); then
 	fail "config must set [data] reuse_existing=false"
@@ -207,7 +246,6 @@ esac
 
 database_host=$(ini_value "$config_file" database host 2>/dev/null || printf '%s' unknown)
 database_name=$(ini_value "$config_file" database database 2>/dev/null || printf '%s' unknown)
-config_fingerprint=$(cksum "$config_file") || fail "cannot fingerprint config"
 
 umask 077
 case "$artifacts_arg" in
@@ -226,6 +264,8 @@ printf 'code\trun_id\texit_code\tduration\toutcome\trestore_state\tstatus_path\n
 
 gstop_pid=
 current_run_id=
+current_plan_code=
+plan_init_pid=
 
 stop_gstop() {
 	if [ -n "$gstop_pid" ] && kill -0 "$gstop_pid" 2>/dev/null; then
@@ -235,9 +275,35 @@ stop_gstop() {
 	gstop_pid=
 }
 
+stop_plan_init() {
+	if [ -n "$plan_init_pid" ]; then
+		if kill -0 "$plan_init_pid" 2>/dev/null; then
+			kill "$plan_init_pid" 2>/dev/null || true
+		fi
+		wait "$plan_init_pid" 2>/dev/null || true
+	fi
+	plan_init_pid=
+}
+
+recover_current_plan() {
+	[ -n "$current_plan_code" ] || return 0
+	"$gsbench_bin" run "$current_plan_code" recover --config "$config_file" \
+		>"restore/$current_plan_code-exit.log" 2>&1 || true
+}
+
+on_exit() {
+	stop_plan_init
+	recover_current_plan
+	stop_gstop
+}
+
 on_signal() {
 	signal_name=$1
-	if [ -n "$current_run_id" ] && [ -n "$gsbench_bin" ]; then
+	if [ -n "$current_plan_code" ]; then
+		stop_plan_init
+		recover_current_plan
+		current_plan_code=
+	elif [ -n "$current_run_id" ] && [ -n "$gsbench_bin" ]; then
 		"$gsbench_bin" restore --config "$config_file" --run-id "$current_run_id" \
 			>"restore/interrupted-$current_run_id.log" 2>&1 || true
 	fi
@@ -246,7 +312,7 @@ on_signal() {
 	exit 130
 }
 
-trap stop_gstop EXIT
+trap on_exit EXIT
 trap 'on_signal HUP' HUP
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
@@ -278,6 +344,59 @@ for code in $scenario_codes; do
 	evidence_file=$artifacts/scenarios/$code.json
 	started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 	current_run_id=
+	case "$code" in
+		601|602|603|604|605|606)
+			current_plan_code=$code
+			init_log=$run_log
+			fault_log=$artifacts/scenarios/$code-fault.log
+			recover_log=$artifacts/scenarios/$code-recover.log
+			ready_status=$artifacts/status/$code-baseline.log
+			"$gsbench_bin" run "$code" init --worker "$plan_workers" \
+				--duration "$duration" --config "$config_file" \
+				>"$init_log" 2>&1 &
+			plan_init_pid=$!
+			if ! current_run_id=$(wait_for_plan_baseline \
+				"$code" "$init_log" "$plan_init_pid" "$ready_status"); then
+				fail "scenario $code init did not reach plan_baseline; see $init_log"
+			fi
+			if ! "$gsbench_bin" run "$code" fault --config "$config_file" \
+				>"$fault_log" 2>&1; then
+				fail "scenario $code fault failed; see $fault_log"
+			fi
+			if ! "$gsbench_bin" run "$code" recover --config "$config_file" \
+				>"$recover_log" 2>&1; then
+				fail "scenario $code recover failed; see $recover_log"
+			fi
+			if wait "$plan_init_pid"; then
+				run_rc=0
+			else
+				run_rc=$?
+			fi
+			plan_init_pid=
+			[ "$run_rc" -eq 0 ] ||
+				fail "scenario $code init failed with exit code $run_rc; see $init_log"
+			status_path=$artifacts/status/$code.log
+			"$gsbench_bin" status --config "$config_file" \
+				>"$status_path" 2>&1 || fail "status failed after scenario $code"
+			operations=$(sed -n \
+				's/.*plan init SUCCESS.*operations=\([0-9][0-9]*\).*/\1/p' \
+				"$init_log" | tail -n 1)
+			[ -n "$operations" ] || operations=0
+			name=$(plan_name_for "$code")
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$code" "$name" "workers=$plan_workers" \
+				'phases=plan_baseline,hold,restore' '' \
+				"$operations" 0 SUCCESS APPLICABLE "$init_log" >>results.tsv
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$code" "$current_run_id" "$run_rc" "$duration" SUCCESS \
+				PLAN_RECOVERED "$status_path" >>runs.tsv
+			printf 'scenario=%s name=%s started=%s outcome=SUCCESS rc=%s restore=PLAN_RECOVERED\n' \
+				"$code" "$name" "$started_at" "$run_rc"
+			current_plan_code=
+			current_run_id=
+			continue
+			;;
+	esac
 	if "$gsbench_bin" run --config "$config_file" --scenario "$code" \
 		--duration "$duration" >"$run_log" 2>&1; then
 		run_rc=0
@@ -346,14 +465,5 @@ stop_gstop
 grep -q 'stale recovery runs=0 database_runs=0 local_actions=0' status/final.log ||
 	fail "residual recovery actions remain; dataset retained"
 
-[ "$(cksum "$config_file")" = "$config_fingerprint" ] ||
-	fail "config changed during test; refusing cleanup"
-[ "$(config_schema "$config_file")" = "$required_schema" ] ||
-	fail "schema guard changed; refusing cleanup"
-[ "${GSBENCH_E2E_SCHEMA-}" = "$required_schema" ] ||
-	fail "schema acknowledgement changed; refusing cleanup"
-
-"$gsbench_bin" cleanup --config "$config_file" --data >cleanup.log 2>&1 ||
-	fail "guarded cleanup failed; see $artifacts/cleanup.log"
-
-printf 'full scenario matrix complete: results=%s/results.tsv\n' "$artifacts"
+printf 'full scenario matrix complete; dataset retained: results=%s/results.tsv\n' \
+	"$artifacts"

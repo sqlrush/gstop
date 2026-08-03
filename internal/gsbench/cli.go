@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.1.2"
+const Version = "v1.1.3"
 
 const ConfigEnv = "GSBENCH_CONFIG"
 
@@ -379,6 +379,12 @@ func applyPlanRunCLI(
 	}
 	if !isPlanChangeCode(options.ScenarioCodes[0]) {
 		return fmt.Errorf("plan actions are only valid for scenarios 601-606")
+	}
+	if strings.TrimSpace(options.RunID) != "" {
+		return fmt.Errorf("a plan action does not accept --run-id")
+	}
+	if options.DryRun {
+		return fmt.Errorf("plan action does not support --dry-run")
 	}
 	switch options.PlanAction {
 	case PlanRunInit:

@@ -356,13 +356,15 @@ func SQLAction(m Mutation) Action {
 			comparison = sqlVerifyComparisonIndexDDL
 		}
 		action.Verify = marshalActionPayload(struct {
-			SQL        string `json:"sql"`
-			Expected   string `json:"expected"`
-			Comparison string `json:"comparison,omitempty"`
+			SQL                     string `json:"sql"`
+			Expected                string `json:"expected"`
+			Comparison              string `json:"comparison,omitempty"`
+			SkipInverseWhenRestored bool   `json:"skip_inverse_when_restored,omitempty"`
 		}{
-			SQL:        m.VerifyAction,
-			Expected:   m.VerifyValue,
-			Comparison: comparison,
+			SQL:                     m.VerifyAction,
+			Expected:                m.VerifyValue,
+			Comparison:              comparison,
+			SkipInverseWhenRestored: m.SkipInverseWhenRestored,
 		})
 	}
 	return action

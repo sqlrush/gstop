@@ -28,6 +28,7 @@ func TestJournalSQLUsesCompositeKeyAndFormalActionColumns(t *testing.T) {
 		"verify_action",
 		"last_error",
 		"RETURNING action_id",
+		"CAST($1 AS varchar(96))",
 	} {
 		if !strings.Contains(insert, token) {
 			t.Errorf("journal insert missing %q:\n%s", token, insert)

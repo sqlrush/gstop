@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	planWorkloadRunningStatus = "workload_running"
-	planWorkloadPhase         = "plan_baseline"
+	planWorkloadPreparingStatus = "workload_preparing"
+	planWorkloadRunningStatus   = "workload_running"
+	planWorkloadPhase           = "plan_baseline"
 )
 
 var (
@@ -73,10 +74,36 @@ func (s *planControlStore) StartWorkload(
 		runID,
 		fmt.Sprintf("%03d", code),
 		planWorkloadPhase,
-		planWorkloadRunningStatus,
+		planWorkloadPreparingStatus,
 		fmt.Sprintf("three_phase workers=%d", workers),
 	)
 	return err
+}
+
+func (s *planControlStore) MarkWorkloadRunning(
+	ctx context.Context,
+	runID string,
+) error {
+	result, err := s.db.Exec(
+		ctx,
+		"UPDATE "+s.schema+
+			".meta_runs SET status=$1,updated_at=current_timestamp "+
+			"WHERE run_id=$2 AND status=$3",
+		planWorkloadRunningStatus,
+		runID,
+		planWorkloadPreparingStatus,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("plan workload %s is no longer preparing", runID)
+	}
+	return nil
 }
 
 func (s *planControlStore) HeartbeatWorkload(
@@ -114,10 +141,11 @@ func (s *planControlStore) FinishWorkload(
 		ctx,
 		"UPDATE "+s.schema+
 			".meta_runs SET status=$1,detail=$2,updated_at=current_timestamp "+
-			"WHERE run_id=$3 AND status=$4",
+			"WHERE run_id=$3 AND status IN ($4,$5)",
 		string(outcome),
 		detail,
 		runID,
+		planWorkloadPreparingStatus,
 		planWorkloadRunningStatus,
 	)
 	return err
@@ -163,14 +191,57 @@ func (s *planControlStore) SetFaultPhase(
 	return err
 }
 
+func (s *planControlStore) MarkFaultFailed(
+	ctx context.Context,
+	runID string,
+	faultErr error,
+) error {
+	detail := "plan fault failed"
+	if faultErr != nil {
+		detail = journalSafeErrorText(faultErr.Error())
+	}
+	_, err := s.db.Exec(
+		ctx,
+		"UPDATE "+s.schema+
+			".meta_runs SET status=$1,detail=$2,updated_at=current_timestamp "+
+			"WHERE run_id=$3",
+		"restore_failed",
+		detail,
+		runID,
+	)
+	return err
+}
+
 func (s *planControlStore) ResolveWorkload(
 	ctx context.Context,
 	code ScenarioCode,
 ) (planRunRecord, error) {
+	run, err := s.ResolveAnyWorkload(ctx)
+	if err != nil {
+		return planRunRecord{}, err
+	}
+	if run.Status != planWorkloadRunningStatus {
+		return planRunRecord{}, errPlanWorkloadNotFound
+	}
+	if run.Code != code {
+		return planRunRecord{}, fmt.Errorf(
+			"active plan workload is scenario %03d, not %03d",
+			run.Code,
+			code,
+		)
+	}
+	return run, nil
+}
+
+func (s *planControlStore) ResolveAnyWorkload(
+	ctx context.Context,
+) (planRunRecord, error) {
 	runs, err := s.queryRuns(
 		ctx,
 		"SELECT run_id,scenarios,phase,status,started_at FROM "+s.schema+
-			".meta_runs WHERE status=$1 ORDER BY started_at DESC,run_id DESC",
+			".meta_runs WHERE status IN ($1,$2) "+
+			"ORDER BY started_at DESC,run_id DESC",
+		planWorkloadPreparingStatus,
 		planWorkloadRunningStatus,
 	)
 	if err != nil {
@@ -181,13 +252,6 @@ func (s *planControlStore) ResolveWorkload(
 	}
 	if len(runs) != 1 {
 		return planRunRecord{}, fmt.Errorf("multiple active plan workloads found: %d", len(runs))
-	}
-	if runs[0].Code != code {
-		return planRunRecord{}, fmt.Errorf(
-			"active plan workload is scenario %03d, not %03d",
-			runs[0].Code,
-			code,
-		)
 	}
 	return runs[0], nil
 }

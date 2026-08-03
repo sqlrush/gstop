@@ -156,6 +156,39 @@ func TestEveryPlanMutationHasInverseAndRestoreVerification(t *testing.T) {
 	}
 }
 
+func TestNonIdempotentPlanInversesRequireBaselineSkipMarker(t *testing.T) {
+	for _, test := range []struct {
+		scenario string
+		kind     string
+	}{
+		{"planchange_stats_extended", "statistics_extended"},
+		{"planchange_index_drop", "index_drop"},
+		{"planchange_index_shape", "index_shape_drop_good"},
+	} {
+		mutations, err := PlanMutationSet("run-1", "gsbench", test.scenario)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, mutation := range mutations {
+			if mutation.Kind != test.kind {
+				continue
+			}
+			found = true
+			if !mutation.SkipInverseWhenRestored {
+				t.Fatalf("%s %s missing skip marker", test.scenario, test.kind)
+			}
+			action := SQLAction(mutation)
+			if !actionSkipsPlannedInverseWhenRestored(action) {
+				t.Fatalf("%s %s marker missing from journal action", test.scenario, test.kind)
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing mutation %s", test.scenario, test.kind)
+		}
+	}
+}
+
 func TestIndexPlanMutationsUseCompleteCanonicalDefinitions(t *testing.T) {
 	drop, err := PlanMutationSet(
 		"run-1", "gsbench", "planchange_index_drop",

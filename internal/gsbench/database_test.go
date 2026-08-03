@@ -427,6 +427,49 @@ func TestDatasetExecutorDoesNotApplyWorkloadQueryTimeoutToMaintenanceDDL(
 	}
 }
 
+func TestMaintenanceSessionDoesNotApplyWorkloadQueryTimeout(t *testing.T) {
+	const workloadQueryTimeout = 20 * time.Millisecond
+	state := &maintenanceExecTestState{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	pool := sql.OpenDB(&maintenanceExecTestConnector{state: state})
+	databaseContext, cancelDatabase := context.WithCancel(context.Background())
+	database := &Database{
+		cfg: BenchConfig{Safety: SafetyConfig{
+			QueryTimeout: workloadQueryTimeout,
+		}},
+		ctx: databaseContext, cancel: cancelDatabase, pool: pool,
+		tagged: map[*TaggedConn]struct{}{},
+	}
+	t.Cleanup(func() {
+		cancelDatabase()
+		_ = pool.Close()
+	})
+
+	parent, cancelParent := context.WithTimeout(context.Background(), time.Second)
+	defer cancelParent()
+	result := make(chan error, 1)
+	go func() {
+		result <- database.ExecMaintenanceSession(parent, "ANALYZE plan_data")
+	}()
+
+	select {
+	case <-state.started:
+	case <-parent.Done():
+		t.Fatalf("maintenance session did not start: %v", parent.Err())
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("maintenance session ended at workload timeout: %v", err)
+	case <-time.After(3 * workloadQueryTimeout):
+		close(state.release)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("maintenance session failed after release: %v", err)
+	}
+}
+
 func TestDatasetExecutorDefaultsToWorkloadQueryTimeout(t *testing.T) {
 	const workloadQueryTimeout = 20 * time.Millisecond
 	state := &maintenanceExecTestState{

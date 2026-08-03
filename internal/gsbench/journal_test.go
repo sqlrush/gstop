@@ -569,6 +569,119 @@ func TestRestoreActionsUsesJournalEngineAndPreservesCoordinatorOrder(t *testing.
 	}
 }
 
+func TestRestorePlannedActionSkipsInverseWhenBaselineIsAlreadyPresent(t *testing.T) {
+	action := validSQLJournalAction()
+	action.Sequence = 7
+	action.State = MutationPlanned
+	action.Verify = []byte(
+		`{"sql":"SELECT baseline","expected":"true",` +
+			`"skip_inverse_when_restored":true}`,
+	)
+	store := &memoryActionStore{entries: []Action{action}}
+	restoreCalls := 0
+	executor := &memoryActionExecutor{
+		onRestore: func(Action) { restoreCalls++ },
+	}
+
+	if err := NewJournal(store, executor).restoreCoordinatorActions(
+		context.Background(), []Action{action},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if restoreCalls != 0 {
+		t.Fatalf("inverse executions=%d want=0", restoreCalls)
+	}
+	if len(executor.verifyActions) != 1 {
+		t.Fatalf("baseline verification calls=%d want=1", len(executor.verifyActions))
+	}
+	if store.states[7] != MutationRestored {
+		t.Fatalf("state=%q want=%q", store.states[7], MutationRestored)
+	}
+}
+
+func TestRestorePlannedActionWithoutSkipMarkerExecutesInverse(t *testing.T) {
+	action := validSQLJournalAction()
+	action.Sequence = 7
+	action.State = MutationPlanned
+	action.Verify = []byte(`{"sql":"SELECT 1","expected":"1"}`)
+	store := &memoryActionStore{entries: []Action{action}}
+	restoreCalls := 0
+	executor := &memoryActionExecutor{
+		onRestore: func(Action) { restoreCalls++ },
+	}
+
+	if err := NewJournal(store, executor).restoreCoordinatorActions(
+		context.Background(), []Action{action},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if restoreCalls != 1 {
+		t.Fatalf("inverse executions=%d want=1", restoreCalls)
+	}
+	if len(executor.verifyActions) != 1 {
+		t.Fatalf("restore verification calls=%d want=1", len(executor.verifyActions))
+	}
+}
+
+func TestRestoreResumedSkipMarkedActionRechecksBaseline(t *testing.T) {
+	for _, state := range []MutationState{
+		MutationRestoring,
+		MutationRestoreFailed,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			action := validSQLJournalAction()
+			action.Sequence = 7
+			action.State = state
+			action.Verify = []byte(
+				`{"sql":"SELECT baseline","expected":"true",` +
+					`"skip_inverse_when_restored":true}`,
+			)
+			store := &memoryActionStore{entries: []Action{action}}
+			restoreCalls := 0
+			executor := &memoryActionExecutor{
+				onRestore: func(Action) { restoreCalls++ },
+			}
+
+			if err := NewJournal(store, executor).restoreCoordinatorActions(
+				context.Background(), []Action{action},
+			); err != nil {
+				t.Fatal(err)
+			}
+			if restoreCalls != 0 {
+				t.Fatalf("inverse executions=%d want=0", restoreCalls)
+			}
+			if store.states[7] != MutationRestored {
+				t.Fatalf("state=%q want=%q", store.states[7], MutationRestored)
+			}
+		})
+	}
+}
+
+func TestRestoreAppliedActionStillExecutesInverseBeforeVerification(t *testing.T) {
+	action := validSQLJournalAction()
+	action.Sequence = 7
+	action.State = MutationApplied
+	action.Verify = []byte(`{"sql":"SELECT baseline","expected":"true"}`)
+	store := &memoryActionStore{entries: []Action{action}}
+	var events []string
+	executor := &memoryActionExecutor{
+		onRestore: func(Action) { events = append(events, "restore") },
+	}
+	executor.onPreflight = func(Action) { events = append(events, "preflight") }
+
+	if err := NewJournal(store, executor).restoreCoordinatorActions(
+		context.Background(), []Action{action},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"preflight", "restore"}) {
+		t.Fatalf("events=%v want=[preflight restore]", events)
+	}
+	if len(executor.verifyActions) != 1 {
+		t.Fatalf("restore verification calls=%d want=1", len(executor.verifyActions))
+	}
+}
+
 func TestRestoreVerificationFailureRemainsPendingForRetry(t *testing.T) {
 	action := validSQLJournalAction()
 	action.Sequence = 7

@@ -128,9 +128,35 @@ func TestPlanTrafficKeepsFixedSessionsAndSQLMixUntilDuration(t *testing.T) {
 		return &TaggedConn{Conn: conn, pool: pool}, nil
 	}
 
-	snapshot, err := traffic.Run(context.Background(), 40*time.Millisecond)
+	readyCalled := false
+	var readyReturnedAt time.Time
+	snapshot, err := traffic.RunWithReady(
+		context.Background(),
+		40*time.Millisecond,
+		func(context.Context) error {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if len(state.queries) != 0 {
+				t.Fatalf("queries started before readiness callback: %v", state.queries)
+			}
+			ready := traffic.workload.Snapshot()
+			if ready.Started != 2 || ready.Active != 2 {
+				t.Fatalf("ready snapshot=%+v", ready)
+			}
+			readyCalled = true
+			time.Sleep(25 * time.Millisecond)
+			readyReturnedAt = time.Now()
+			return nil
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !readyCalled {
+		t.Fatal("readiness callback was not called")
+	}
+	if elapsed := time.Since(readyReturnedAt); elapsed < 30*time.Millisecond {
+		t.Fatalf("duration started before readiness returned: elapsed=%s", elapsed)
 	}
 	if snapshot.Started != 2 || snapshot.PeakActive != 2 || snapshot.Operations == 0 {
 		t.Fatalf("snapshot=%+v", snapshot)
