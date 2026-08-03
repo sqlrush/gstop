@@ -65,15 +65,17 @@ func (w *rotatingWriter) open() {
 // waiting up to ten seconds for the database version to be discovered.
 func (w *rotatingWriter) generateName() string {
 	version := "unknown"
+	var snapshot model.DBInfoSnapshot
 	for i := 0; i < 10; i++ {
-		version = whitespace.ReplaceAllString(w.dbInfo.Version(), "_")
+		snapshot = w.dbInfo.Snapshot()
+		version = whitespace.ReplaceAllString(snapshot.Version, "_")
 		if version != "unknown" {
 			break
 		}
 		time.Sleep(time.Second)
 	}
 	ts := w.nowFunc().Format("20060102_150405")
-	name := "gstoplog_GaussDB_" + version + "_" + w.dbInfo.User() + "_" + w.dbInfo.Role() + "_" + ts + ".log"
+	name := "gstoplog_GaussDB_" + version + "_" + snapshot.User + "_" + snapshot.Role + "_" + ts + ".log"
 	return filepath.Join(w.baseDir, name)
 }
 

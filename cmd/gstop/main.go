@@ -25,12 +25,22 @@ import (
 	"gstop/internal/tui"
 )
 
+const version = "v1.6.3"
+
 func main() {
+	if versionRequested(os.Args[1:]) {
+		fmt.Printf("gstop %s\n", version)
+		return
+	}
 	args, configPath := parseFlags()
 
 	cfg, err := config.Load(configPath, args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load config:", err)
+		os.Exit(1)
+	}
+	if err := validateDaemonInvocation(cfg, args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
@@ -41,7 +51,7 @@ func main() {
 	// can enable session termination through configuration alone.
 
 	logger := logging.New("gstop", "gstop_app.log")
-	runner := oscmd.New(logger, commandSlowThreshold(cfg))
+	runner := oscmd.New(logger, commandSlowThreshold(cfg), collectTimeout(cfg))
 
 	if !withinUserLimit(cfg, runner) {
 		fmt.Println("The user limit has been reached, exit.")
@@ -57,6 +67,31 @@ func main() {
 		fmt.Fprintln(os.Stderr, "gstop:", err)
 		os.Exit(1)
 	}
+}
+
+func versionRequested(args []string) bool {
+	seenVersion := false
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "version" || args[i] == "-version" || args[i] == "--version":
+			if seenVersion {
+				return false
+			}
+			seenVersion = true
+		case args[i] == "-c":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return false
+			}
+			i++
+		case strings.HasPrefix(args[i], "-c="):
+			if strings.TrimPrefix(args[i], "-c=") == "" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return seenVersion
 }
 
 // run wires the dependencies and starts the appropriate loop.
@@ -97,7 +132,9 @@ func parseFlags() (config.Args, string) {
 	logInterval := flag.Int("l", 0, "log refresh interval (seconds)")
 	user := flag.String("u", "", "production environment db user")
 	port := flag.Int("p", 0, "production environment db port")
-	daemon := flag.Bool("d", false, "run gstop in daemon mode")
+	var daemon bool
+	flag.BoolVar(&daemon, "d", false, "run gstop in daemon mode")
+	flag.BoolVar(&daemon, "daemon", false, "run gstop in daemon mode")
 	configPath := flag.String("c", "", "path to gstop.cfg")
 	flag.Parse()
 
@@ -117,10 +154,20 @@ func parseFlags() (config.Args, string) {
 	if set["p"] {
 		args.Port = port
 	}
-	if set["d"] {
-		args.Daemon = daemon
+	if set["d"] || set["daemon"] {
+		args.Daemon = &daemon
 	}
 	return args, resolveConfigPath(*configPath)
+}
+
+func validateDaemonInvocation(cfg *config.Config, args config.Args) error {
+	if !cfg.GetBool("main.daemon", false) {
+		return nil
+	}
+	if args.Daemon == nil || !*args.Daemon {
+		return fmt.Errorf("daemon mode must be enabled explicitly with -d or --daemon")
+	}
+	return nil
 }
 
 // resolveConfigPath honours an explicit -c, otherwise prefers ./gstop.cfg and
@@ -135,30 +182,45 @@ func resolveConfigPath(explicit string) string {
 	return filepath.Join("configs", "gstop.cfg")
 }
 
-// withinUserLimit reproduces the ps|grep concurrent-instance guard. The current
-// process is counted, so the daemon allows at most one and the interactive mode
-// allows up to main.max_concurrent_users.
+// withinUserLimit enforces the concurrent-instance guard. The current process
+// is present in ps output, so daemon mode allows at most one daemon and
+// interactive mode allows up to main.max_concurrent_users.
 func withinUserLimit(cfg *config.Config, runner *oscmd.Runner) bool {
-	// grep -v defunct drops zombie processes, which otherwise count as live
-	// instances in containers whose PID 1 does not reap orphans.
-	base := "ps aux | grep -w gstop | grep -v grep | grep -v defunct"
-	if cfg.GetBool("main.daemon", false) {
-		base += " | grep -E 'd|daemon' | awk '{print $2}'"
-	} else {
-		base += " | awk '{print $2}'"
-	}
-	out, _ := runner.Run(base, false)
+	out, _ := runner.Run("ps -ww -axo pid=,stat=,ucomm=,args=", false)
 	pids := map[string]struct{}{}
-	for _, pid := range strings.Fields(out) {
-		pids[pid] = struct{}{}
+	daemonOnly := cfg.GetBool("main.daemon", false)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || strings.Contains(fields[1], "Z") {
+			continue
+		}
+		if fields[2] != "gstop" {
+			continue
+		}
+		argv := fields[3:]
+		if daemonOnly && !hasDaemonArgument(argv[1:]) {
+			continue
+		}
+		pids[fields[0]] = struct{}{}
 	}
 	if len(pids) == 0 {
 		return true
 	}
-	if cfg.GetBool("main.daemon", false) {
+	if daemonOnly {
 		return len(pids) <= 1
 	}
 	return len(pids) <= cfg.GetInt("main.max_concurrent_users", 3)
+}
+
+func hasDaemonArgument(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "-d", "--d", "-daemon", "--daemon",
+			"-d=true", "--d=true", "-daemon=true", "--daemon=true":
+			return true
+		}
+	}
+	return false
 }
 
 // readPasswordIfNeeded prompts for a database password when password-free login
@@ -185,4 +247,8 @@ func readPasswordIfNeeded(cfg *config.Config) (string, bool) {
 
 func commandSlowThreshold(cfg *config.Config) time.Duration {
 	return time.Duration(cfg.GetFloat("main.sql_command_time_thresh", 3) * float64(time.Second))
+}
+
+func collectTimeout(cfg *config.Config) time.Duration {
+	return config.CollectTimeout(cfg)
 }

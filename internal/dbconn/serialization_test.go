@@ -28,17 +28,18 @@ func TestPrimaryGatewaySerializesConcurrentQueries(t *testing.T) {
 		done <- struct{}{}
 	}()
 	waitForSerializationEntry(t, tracker.entered)
+
 	go func() {
 		db.Query("second")
 		done <- struct{}{}
 	}()
-
 	concurrent := false
 	select {
 	case <-tracker.entered:
 		concurrent = true
 	case <-time.After(100 * time.Millisecond):
 	}
+
 	close(tracker.release)
 	waitForSerializationEntry(t, done)
 	waitForSerializationEntry(t, done)
@@ -77,6 +78,66 @@ func TestPrimaryGatewaySerializesEntireResultStreams(t *testing.T) {
 	}
 }
 
+func TestDifferentGatewaysDoNotShareQuerySerialization(t *testing.T) {
+	tracker := newSerializationTracker()
+	db1 := newSerializationTestDB(t, tracker)
+	db2 := newSerializationTestDB(t, tracker)
+
+	done := make(chan struct{}, 2)
+	go func() {
+		db1.Query("first gateway")
+		done <- struct{}{}
+	}()
+	waitForSerializationEntry(t, tracker.entered)
+	go func() {
+		db2.Query("second gateway")
+		done <- struct{}{}
+	}()
+	waitForSerializationEntry(t, tracker.entered)
+
+	close(tracker.release)
+	waitForSerializationEntry(t, done)
+	waitForSerializationEntry(t, done)
+	if tracker.maxConcurrent() != 2 {
+		t.Fatalf("different gateways max concurrent queries=%d, want 2", tracker.maxConcurrent())
+	}
+}
+
+func TestQueuedGatewayQueryHonorsContextWithoutEnteringDriver(t *testing.T) {
+	tracker := newSerializationTracker()
+	db := newSerializationTestDB(t, tracker)
+
+	firstDone := make(chan struct{})
+	go func() {
+		db.Query("blocking query")
+		close(firstDone)
+	}()
+	waitForSerializationEntry(t, tracker.entered)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	secondDone := make(chan []Row, 1)
+	go func() {
+		secondDone <- db.QueryContext(ctx, "queued query")
+	}()
+	select {
+	case rows := <-secondDone:
+		if rows != nil {
+			t.Fatalf("canceled queued query rows=%v, want nil", rows)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued query did not honor its context")
+	}
+	select {
+	case <-tracker.entered:
+		t.Fatal("canceled queued query entered the driver")
+	default:
+	}
+
+	close(tracker.release)
+	waitForSerializationEntry(t, firstDone)
+}
+
 func TestPrimaryGatewaySerializesQueryAndNoReturn(t *testing.T) {
 	tracker := newSerializationTracker()
 	db := newSerializationTestDB(t, tracker)
@@ -92,34 +153,38 @@ func TestPrimaryGatewaySerializesQueryAndNoReturn(t *testing.T) {
 	go func() {
 		execDone <- db.NoReturn("queued statement")
 	}()
-	concurrent := false
 	select {
 	case <-tracker.entered:
-		concurrent = true
+		close(tracker.release)
+		t.Fatal("NoReturn overlapped an in-flight query on the same gateway")
 	case <-time.After(100 * time.Millisecond):
 	}
+
 	close(tracker.release)
 	waitForSerializationEntry(t, queryDone)
 	if ok := <-execDone; !ok {
 		t.Fatal("serialized NoReturn failed")
 	}
-	if concurrent || tracker.maxConcurrent() != 1 {
+	if tracker.maxConcurrent() != 1 {
 		t.Fatalf("query/NoReturn max concurrency=%d, want 1", tracker.maxConcurrent())
 	}
 }
 
 func newSerializationTestDB(t *testing.T, tracker *serializationTracker) *DB {
 	t.Helper()
-	name := fmt.Sprintf("gstop-serialization-%d", serializationDriverID.Add(1))
-	sql.Register(name, &serializationDriver{tracker: tracker})
-	pool, err := sql.Open(name, "")
+	driverName := fmt.Sprintf("gstop-serialization-%d", serializationDriverID.Add(1))
+	sql.Register(driverName, &serializationDriver{tracker: tracker})
+	pool, err := sql.Open(driverName, "")
 	if err != nil {
 		t.Fatalf("open serialization test pool: %v", err)
 	}
 	pool.SetMaxOpenConns(maxPoolConns)
 	pool.SetMaxIdleConns(maxPoolConns)
 
-	db := New(config.FromMap(map[string]any{}), logging.New("db-serialization-test", ""))
+	cfg := config.FromMap(map[string]any{
+		"main": map[string]any{"collect_timeout": 5.0},
+	})
+	db := New(cfg, logging.New("db-serialization-test", ""))
 	db.mu.Lock()
 	db.pool = pool
 	db.healthy = true
@@ -139,11 +204,12 @@ func waitForSerializationEntry(t *testing.T, ch <-chan struct{}) {
 }
 
 type serializationTracker struct {
-	mu          sync.Mutex
-	current     int
-	maximum     int
-	entered     chan struct{}
-	release     chan struct{}
+	mu      sync.Mutex
+	current int
+	maximum int
+	entered chan struct{}
+	release chan struct{}
+
 	blockInRows bool
 }
 
@@ -211,17 +277,6 @@ func (c *serializationConn) QueryContext(ctx context.Context, _ string, _ []driv
 	}
 }
 
-func (c *serializationConn) ExecContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Result, error) {
-	c.tracker.enter()
-	defer c.tracker.leave()
-	select {
-	case <-c.tracker.release:
-		return driver.RowsAffected(1), nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 type blockingSerializationRows struct {
 	ctx     context.Context
 	tracker *serializationTracker
@@ -243,6 +298,17 @@ func (r *blockingSerializationRows) Next([]driver.Value) error {
 		return io.EOF
 	case <-r.ctx.Done():
 		return r.ctx.Err()
+	}
+}
+
+func (c *serializationConn) ExecContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Result, error) {
+	c.tracker.enter()
+	defer c.tracker.leave()
+	select {
+	case <-c.tracker.release:
+		return driver.RowsAffected(1), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

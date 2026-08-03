@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -49,14 +50,14 @@ func TestInstanceRejectsCrossAssociatedSessionRows(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			m := &InstanceMonitor{
-				base:    newBase(instanceName, instanceHeight, Deps{Logger: logger}),
-				items:   []string{"SN"},
-				methods: []string{"session query"},
-				queryFn: func(string) []dbconn.Row { return []dbconn.Row{test.row} },
+				base:         newBase(instanceName, instanceHeight, Deps{Logger: logger}),
+				items:        []string{"SN"},
+				methods:      []string{"session query"},
+				queryContext: func(context.Context, string) []dbconn.Row { return []dbconn.Row{test.row} },
 			}
 			values := []string{"old"}
 			var sessionRow dbconn.Row
-			if m.refreshSession(0, values, &sessionRow) {
+			if m.refreshSession(context.Background(), 0, values, &sessionRow) {
 				t.Fatal("cross-associated session result was accepted")
 			}
 			if !reflect.DeepEqual(values, []string{"old"}) || sessionRow != nil {
@@ -71,13 +72,13 @@ func TestInstanceAcceptsValidSessionAggregate(t *testing.T) {
 		base:    newBase(instanceName, instanceHeight, Deps{Logger: logging.New("monitor-result-validation-test", "")}),
 		items:   []string{"SN"},
 		methods: []string{"session query"},
-		queryFn: func(string) []dbconn.Row {
+		queryContext: func(context.Context, string) []dbconn.Row {
 			return []dbconn.Row{{int64(19), int64(8), int64(7), int64(0), int64(11)}}
 		},
 	}
 	values := []string{"old"}
 	var sessionRow dbconn.Row
-	if !m.refreshSession(0, values, &sessionRow) {
+	if !m.refreshSession(context.Background(), 0, values, &sessionRow) {
 		t.Fatal("valid session aggregate was rejected")
 	}
 	if values[0] != "19" || !reflect.DeepEqual(sessionRow, dbconn.Row{
@@ -94,12 +95,12 @@ func TestInstanceRejectsCrossAssociatedXlogValue(t *testing.T) {
 		methods:  []string{"xlog query"},
 		interval: 1,
 		prevXlog: 4096,
-		queryFn: func(string) []dbconn.Row {
+		queryContext: func(context.Context, string) []dbconn.Row {
 			return []dbconn.Row{{int64(3571632)}}
 		},
 	}
 	values := []string{"old"}
-	if m.refreshXlog(0, values) {
+	if m.refreshXlog(context.Background(), 0, values) {
 		t.Fatal("cross-associated xlog value was accepted")
 	}
 	if values[0] != "old" || m.prevXlog != 4096 {
@@ -142,7 +143,7 @@ func TestDBRefreshRejectsCrossAssociatedBusyRow(t *testing.T) {
 		values:    []string{"12.5"},
 		busy:      oldBusy,
 		lastBusy:  oldLast,
-		queryFn: func(string) []dbconn.Row {
+		queryContext: func(context.Context, string) []dbconn.Row {
 			return []dbconn.Row{{
 				int64(10494930208), "BufHashTableSearch",
 				int64(1940789603), int64(1968176646), float64(1), "LWLock",

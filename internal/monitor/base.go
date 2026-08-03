@@ -1,6 +1,8 @@
 package monitor
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,10 +26,17 @@ type base struct {
 	pad    *tui.Pad
 	mu     sync.Mutex
 	deps   Deps
+
+	refreshState RefreshState
 }
 
 func newBase(name string, height int, deps Deps) base {
-	return base{name: name, height: height, deps: deps}
+	return base{
+		name:         name,
+		height:       height,
+		deps:         deps,
+		refreshState: RefreshState{Phase: RefreshLoading},
+	}
 }
 
 // Name returns the panel name.
@@ -35,6 +44,20 @@ func (b *base) Name() string { return b.name }
 
 // Height returns the panel's row count.
 func (b *base) Height() int { return b.height }
+
+// SetRefreshState stores the scheduler's latest collection result.
+func (b *base) SetRefreshState(state RefreshState) {
+	b.mu.Lock()
+	b.refreshState = state
+	b.mu.Unlock()
+}
+
+// RefreshState returns the scheduler's latest collection result.
+func (b *base) RefreshState() RefreshState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.refreshState
+}
 
 // Init records the panel's position and allocates its pad. The pad is always
 // created (even in daemon mode) so the dump snapshot stays available for
@@ -67,6 +90,42 @@ func (b *base) blit(screen tcell.Screen) {
 	if b.pad != nil {
 		b.pad.Blit(screen, b.beginX, b.beginY)
 	}
+}
+
+func refreshBadge(phase RefreshPhase) string {
+	switch phase {
+	case RefreshLoading:
+		return "[L]"
+	case RefreshRefreshing:
+		return "[R]"
+	case RefreshTimeout:
+		return "[T]"
+	case RefreshError:
+		return "[E]"
+	default:
+		return ""
+	}
+}
+
+// drawRefreshBadgeLocked overlays the current collection state on row 0. Draw
+// already holds b.mu, so this helper deliberately does not acquire it again.
+func (b *base) drawRefreshBadgeLocked() {
+	if b.pad == nil {
+		return
+	}
+	badge := refreshBadge(b.refreshState.Phase)
+	if badge == "" || b.width <= len(badge) {
+		return
+	}
+	b.pad.AddStr(0, b.width-len(badge)-1, badge,
+		model.Style{Pair: model.PairConfirmYellow, Bold: true})
+}
+
+func queryFailure(ctx context.Context, operation string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("%s failed", operation)
 }
 
 // terminateSession terminates one backend by pid and session id.

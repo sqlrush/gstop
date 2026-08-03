@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -72,6 +73,8 @@ type EventMonitor struct {
 	lastCPU    int64
 	lastTotal  int64
 	lastEvents map[string]eventSample
+
+	queryContext func(context.Context, string) []dbconn.Row
 }
 
 // NewEventMonitor builds the wait-event panel (height 7: one header + six rows).
@@ -119,52 +122,66 @@ func (m *EventMonitor) parseConfig() error {
 // Refresh snapshots the mode flag (so the header and data stay in step for this
 // cycle) and re-samples the wait events.
 func (m *EventMonitor) Refresh() {
+	_ = m.RefreshWithContext(context.Background())
+}
+
+func (m *EventMonitor) RefreshContext(ctx context.Context) {
+	_ = m.RefreshWithContext(ctx)
+}
+
+func (m *EventMonitor) RefreshWithContext(ctx context.Context) error {
 	m.mu.Lock()
 	curr := m.immediate
-	m.currImmediate = curr
+	lastCPU := m.lastCPU
+	lastTotal := m.lastTotal
+	lastEvents := m.lastEvents
 	m.mu.Unlock()
 
-	m.refreshEvent(curr)
+	return m.refreshEvent(ctx, curr, lastCPU, lastTotal, lastEvents)
 }
 
 // refreshEvent runs the query, computes the DB CPU row and per-event rows for the
 // active mode, sorts by PCT, and publishes the result. On any early return the
 // previously published rows are left in place, exactly as the original did.
-func (m *EventMonitor) refreshEvent(realtime bool) {
-	rows := m.deps.DB.Query(eventQuery)
+func (m *EventMonitor) refreshEvent(
+	ctx context.Context,
+	realtime bool,
+	lastCPU, lastTotal int64,
+	lastEvents map[string]eventSample,
+) error {
+	rows := m.query(ctx, eventQuery)
 	if rows == nil {
 		m.deps.Logger.Error("Exec query failed.")
-		return
+		return queryFailure(ctx, "event query")
 	}
 	if len(rows) == 0 {
 		m.deps.Logger.Error("No wait events returned.")
-		return
+		return fmt.Errorf("event query returned no rows")
+	}
+	if !validEventRows(rows) {
+		m.deps.Logger.Error("Wait event query returned an invalid result shape or value.")
+		return fmt.Errorf("invalid event query result")
 	}
 
 	curCPU, _ := rows[0].Int(0)
 	curTotal := sumTotalWaitTime(rows)
 	if curTotal == 0 || curCPU == 0 {
 		m.deps.Logger.Error("Invalid total_time: %d or cpu_time: %d.", curTotal, curCPU)
-		return
+		return fmt.Errorf("invalid event totals: total=%d cpu=%d", curTotal, curCPU)
 	}
 
-	cpuDiff, totalDiff := m.computeDiffs(realtime, curCPU, curTotal)
+	cpuDiff, totalDiff := computeEventDiffs(realtime, curCPU, curTotal, lastCPU, lastTotal)
 	if totalDiff == 0 {
 		// Guards the division below; the original would ZeroDivisionError here.
 		m.deps.Logger.Error("Invalid total_time_diff: 0.")
-		return
+		return fmt.Errorf("invalid event total time diff: 0")
 	}
 
 	lines := make([]eventLine, 0, len(rows)+1)
 	lines = append(lines, buildDBCPULine(cpuDiff, totalDiff))
 
-	// Save the raw CPU/total counters after the DB CPU row, before the per-event
-	// rows, matching the ordering in refresh_event.
-	m.lastCPU = curCPU
-	m.lastTotal = curTotal
-
 	if realtime {
-		lines = append(lines, buildRealtimeLines(rows, totalDiff, m.lastEvents)...)
+		lines = append(lines, buildRealtimeLines(rows, totalDiff, lastEvents)...)
 	} else {
 		lines = append(lines, buildCumulativeLines(rows, totalDiff)...)
 	}
@@ -177,21 +194,53 @@ func (m *EventMonitor) refreshEvent(realtime bool) {
 
 	m.mu.Lock()
 	m.lines = lines
-	m.mu.Unlock()
-
-	// Cache this sample for the next realtime diff (both modes update it, as the
-	// original saved last_event_result unconditionally).
+	m.currImmediate = realtime
+	m.lastCPU = curCPU
+	m.lastTotal = curTotal
 	m.lastEvents = snapshotEvents(rows)
+	m.mu.Unlock()
+	return nil
+}
+
+func validEventRows(rows []dbconn.Row) bool {
+	if !rowsHaveWidth(rows, 6) {
+		return false
+	}
+	for _, row := range rows {
+		cpu, cpuOK := row.Int(0)
+		waits, waitsOK := row.Int(2)
+		totalWait, totalWaitOK := row.Int(3)
+		avgWait, avgWaitOK := row.Float(4)
+		if !cpuOK || !waitsOK || !totalWaitOK || !avgWaitOK ||
+			cpu < 0 || waits < 0 || totalWait < 0 || avgWait < 0 ||
+			strings.TrimSpace(row.Str(1)) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *EventMonitor) failRefresh() {}
+
+func (m *EventMonitor) query(ctx context.Context, query string) []dbconn.Row {
+	if m.queryContext != nil {
+		return m.queryContext(ctx, query)
+	}
+	return m.deps.DB.QueryContext(ctx, query)
 }
 
 // computeDiffs returns (cpu_time_diff, total_time_diff) for the active mode.
 // Cumulative uses absolute values; realtime differences against the last sample.
 func (m *EventMonitor) computeDiffs(realtime bool, curCPU, curTotal int64) (int64, int64) {
+	return computeEventDiffs(realtime, curCPU, curTotal, m.lastCPU, m.lastTotal)
+}
+
+func computeEventDiffs(realtime bool, curCPU, curTotal, lastCPU, lastTotal int64) (int64, int64) {
 	if !realtime {
 		return curCPU, curTotal + curCPU
 	}
-	cpuDiff := curCPU - m.lastCPU
-	return cpuDiff, curTotal - m.lastTotal + cpuDiff
+	cpuDiff := curCPU - lastCPU
+	return cpuDiff, curTotal - lastTotal + cpuDiff
 }
 
 // sumTotalWaitTime sums column 3 (total_wait_time) over every row, the analogue of
@@ -288,6 +337,7 @@ func (m *EventMonitor) Draw(screen tcell.Screen) {
 	m.pad.Clear()
 	m.drawHeader()
 	m.drawRows()
+	m.drawRefreshBadgeLocked()
 	m.blit(screen)
 }
 

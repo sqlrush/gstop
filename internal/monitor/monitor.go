@@ -6,6 +6,9 @@
 package monitor
 
 import (
+	"context"
+	"time"
+
 	"github.com/gdamore/tcell/v2"
 
 	"gstop/internal/alarm"
@@ -40,4 +43,42 @@ type Monitor interface {
 	Draw(screen tcell.Screen)
 	DumpData() model.DumpData
 	SetVisible(v bool)
+}
+
+// ContextMonitor lets Refresher give a whole module one shared deadline across
+// all of its sequential SQL and command probes.
+type ContextMonitor interface {
+	RefreshContext(context.Context)
+}
+
+// RefreshPhase describes the most recent collection outcome for a monitor.
+type RefreshPhase string
+
+const (
+	RefreshLoading    RefreshPhase = "loading"
+	RefreshRefreshing RefreshPhase = "refreshing"
+	RefreshFresh      RefreshPhase = "fresh"
+	RefreshTimeout    RefreshPhase = "timeout"
+	RefreshError      RefreshPhase = "error"
+)
+
+// RefreshState records collection timing and the last result independently for
+// each monitor.
+type RefreshState struct {
+	Phase       RefreshPhase
+	LastAttempt time.Time
+	LastSuccess time.Time
+	Error       string
+}
+
+// ResultContextMonitor refreshes under a deadline and reports the collection
+// result to the scheduler.
+type ResultContextMonitor interface {
+	RefreshWithContext(context.Context) error
+}
+
+// RefreshStateMonitor exposes scheduler-owned collection state.
+type RefreshStateMonitor interface {
+	SetRefreshState(RefreshState)
+	RefreshState() RefreshState
 }

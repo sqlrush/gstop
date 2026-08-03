@@ -13,6 +13,13 @@ type DBInfo struct {
 	role    string
 }
 
+// DBInfoSnapshot is one coherent version/user/role tuple.
+type DBInfoSnapshot struct {
+	Version string
+	User    string
+	Role    string
+}
+
 // NewDBInfo returns a DBInfo seeded with the same defaults as the Python class.
 func NewDBInfo() *DBInfo {
 	return &DBInfo{version: "unknown", user: "rdsAdmin", role: "unknown"}
@@ -26,6 +33,15 @@ func (d *DBInfo) SetUser(v string) { d.set(&d.user, v) }
 
 // SetRole records the cluster role ("primary" or "standby").
 func (d *DBInfo) SetRole(v string) { d.set(&d.role, v) }
+
+// SetSnapshot replaces the complete metadata tuple under one lock.
+func (d *DBInfo) SetSnapshot(snapshot DBInfoSnapshot) {
+	d.mu.Lock()
+	d.version = snapshot.Version
+	d.user = snapshot.User
+	d.role = snapshot.Role
+	d.mu.Unlock()
+}
 
 func (d *DBInfo) set(field *string, v string) {
 	d.mu.Lock()
@@ -41,6 +57,17 @@ func (d *DBInfo) User() string { return d.get(&d.user) }
 
 // Role returns the recorded cluster role.
 func (d *DBInfo) Role() string { return d.get(&d.role) }
+
+// Snapshot returns the complete metadata tuple from one read lock.
+func (d *DBInfo) Snapshot() DBInfoSnapshot {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return DBInfoSnapshot{
+		Version: d.version,
+		User:    d.user,
+		Role:    d.role,
+	}
+}
 
 func (d *DBInfo) get(field *string) string {
 	d.mu.RLock()

@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -57,7 +58,24 @@ type DBMonitor struct {
 
 	dbInfo *model.DBInfo
 
-	queryFn func(string) []dbconn.Row
+	queryContext func(context.Context, string) []dbconn.Row
+	runContext   func(context.Context, string, bool) (string, bool)
+}
+
+type dbRefreshState struct {
+	counter     int
+	version     string
+	user        string
+	pcache      string
+	primaryNode string
+	busy        busyResult
+	lastBusy    []busyResult
+}
+
+type dbRefreshCommit struct {
+	publishDBInfo bool
+	dbInfo        model.DBInfoSnapshot
+	commitPcache  bool
 }
 
 // NewDBMonitor builds the database panel.
@@ -106,6 +124,27 @@ func (m *DBMonitor) parseConfig() error {
 // Refresh recomputes every cell using the three-phase (SQL, shell, post-process)
 // pipeline from the original.
 func (m *DBMonitor) Refresh() {
+	_ = m.RefreshWithContext(context.Background())
+}
+
+func (m *DBMonitor) RefreshContext(ctx context.Context) {
+	_ = m.RefreshWithContext(ctx)
+}
+
+func (m *DBMonitor) RefreshWithContext(ctx context.Context) error {
+	saved := m.captureRefreshState()
+	var commit dbRefreshCommit
+	if m.dbInfo != nil {
+		commit.publishDBInfo = true
+		commit.dbInfo = m.dbInfo.Snapshot()
+	}
+	published := false
+	defer func() {
+		if !published {
+			m.restoreRefreshState(saved)
+		}
+	}()
+
 	m.counter++
 	tmp := make([]string, len(m.items))
 	for i := range tmp {
@@ -116,17 +155,44 @@ func (m *DBMonitor) Refresh() {
 		if m.shortCircuit(i, item, tmp) {
 			continue
 		}
-		processData, ok := m.phaseQuery(i, item)
+		processData, ok := m.phaseQuery(ctx, i, item)
 		if !ok {
-			return
+			return queryFailure(ctx, fmt.Sprintf("db query for %s", item))
 		}
-		m.phaseCommand(i, processData, tmp)
-		m.phasePost(i, item, tmp)
+		if !m.phaseCommand(ctx, i, processData, tmp) {
+			return queryFailure(ctx, fmt.Sprintf("db command for %s", item))
+		}
+		if err := m.phasePost(ctx, i, item, tmp, &commit); err != nil {
+			return err
+		}
 	}
 
 	m.mu.Lock()
 	m.values = tmp
+	if commit.publishDBInfo {
+		m.dbInfo.SetSnapshot(commit.dbInfo)
+	}
+	if commit.commitPcache {
+		m.deps.Health.CommitMemoryRefresh("pcache")
+	}
 	m.mu.Unlock()
+	published = true
+	return nil
+}
+
+func (m *DBMonitor) captureRefreshState() dbRefreshState {
+	state := dbRefreshState{
+		counter: m.counter, version: m.version, user: m.user,
+		pcache: m.pcache, primaryNode: m.primaryNode, busy: m.busy,
+		lastBusy: append([]busyResult(nil), m.lastBusy...),
+	}
+	return state
+}
+
+func (m *DBMonitor) restoreRefreshState(saved dbRefreshState) {
+	m.counter, m.version, m.user = saved.counter, saved.version, saved.user
+	m.pcache, m.primaryNode, m.busy = saved.pcache, saved.primaryNode, saved.busy
+	m.lastBusy = append(m.lastBusy[:0], saved.lastBusy...)
 }
 
 // shortCircuit handles the cached/short-cut cells and returns true when cell i is
@@ -150,7 +216,7 @@ func (m *DBMonitor) shortCircuit(i int, item string, tmp []string) bool {
 			tmp[i] = "0"
 			return true
 		}
-		if !m.deps.Health.ShouldRefreshMemory("pcache") {
+		if !m.deps.Health.CanRefreshMemory("pcache") {
 			tmp[i] = m.pcache
 			return true
 		}
@@ -165,13 +231,13 @@ func (m *DBMonitor) shortCircuit(i int, item string, tmp []string) bool {
 
 // phaseQuery runs the cell's SQL (if any) and returns the scalar text to feed the
 // shell phase. For db% it caches the (cpu,db,ts) sample instead.
-func (m *DBMonitor) phaseQuery(i int, item string) (string, bool) {
+func (m *DBMonitor) phaseQuery(ctx context.Context, i int, item string) (string, bool) {
 	if m.methods[i] == "" {
 		return "", true
 	}
-	rows := m.query(m.methods[i])
+	rows := m.query(ctx, m.methods[i])
 	if rows == nil {
-		return "", true
+		return "", false
 	}
 	if item == "db%" {
 		if len(rows) != 1 {
@@ -180,11 +246,18 @@ func (m *DBMonitor) phaseQuery(i int, item string) (string, bool) {
 		}
 		sample := parseBusy(rows[0])
 		if !sample.valid {
-			m.deps.Logger.Error("Exec query for monitor_item %s returned an invalid busy sample.", item)
+			m.deps.Logger.Error(
+				"Exec query for monitor_item %s returned an invalid busy sample with %d columns.",
+				item, len(rows[0]),
+			)
 			return "", false
 		}
 		m.busy = sample
 		return "", true
+	}
+	if !rowsHaveWidth(rows, 1) {
+		m.deps.Logger.Error("Exec query for monitor_item %s returned a non-scalar result.", item)
+		return "", false
 	}
 	var processData string
 	for _, row := range rows {
@@ -195,61 +268,63 @@ func (m *DBMonitor) phaseQuery(i int, item string) (string, bool) {
 
 // phaseCommand runs the cell's shell command (if any), optionally piping the SQL
 // scalar into it, and stores the raw output.
-func (m *DBMonitor) phaseCommand(i int, processData string, tmp []string) {
+func (m *DBMonitor) phaseCommand(ctx context.Context, i int, processData string, tmp []string) bool {
 	osMethod := m.osMethods[i]
 	if processData != "" {
 		if osMethod != "" {
-			if out, ok := m.deps.OS.Run(fmt.Sprintf("echo \"%s\" | %s", processData, osMethod), true); ok {
+			if out, ok := m.run(ctx, fmt.Sprintf("echo \"%s\" | %s", processData, osMethod), true); ok {
 				tmp[i] = out
 			} else {
 				tmp[i] = ""
+				return false
 			}
 		} else {
 			tmp[i] = processData
 		}
-		return
+		return true
 	}
 	if osMethod != "" {
-		if out, ok := m.deps.OS.Run(osMethod, true); ok {
+		if out, ok := m.run(ctx, osMethod, true); ok {
 			tmp[i] = out
 		} else {
 			tmp[i] = ""
+			return false
 		}
 	}
+	return true
 }
 
 // phasePost applies the per-cell Python post-processing: memory formatting,
 // primary-node role detection, version/user caching, and the db%/WTR% deltas.
-func (m *DBMonitor) phasePost(i int, item string, tmp []string) {
+func (m *DBMonitor) phasePost(ctx context.Context, i int, item string, tmp []string, commit *dbRefreshCommit) error {
 	switch {
 	case item == "MB dyn":
 		tmp[i] = formatMB(tmp[i])
 	case item == "MB pcache":
 		tmp[i] = formatMB(tmp[i])
 		m.pcache = tmp[i]
+		commit.commitPcache = true
 	case item == "PRI":
 		m.primaryNode = tmp[i]
-		if m.dbInfo != nil {
-			if m.isPrimary(m.primaryNode) {
-				m.dbInfo.SetRole("primary")
-			} else {
-				m.dbInfo.SetRole("standby")
-			}
+		primary, err := m.isPrimary(ctx, m.primaryNode)
+		if err != nil {
+			return err
+		}
+		commit.dbInfo.Role = "standby"
+		if primary {
+			commit.dbInfo.Role = "primary"
 		}
 		m.counter = 0
 	case i == 0:
 		m.version = tmp[i]
-		if m.dbInfo != nil {
-			m.dbInfo.SetVersion(tmp[i])
-		}
+		commit.dbInfo.Version = tmp[i]
 	case i == 1:
 		m.user = tmp[i]
-		if m.dbInfo != nil {
-			m.dbInfo.SetUser(tmp[i])
-		}
+		commit.dbInfo.User = tmp[i]
 	case item == "db%" || item == "WTR%":
 		tmp[i] = m.busyPercent(i, item, tmp[i])
 	}
+	return nil
 }
 
 // busyPercent computes db% or WTR% from the delta against the previous sample.
@@ -274,12 +349,46 @@ func (m *DBMonitor) busyPercent(i int, item, current string) string {
 }
 
 // isPrimary reports whether this host owns the primary node's address.
-func (m *DBMonitor) isPrimary(node string) bool {
+func (m *DBMonitor) isPrimary(ctx context.Context, node string) (bool, error) {
+	if node == "" {
+		return false, nil
+	}
+	out, ok := m.run(ctx, "ifconfig", true)
+	if !ok {
+		return false, queryFailure(ctx, "primary address detection")
+	}
+	return interfaceHasAddress(out, node), nil
+}
+
+func interfaceHasAddress(output, node string) bool {
+	node = strings.TrimSpace(node)
 	if node == "" {
 		return false
 	}
-	out, ok := m.deps.OS.Run("ifconfig | grep -w "+node, true)
-	return ok && strings.TrimSpace(out) != ""
+	for _, field := range strings.Fields(output) {
+		candidate := strings.Trim(field, "[](),")
+		candidate = strings.TrimPrefix(candidate, "addr:")
+		candidate = strings.TrimPrefix(candidate, "inet:")
+		candidate = strings.SplitN(candidate, "/", 2)[0]
+		if candidate == node {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *DBMonitor) query(ctx context.Context, query string) []dbconn.Row {
+	if m.queryContext != nil {
+		return m.queryContext(ctx, query)
+	}
+	return m.deps.DB.QueryContext(ctx, query)
+}
+
+func (m *DBMonitor) run(ctx context.Context, command string, check bool) (string, bool) {
+	if m.runContext != nil {
+		return m.runContext(ctx, command, check)
+	}
+	return m.deps.OS.RunContext(ctx, command, check)
 }
 
 // Draw renders the single row of "value item" pairs.
@@ -301,6 +410,7 @@ func (m *DBMonitor) Draw(screen tcell.Screen) {
 			x += m.widths[i]
 		}
 	}
+	m.drawRefreshBadgeLocked()
 	m.blit(screen)
 }
 
@@ -338,13 +448,6 @@ func parseBusy(row dbconn.Row) busyResult {
 		return busyResult{}
 	}
 	return busyResult{cpuTime: cpu, dbTime: db, ts: ts, valid: true}
-}
-
-func (m *DBMonitor) query(query string) []dbconn.Row {
-	if m.queryFn != nil {
-		return m.queryFn(query)
-	}
-	return m.deps.DB.Query(query)
 }
 
 // formatMB rounds a raw MB value to two decimals and renders it with six

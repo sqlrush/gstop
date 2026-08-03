@@ -44,20 +44,40 @@ func (h *Health) UpdateCPUUsage(cpu float64) {
 // threshold, and otherwise no more often than dynamic_mem_interval. A true
 // result records the refresh time.
 func (h *Health) ShouldRefreshMemory(key string) bool {
-	threshold := h.cfg.GetFloat("main.dynamic_mem_cpu_thresh", 50)
-	interval := time.Duration(h.cfg.GetInt("main.dynamic_mem_interval", 60)) * time.Second
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	now := h.now()
+	if !h.canRefreshMemoryLocked(key, now) {
+		return false
+	}
+	h.lastMemRef[key] = now
+	return true
+}
+
+// CanRefreshMemory reports whether key is eligible without consuming its
+// throttle. Call CommitMemoryRefresh only after the associated collection has
+// succeeded.
+func (h *Health) CanRefreshMemory(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.canRefreshMemoryLocked(key, h.now())
+}
+
+// CommitMemoryRefresh records a successfully published memory collection.
+func (h *Health) CommitMemoryRefresh(key string) {
+	h.mu.Lock()
+	h.lastMemRef[key] = h.now()
+	h.mu.Unlock()
+}
+
+func (h *Health) canRefreshMemoryLocked(key string, now time.Time) bool {
+	threshold := h.cfg.GetFloat("main.dynamic_mem_cpu_thresh", 50)
 	if h.lastCPUUsage >= threshold {
 		return false
 	}
+	interval := time.Duration(h.cfg.GetInt("main.dynamic_mem_interval", 60)) * time.Second
 	last, ok := h.lastMemRef[key]
-	if !ok || h.now().Sub(last) >= interval {
-		h.lastMemRef[key] = h.now()
-		return true
-	}
-	return false
+	return !ok || now.Sub(last) >= interval
 }
 
 // UpdateRefreshTime records a completed refresh cycle (the liveness heartbeat).

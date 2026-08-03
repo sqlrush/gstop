@@ -49,3 +49,32 @@ func TestSupportsGsGetExplain(t *testing.T) {
 		t.Error("unknown should default to supported (GaussDB behaviour)")
 	}
 }
+
+func TestSafeExplainStatementAllowsOnePlannableStatement(t *testing.T) {
+	for _, query := range []string{
+		"select * from t where id = 1;",
+		"select now()::date",
+		"with x as (select 1) select * from x",
+		"update t set value = 1 where id = 2",
+	} {
+		if statement, err := SafeExplainStatement(query); err != nil || statement == "" {
+			t.Errorf("SafeExplainStatement(%q) = %q, %v", query, statement, err)
+		}
+	}
+}
+
+func TestSafeExplainStatementRejectsUnsafeOrUnplannableSQL(t *testing.T) {
+	for _, query := range []string{
+		"",
+		"select 1; delete from important",
+		"select * from t where id = $1",
+		"select * from t where id = ?",
+		"select * from t where id = :value",
+		"begin",
+		"explain select 1",
+	} {
+		if _, err := SafeExplainStatement(query); err == nil {
+			t.Errorf("SafeExplainStatement(%q) accepted unsafe SQL", query)
+		}
+	}
+}

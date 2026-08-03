@@ -21,10 +21,9 @@ const (
 	inspectionPersist = 0
 )
 
-// SQL preserved verbatim from inspection.py.
+// SQL preserved from inspection.py, except the statement-history check: that
+// check is generated as an indexed time window by slowSQLWindowQuery.
 const (
-	inspStatementHistorySQL = `SELECT count(*) FROM dbe_perf.statement_history WHERE db_name != 'postgres';`
-
 	inspTotalMemorySQL = `SELECT memorytype, memorymbytes FROM pg_catalog.pv_total_memory_detail();`
 
 	inspInvalidIndexSQL = `SELECT a.schemaname, a.relname, a.indexrelname, b.indisusable, b.indisready, b.indisvalid
@@ -95,17 +94,23 @@ type Inspection struct {
 	// item can honour its own interval.
 	lastCheck map[string]time.Time
 
-	// slow-SQL running count cache (the Python last_statement_history).
-	lastSlowSQL    int64
-	hasLastSlowSQL bool
+	// slowSQLSince is the upper bound of the last successful history window.
+	// A failed query leaves it unchanged so the next success covers the gap.
+	slowSQLSince time.Time
+	now          func() time.Time
+	query        func(string) []dbconn.Row
 }
 
 // NewInspection builds the inspection scenario, loading its items from config
 // and pre-seeding the slow-SQL baseline when that item is enabled.
 func NewInspection(deps Deps) *Inspection {
+	started := time.Now()
 	s := &Inspection{
-		Base:      NewBase(inspectionName, inspectionHeader, deps, inspectionPersist),
-		lastCheck: map[string]time.Time{},
+		Base:         NewBase(inspectionName, inspectionHeader, deps, inspectionPersist),
+		lastCheck:    map[string]time.Time{},
+		slowSQLSince: started,
+		now:          time.Now,
+		query:        deps.DB.Query,
 	}
 	s.loadConfig()
 	if s.enabled {
@@ -301,38 +306,34 @@ func (s *Inspection) queryMemoryPair(maxKey, usedKey string) (maxVal, usedVal fl
 	return maxVal, usedVal, true
 }
 
-// checkSlowSQL reports the growth in dbe_perf.statement_history since the last
-// run. Port of _check_slow_sql.
+// checkSlowSQL counts new slow statements since the last successful check. The
+// cursor advances only on success, so a timeout produces a blank/zero round but
+// the next successful interval still includes the missed time.
 func (s *Inspection) checkSlowSQL() inspResult {
-	if !s.hasLastSlowSQL {
-		n, ok := s.querySlowSQLCount()
-		if !ok {
-			return inspIntResult(0, inspNoDetails)
+	to := s.now()
+	rows := s.query(slowSQLWindowQuery(s.slowSQLSince, to))
+	if len(rows) == 0 {
+		if s.Base != nil && s.deps.Logger != nil {
+			s.deps.Logger.Error("Query dbe_perf.statement_history failed.")
 		}
-		s.lastSlowSQL, s.hasLastSlowSQL = n, true
-	}
-	curr, ok := s.querySlowSQLCount()
-	if !ok {
-		s.hasLastSlowSQL = false
 		return inspIntResult(0, inspNoDetails)
 	}
-	diff := curr - s.lastSlowSQL
-	s.lastSlowSQL, s.hasLastSlowSQL = curr, true
-	return inspIntResult(diff, inspNoDetails)
+	n, ok := dbInt64(rows[0].Col(0))
+	if !ok {
+		return inspIntResult(0, inspNoDetails)
+	}
+	s.slowSQLSince = to
+	return inspIntResult(n, inspNoDetails)
 }
 
-// querySlowSQLCount returns the current slow-SQL count, or ok=false on failure.
-func (s *Inspection) querySlowSQLCount() (int64, bool) {
-	rows := s.deps.DB.Query(inspStatementHistorySQL)
-	if rows == nil {
-		s.deps.Logger.Error("Query dbe_perf.statement_history failed.")
-		return 0, false
-	}
-	if len(rows) == 0 {
-		return 0, false
-	}
-	n, _ := dbInt64(rows[0].Col(0))
-	return n, true
+func slowSQLWindowQuery(from, to time.Time) string {
+	const timestampLayout = "2006-01-02 15:04:05.999999999Z07:00"
+	return fmt.Sprintf(`SELECT count(*)
+FROM dbe_perf.statement_history
+WHERE start_time > '%s'
+  AND start_time <= '%s'
+  AND is_slow_sql = true
+  AND db_name != 'postgres';`, from.Format(timestampLayout), to.Format(timestampLayout))
 }
 
 // checkLongTransaction counts sessions whose current transaction has been open

@@ -1,6 +1,9 @@
 package app
 
 import (
+	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gstop/internal/alarm"
@@ -8,12 +11,18 @@ import (
 	"gstop/internal/dbconn"
 	"gstop/internal/emergency"
 	"gstop/internal/health"
+	"gstop/internal/healthdash"
 	"gstop/internal/logging"
 	"gstop/internal/model"
 	"gstop/internal/monitor"
+	"gstop/internal/oscmd"
 	"gstop/internal/persist"
 	"gstop/internal/tui"
 )
+
+type detailStreamer interface {
+	LoadStream(context.Context, healthdash.DetailTarget, healthdash.DetailEmitter)
+}
 
 // App coordinates the monitors, the background refresher, and the TUI event loop.
 // It is the top-level equivalent of gstop.py's gstop_main_routine.
@@ -23,6 +32,7 @@ type App struct {
 	alarm  *alarm.Alarm
 	health *health.Health
 	db     *dbconn.DB
+	os     *oscmd.Runner
 
 	screen   *tui.Screen // nil in daemon mode
 	daemon   bool
@@ -36,12 +46,26 @@ type App struct {
 
 	emergency       *emergency.EmergencyMain // nil unless the emergency feature is enabled
 	emergencyBeginY int
+	planChange      *emergency.PlanChange
+	planPersist     emergency.Persister
 
-	dbInfo     *model.DBInfo
-	dataLogger *persist.DataLogger // nil unless persistence is enabled
+	dbInfo         *model.DBInfo
+	dataLogger     *persist.DataLogger // nil unless persistence is enabled
+	dataLoggerMu   sync.Mutex
+	dataLoggerOnce sync.Once
 
-	showMemoryView bool
-	refresher      *Refresher
+	showMemoryView        bool
+	showHealthView        bool
+	healthCollector       *healthdash.Collector
+	healthView            *healthdash.View
+	healthDetailLoader    detailStreamer
+	healthDetailMu        sync.Mutex
+	healthState           healthViewState
+	healthDetailRequestID uint64
+	healthDetailCancel    context.CancelFunc
+	healthDetailPatches   chan healthDetailPatch
+	refresher             *Refresher
+	exitRequested         atomic.Bool
 }
 
 // New builds the app, its monitors, and their layout. screen is nil for daemon
@@ -54,8 +78,12 @@ func New(deps monitor.Deps, screen *tui.Screen) *App {
 		alarm:  deps.Alarm,
 		health: deps.Health,
 		db:     deps.DB,
+		os:     deps.OS,
 		screen: screen,
 		daemon: deps.Cfg.GetBool("main.daemon", false),
+	}
+	if screen != nil {
+		screen.SetQuitHandler(a.requestExit)
 	}
 	a.buildMonitors(deps)
 	return a
@@ -91,6 +119,7 @@ func (a *App) buildMonitors(deps monitor.Deps) {
 
 	a.buildMemory(deps)
 	a.buildEmergency(deps)
+	a.buildHealthDashboard(deps)
 }
 
 // buildMemory creates the memory dashboard only when both memory monitoring and
@@ -115,19 +144,38 @@ func (a *App) Run() error {
 	a.session.SetCursor(-1)
 	interval := a.interval()
 	for {
+		if a.exitRequested.Load() {
+			return nil
+		}
 		if a.checkStalled() {
 			return nil
 		}
 		a.drawAll()
-		a.renderEmergency(a.screen.Raw())
-		a.screen.Show()
+		if !a.showHealthView {
+			a.renderEmergency(a.screen.Raw())
+		}
+		presentMainFrame(a.screen)
 
 		key, ok := a.screen.GetKey(interval)
 		if !ok {
 			continue
 		}
+		if a.exitRequested.Load() || key.IsRune('q') {
+			a.requestExit()
+			return nil
+		}
+		if a.showHealthView {
+			a.handleHealthViewKey(key)
+			if a.exitRequested.Load() {
+				return nil
+			}
+			continue
+		}
 		if a.showMemoryView {
 			a.handleMemoryViewKey(key)
+			if a.exitRequested.Load() {
+				return nil
+			}
 			continue
 		}
 		if a.dispatch(key) {
@@ -144,6 +192,9 @@ func (a *App) RunDaemon() error {
 
 	interval := a.interval()
 	for {
+		if a.exitRequested.Load() {
+			return nil
+		}
 		if a.checkStalled() {
 			return nil
 		}
@@ -155,29 +206,52 @@ func (a *App) RunDaemon() error {
 	}
 }
 
-// startRefresher does one synchronous refresh so the first frame has data, then
-// launches the background refresh goroutine.
+// startRefresher launches collection and persistence without delaying the first
+// frame.
 func (a *App) startRefresher() {
 	a.refresher = NewRefresher(a.monitors, a.health, a.cfg, a.logger)
-	if a.emergency != nil {
-		a.refresher.SetAfterRefresh(a.emergencyAnalyze)
+	if a.emergency != nil || a.healthCollector != nil {
+		a.refresher.SetAfterRefresh(a.afterMonitorRefresh)
 	}
-	a.refresher.RefreshOnce()
-	a.startDataLogger()
+	if a.healthCollector != nil {
+		go a.healthCollector.RefreshFast()
+	}
+	go a.startDataLoggerOnce()
 	go a.refresher.Run()
 }
 
-// startDataLogger launches monitoring-data persistence when a positive
-// log_interval is configured. It runs after the initial refresh so the database
-// version is known before the first log file is named.
-func (a *App) startDataLogger() {
-	logInterval := a.cfg.GetInt("main.log_interval", 0)
-	if logInterval == 0 {
-		return
+// startDataLoggerOnce constructs persistence asynchronously because persist.New
+// may wait for DBInfo populated by the first database refresh.
+func (a *App) startDataLoggerOnce() {
+	a.dataLoggerOnce.Do(func() {
+		logInterval := a.cfg.GetInt("main.log_interval", 0)
+		if logInterval <= 0 || a.exitRequested.Load() {
+			return
+		}
+		logger := persist.New(
+			a.osMon, a.dbMon, a.insMon, a.dbInfo, a.cfg, a.logger,
+			time.Duration(logInterval)*time.Second,
+		)
+		a.dataLoggerMu.Lock()
+		if a.exitRequested.Load() {
+			a.dataLoggerMu.Unlock()
+			logger.Stop()
+			return
+		}
+		a.dataLogger = logger
+		logger.Start()
+		a.dataLoggerMu.Unlock()
+	})
+}
+
+func (a *App) stopDataLogger() {
+	a.dataLoggerMu.Lock()
+	logger := a.dataLogger
+	a.dataLogger = nil
+	a.dataLoggerMu.Unlock()
+	if logger != nil {
+		logger.Stop()
 	}
-	interval := time.Duration(logInterval) * time.Second
-	a.dataLogger = persist.New(a.osMon, a.dbMon, a.insMon, a.dbInfo, a.cfg, a.logger, interval)
-	a.dataLogger.Start()
 }
 
 // checkStalled exits (with an alarm) when the refresh loop has been silent for
@@ -195,6 +269,10 @@ func (a *App) checkStalled() bool {
 // drawAll blits every resident panel to the screen; in the memory view the
 // resident panels are hidden and the memory dashboard is drawn over them.
 func (a *App) drawAll() {
+	if a.showHealthView {
+		a.drawHealthView()
+		return
+	}
 	raw := a.screen.Raw()
 	for _, m := range a.monitors {
 		m.Draw(raw)
@@ -208,6 +286,7 @@ func (a *App) drawAll() {
 func (a *App) dispatch(key tui.Key) bool {
 	switch {
 	case key.IsRune('q'):
+		a.requestExit()
 		return true
 	case key.IsRune('r'):
 		a.event.SetImmediate(true)
@@ -217,12 +296,14 @@ func (a *App) dispatch(key tui.Key) bool {
 		a.sessionMode()
 	case key.IsRune('m'):
 		a.enterMemoryView()
+	case key.IsRune('h'):
+		a.enterHealthView()
 	case key.IsRune('e'):
 		a.emergencyMode()
 	default:
 		a.screen.FlushInput()
 	}
-	return false
+	return a.exitRequested.Load()
 }
 
 // enterMemoryView switches to the memory dashboard if it is enabled, hiding the
@@ -253,12 +334,12 @@ func (a *App) setResidentVisible(v bool) {
 	}
 }
 
-// handleMemoryViewKey routes keys while the memory view is active: q returns to
+// handleMemoryViewKey routes keys while the memory view is active: Escape returns to
 // the normal view, m enters the memory selection sub-mode, anything else is
 // discarded. Port of the show_memory_view branch in gstop.py.
 func (a *App) handleMemoryViewKey(key tui.Key) {
 	switch {
-	case key.IsRune('q'):
+	case key.Kind == tui.KeyEscape:
 		a.exitMemoryView()
 	case key.IsRune('m'):
 		a.memoryMode()
@@ -281,17 +362,50 @@ func (a *App) sessionMode() {
 
 // stop tears down the background loop and alarm on exit.
 func (a *App) stop() {
+	a.requestExit()
 	a.logger.Warning("Gstop is starting to exit.")
-	if a.dataLogger != nil {
-		a.dataLogger.Stop()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if a.refresher != nil {
+			a.refresher.Stop()
+		}
+		a.stopDataLogger()
+		if a.memory != nil {
+			a.memory.Stop()
+		}
+		if a.healthCollector != nil {
+			a.healthCollector.Stop()
+		}
+		a.alarm.Stop()
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		a.logger.Warning("Shutdown cleanup exceeded 500ms; exiting without further wait.")
 	}
-	if a.memory != nil {
-		a.memory.Stop()
+}
+
+// requestExit is the highest-priority command path. It records the process exit
+// request before canceling data sources, ensuring no subsequent refresh can be
+// mistaken for useful work.
+func (a *App) requestExit() {
+	if !a.exitRequested.CompareAndSwap(false, true) {
+		return
 	}
+	a.cancelHealthDetail()
 	if a.refresher != nil {
-		a.refresher.Stop()
+		a.refresher.RequestStop()
 	}
-	a.alarm.Stop()
+	if a.healthCollector != nil {
+		a.healthCollector.Cancel()
+	}
+	if a.db != nil {
+		a.db.Cancel()
+	}
+	if a.os != nil {
+		a.os.Cancel()
+	}
 }
 
 func (a *App) interval() time.Duration {

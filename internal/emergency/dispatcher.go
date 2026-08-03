@@ -59,6 +59,7 @@ type EmergencyMain struct {
 	scenarios []Scenario
 
 	beginX, beginY, width, height int
+	displayBeginY                 int
 	pad                           *tui.Pad
 
 	// mu guards the published render state (results, lines, pad, snapshot data).
@@ -83,13 +84,14 @@ type EmergencyMain struct {
 // order. daemon controls whether a drawable pad is allocated.
 func NewEmergencyMain(deps Deps, beginX, beginY, width int, scenarios []Scenario, daemon bool) *EmergencyMain {
 	e := &EmergencyMain{
-		deps:         deps,
-		scenarios:    scenarios,
-		beginX:       beginX,
-		beginY:       beginY,
-		width:        width,
-		height:       windowHeight,
-		snapshotDict: map[int]snapshotData{},
+		deps:          deps,
+		scenarios:     scenarios,
+		beginX:        beginX,
+		beginY:        beginY,
+		width:         width,
+		height:        windowHeight,
+		displayBeginY: beginY,
+		snapshotDict:  map[int]snapshotData{},
 	}
 	e.pad = tui.NewPad(windowHeight, width)
 	return e
@@ -97,6 +99,22 @@ func NewEmergencyMain(deps Deps, beginX, beginY, width int, scenarios []Scenario
 
 // Height returns the emergency panel height.
 func (e *EmergencyMain) Height() int { return e.height }
+
+// DisplayBeginY returns the terminal row used by the most recent emergency
+// draw. It differs from the configured beginY when the panel must overlay a
+// terminal that is too short to render below the resident monitors.
+func (e *EmergencyMain) DisplayBeginY() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.displayBeginY
+}
+
+func (e *EmergencyMain) originForHeight(screenHeight int) int {
+	if screenHeight <= 0 {
+		return e.beginY
+	}
+	return min(e.beginY, max(0, screenHeight-e.height))
+}
 
 // Triggered reports whether any scenario is currently firing.
 func (e *EmergencyMain) Triggered() bool {
@@ -204,13 +222,18 @@ func (e *EmergencyMain) Draw(screen tcell.Screen, cursorY int) {
 	e.lines = nil
 
 	if !e.triggered {
-		e.blit(screen)
 		return
+	}
+
+	e.displayBeginY = e.beginY
+	if screen != nil {
+		_, screenHeight := screen.Size()
+		e.displayBeginY = e.originForHeight(screenHeight)
 	}
 
 	y := e.drawHeader()
 	e.drawScenarios(y, cursorY)
-	e.blit(screen)
+	e.blit(screen, e.displayBeginY)
 }
 
 // drawHeader paints the reverse-video "EMERGENCY TRIGGERED" banner.
@@ -247,7 +270,7 @@ func (e *EmergencyMain) drawScenarios(y, cursorY int) {
 // drawLine draws one panel line, recording it in the interactive list.
 func (e *EmergencyMain) drawLine(s Scenario, text string, y, cursorY int, visible bool) int {
 	style := model.Normal
-	if cursorY >= 0 && e.beginY+y+1 == cursorY {
+	if cursorY >= 0 && e.displayBeginY+y == cursorY {
 		style.Reverse = true
 		e.pad.AddStr(y, 0, spaces(e.width-1), model.Style{Pair: model.PairReverse})
 	}
@@ -264,9 +287,10 @@ func (e *EmergencyMain) drawLine(s Scenario, text string, y, cursorY int, visibl
 // emergency_handle_command_entry.
 func (e *EmergencyMain) HandleCommand(screen *tui.Screen, cursorY int) {
 	e.mu.Lock()
-	idx := cursorY - e.beginY - 1
+	displayBeginY := e.displayBeginY
+	idx := cursorY - displayBeginY
 	var line emerLine
-	ok := idx > 1 && idx < len(e.lines)
+	ok := idx >= 1 && idx < len(e.lines)
 	if ok {
 		line = e.lines[idx]
 	}
@@ -279,7 +303,7 @@ func (e *EmergencyMain) HandleCommand(screen *tui.Screen, cursorY int) {
 		return // analysis in flight; ignore this keypress
 	}
 	defer e.analysisMu.Unlock()
-	line.scenario.HandleCommand(newCommand(screen, e.beginY), line.text)
+	line.scenario.HandleCommand(newCommand(screen, displayBeginY), line.text)
 }
 
 // Persist retains the current snapshot (bounded) and lets each scenario write its
@@ -313,9 +337,9 @@ func (e *EmergencyMain) Persist(monitorsDumpData []model.DumpData) {
 	}
 }
 
-func (e *EmergencyMain) blit(screen tcell.Screen) {
+func (e *EmergencyMain) blit(screen tcell.Screen, beginY int) {
 	if screen != nil {
-		e.pad.Blit(screen, e.beginX, e.beginY)
+		e.pad.Blit(screen, e.beginX, beginY)
 	}
 }
 
