@@ -498,6 +498,8 @@ func TestWorkMemCalibrationEvidenceReportsTargetMiss(t *testing.T) {
 			Attempts: 13,
 			Observation: workMemObservation{
 				UsedKB: 47095, TotalUsedKB: 47095, OperatorCount: 1,
+				OriginalExplainPerfMode:  "pretty",
+				EffectiveExplainPerfMode: "normal",
 			},
 		},
 	}
@@ -512,6 +514,10 @@ func TestWorkMemCalibrationEvidenceReportsTargetMiss(t *testing.T) {
 	if details["target_lower_percent"] != int64(70) ||
 		details["target_upper_percent"] != int64(97) {
 		t.Fatalf("details=%v want target band 70..97", details)
+	}
+	if details["original_explain_perf_mode"] != "pretty" ||
+		details["explain_perf_mode"] != "normal" {
+		t.Fatalf("details=%v want pretty-to-normal compatibility evidence", details)
 	}
 }
 

@@ -82,6 +82,8 @@ gsbench run -s 621,624 -d 2m
 
 201/202 会先用 `sort_data` 自动标定有界工作集，只接受实际 Sort/Hash 内存达到输入 `work_mem` 的 90%–97% 且不落盘的结果。随后每个 worker 建立一个服务端游标并完成首次 `FETCH`；所有 worker 就绪后才开始计算 `--duration`。第一次 Ctrl+C 会立即结束本地进程，数据库通过连接断开释放对应事务和游标；之后可执行 `gsbench restore --run-id RUN_ID` 收敛运行状态。
 
+GaussDB 默认可能使用 `explain_perf_mode=pretty`，而 201/202 需要 normal 格式中的 Sort 方法、Hash Batches 和 Memory Usage 才能证明算子未落盘。gsbench 会读取原始模式，并只在每次标定事务中执行 `SET LOCAL explain_perf_mode=normal`；事务 `ROLLBACK` 后自动恢复，不修改用户、数据库或其他会话的配置。结果证据中的 `original_explain_perf_mode` 和 `explain_perf_mode` 分别记录原始与实际标定模式。pretty 输出的 `Peak Memory` 不会被当作完整的 Hash 溢写证据。
+
 ## 生命周期与恢复
 
 推荐顺序是 `scenarios`、`doctor`、`init --dry-run`、`init`、`run --dry-run`、`run`、`status`。发布配置默认 `run.validation_enabled=false`，普通场景按 `preflight → prepare → ramp → hold → stop → restore` 执行；601–606 改用上述 `init → fault → recover` 三阶段。改为 `true` 后增加计划/场景验证和恢复结果验证阶段。新的变更型运行会先恢复 stale run。
