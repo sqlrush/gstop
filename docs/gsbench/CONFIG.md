@@ -1,4 +1,4 @@
-# gsbench v1.1.4 配置手册
+# gsbench v1.1.5 配置手册
 
 发布包的基准配置是 [`configs/gsbench.cfg`](../../configs/gsbench.cfg)。建议复制后修改并保持 `0600` 权限；不要新增程序未读取的“占位配置”。安装和命令流程见[安装手册](INSTALL.md)。
 

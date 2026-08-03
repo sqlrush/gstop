@@ -1,6 +1,6 @@
-# gsbench v1.1.4 Linux ARM64 安装与操作手册
+# gsbench v1.1.5 Linux ARM64 安装与操作手册
 
-本文适用于 `gsbench v1.1.4` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
+本文适用于 `gsbench v1.1.5` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
 
 ## 1. 安装
 
@@ -13,8 +13,8 @@ uname -m
 输出应为 `aarch64` 或 `arm64`。将发布包复制到测试主机后执行：
 
 ```sh
-tar -xzf gsbench-v1.1.4-linux-arm64-20260803.tar.gz
-cd gsbench-v1.1.4-linux-arm64-20260803
+tar -xzf gsbench-v1.1.5-linux-arm64-20260803.tar.gz
+cd gsbench-v1.1.5-linux-arm64-20260803
 sha256sum -c SHA256SUMS
 chmod 0755 bin/gsbench
 chmod 0600 configs/gsbench.cfg
@@ -24,7 +24,7 @@ file bin/gsbench
 ./bin/gsbench scenarios
 ```
 
-`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.4`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
+`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.5`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
 
 ## 2. 配置数据库连接
 

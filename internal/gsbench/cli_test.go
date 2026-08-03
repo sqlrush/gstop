@@ -176,7 +176,7 @@ func TestCLIVersionPrintsAuthor(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Author: WangYingJie <sqlrush@gmail.com>") {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.4\n") {
+	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.5\n") {
 		t.Fatalf("version=%q", stdout.String())
 	}
 }
