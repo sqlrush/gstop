@@ -11,12 +11,16 @@ import (
 )
 
 type workMemProbeTestConnector struct {
-	statements *[]string
-	plan       string
+	statements      *[]string
+	plan            string
+	explainPerfMode string
 }
 
 func (c *workMemProbeTestConnector) Connect(context.Context) (driver.Conn, error) {
-	return &workMemProbeTestConn{statements: c.statements, plan: c.plan}, nil
+	return &workMemProbeTestConn{
+		statements: c.statements, plan: c.plan,
+		explainPerfMode: c.explainPerfMode,
+	}, nil
 }
 
 func (*workMemProbeTestConnector) Driver() driver.Driver { return workMemProbeTestDriver{} }
@@ -28,8 +32,9 @@ func (workMemProbeTestDriver) Open(string) (driver.Conn, error) {
 }
 
 type workMemProbeTestConn struct {
-	statements *[]string
-	plan       string
+	statements      *[]string
+	plan            string
+	explainPerfMode string
 }
 
 func (*workMemProbeTestConn) Prepare(string) (driver.Stmt, error) {
@@ -57,10 +62,35 @@ func (c *workMemProbeTestConn) QueryContext(
 	_ []driver.NamedValue,
 ) (driver.Rows, error) {
 	*c.statements = append(*c.statements, statement)
+	if statement == "SHOW explain_perf_mode" {
+		return &explainRowsTestRows{
+			columns: []string{"explain_perf_mode"},
+			values:  [][]driver.Value{{c.explainPerfMode}},
+		}, nil
+	}
 	return &explainRowsTestRows{
 		columns: []string{"QUERY PLAN"},
 		values:  [][]driver.Value{{c.plan}},
 	}, nil
+}
+
+func openWorkMemProbeTestConn(
+	t *testing.T,
+	statements *[]string,
+	explainPerfMode string,
+	plan string,
+) *sql.Conn {
+	t.Helper()
+	pool := sql.OpenDB(&workMemProbeTestConnector{
+		statements: statements, plan: plan, explainPerfMode: explainPerfMode,
+	})
+	t.Cleanup(func() { _ = pool.Close() })
+	conn, err := pool.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
 }
 
 func TestWorkMemSQLUsesBoundedSortDataOperators(t *testing.T) {
@@ -198,34 +228,81 @@ func TestParseWorkMemPlanMeasuresOnlyTheRequestedOperator(t *testing.T) {
 	}
 }
 
+func TestWorkMemPlanParseErrorIdentifiesPrettyOutput(t *testing.T) {
+	plan := "id | operation | A-rows | Peak Memory\n" +
+		"1 | -> Sort | 1000 | 240000 KB"
+	_, err := parseWorkMemPlanWithContext(workMemSort, plan, "pretty")
+	if err == nil {
+		t.Fatal("pretty plan was accepted as normal work_mem evidence")
+	}
+	message := err.Error()
+	for _, fragment := range []string{
+		`original_explain_perf_mode="pretty"`,
+		`requested_explain_perf_mode="normal"`,
+		`detected_output_mode="pretty"`,
+		"requested Sort operator",
+	} {
+		if !strings.Contains(message, fragment) {
+			t.Errorf("error=%q missing %q", message, fragment)
+		}
+	}
+}
+
+func TestWorkMemPlanDiagnosticIsEscapedAndTruncated(t *testing.T) {
+	plan := "id | operation | Peak Memory\n\t" +
+		strings.Repeat("界", 600) + "UNIQUE_SUFFIX_AFTER_LIMIT"
+	_, err := parseWorkMemPlanWithContext(workMemHash, plan, "pretty")
+	if err == nil {
+		t.Fatal("unparseable plan was accepted")
+	}
+	message := err.Error()
+	for _, fragment := range []string{`\n`, `\t`, "truncated"} {
+		if !strings.Contains(message, fragment) {
+			t.Errorf("error=%q missing escaped diagnostic %q", message, fragment)
+		}
+	}
+	if strings.Contains(message, "UNIQUE_SUFFIX_AFTER_LIMIT") {
+		t.Fatalf("error exposed plan content beyond the diagnostic limit: %q", message)
+	}
+}
+
+func TestReadWorkMemExplainPerfMode(t *testing.T) {
+	statements := []string{}
+	conn := openWorkMemProbeTestConn(t, &statements, "pretty", "")
+	mode, err := readWorkMemExplainPerfMode(context.Background(), conn)
+	if err != nil || mode != "pretty" {
+		t.Fatalf("mode=%q err=%v", mode, err)
+	}
+	if len(statements) != 1 || statements[0] != "SHOW explain_perf_mode" {
+		t.Fatalf("statements=%v", statements)
+	}
+}
+
 func TestProbeWorkMemUsesOneTransactionForSettingsAndExplain(t *testing.T) {
 	statements := []string{}
-	pool := sql.OpenDB(&workMemProbeTestConnector{
-		statements: &statements,
-		plan:       "Sort Method: quicksort  Memory: 240000kB",
-	})
-	t.Cleanup(func() { _ = pool.Close() })
-	conn, err := pool.Conn(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
+	conn := openWorkMemProbeTestConn(
+		t, &statements, "pretty",
+		"Sort Method: quicksort  Memory: 240000kB",
+	)
 	observation, err := probeWorkMemOnConnection(
 		context.Background(), conn, workMemSort, "gsbench",
-		18462, 256*1024, time.Second,
+		18462, 256*1024, "pretty", time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.UsedKB != 240000 || observation.Spilled {
+	if observation.UsedKB != 240000 || observation.Spilled ||
+		observation.OriginalExplainPerfMode != "pretty" ||
+		observation.EffectiveExplainPerfMode != "normal" {
 		t.Fatalf("observation=%+v", observation)
 	}
 	want := []string{
 		"BEGIN",
 		"SET LOCAL work_mem='262144kB'",
 		"SET LOCAL query_dop=1",
+		"SET LOCAL explain_perf_mode=normal",
 	}
-	if len(statements) != 5 {
+	if len(statements) != 6 {
 		t.Fatalf("statements=%v", statements)
 	}
 	for index, statement := range want {
@@ -233,11 +310,11 @@ func TestProbeWorkMemUsesOneTransactionForSettingsAndExplain(t *testing.T) {
 			t.Errorf("statement[%d]=%q want=%q", index, statements[index], statement)
 		}
 	}
-	if !strings.HasPrefix(statements[3], "EXPLAIN (ANALYZE, BUFFERS)") {
-		t.Errorf("probe query=%q", statements[3])
+	if !strings.HasPrefix(statements[4], "EXPLAIN (ANALYZE, BUFFERS)") {
+		t.Errorf("probe query=%q", statements[4])
 	}
-	if statements[4] != "ROLLBACK" {
-		t.Errorf("last statement=%q want ROLLBACK", statements[4])
+	if statements[5] != "ROLLBACK" {
+		t.Errorf("last statement=%q want ROLLBACK", statements[5])
 	}
 }
 

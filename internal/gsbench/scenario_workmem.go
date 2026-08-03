@@ -21,15 +21,19 @@ const (
 	workMemCalibrationMaxRange     = int64(1_048_576)
 	workMemCalibrationLowerPercent = int64(70)
 	workMemCalibrationUpperPercent = int64(97)
+	workMemPlanDiagnosticMaxRunes  = 512
+	workMemExplainNormal           = "normal"
 )
 
 type workMemObservation struct {
-	UsedKB        int64
-	TotalUsedKB   int64
-	OperatorCount int
-	Spilled       bool
-	Batches       int
-	Plan          string
+	UsedKB                   int64
+	TotalUsedKB              int64
+	OperatorCount            int
+	Spilled                  bool
+	Batches                  int
+	Plan                     string
+	OriginalExplainPerfMode  string
+	EffectiveExplainPerfMode string
 }
 
 type workMemCalibration struct {
@@ -286,6 +290,10 @@ func calibrateWorkMemDatabase(
 		return workMemCalibration{}, fmt.Errorf("open work_mem calibration session: %w", err)
 	}
 	defer tagged.Close()
+	originalExplainPerfMode, err := readWorkMemExplainPerfMode(ctx, tagged.Conn)
+	if err != nil {
+		return workMemCalibration{}, err
+	}
 	probe := func(probeCtx context.Context, rangeEnd int64) (workMemObservation, error) {
 		queryTimeout := rt.Config.Safety.QueryTimeout
 		if queryTimeout <= 0 {
@@ -295,7 +303,7 @@ func calibrateWorkMemDatabase(
 		defer cancelAttempt()
 		return probeWorkMemOnConnection(
 			attemptCtx, tagged.Conn, kind, rt.Config.Data.Schema,
-			rangeEnd, targetKB, queryTimeout,
+			rangeEnd, targetKB, originalExplainPerfMode, queryTimeout,
 		)
 	}
 	return calibrateWorkMemRange(ctx, targetKB, kind, probe)
@@ -308,6 +316,7 @@ func probeWorkMemOnConnection(
 	schema string,
 	rangeEnd int64,
 	targetKB int64,
+	originalExplainPerfMode string,
 	cleanupTimeout time.Duration,
 ) (observation workMemObservation, resultErr error) {
 	if conn == nil {
@@ -329,7 +338,7 @@ func probeWorkMemOnConnection(
 			resultErr = errors.Join(resultErr, fmt.Errorf("rollback calibration: %w", err))
 		}
 	}()
-	setup, err := workMemSessionSetup(kind, targetKB)
+	setup, err := workMemCalibrationSessionSetup(kind, targetKB)
 	if err != nil {
 		return workMemObservation{}, err
 	}
@@ -351,7 +360,22 @@ func probeWorkMemOnConnection(
 	if scanErr != nil || closeErr != nil {
 		return workMemObservation{}, errors.Join(scanErr, closeErr)
 	}
-	return parseWorkMemPlan(kind, plan)
+	return parseWorkMemPlanWithContext(kind, plan, originalExplainPerfMode)
+}
+
+func readWorkMemExplainPerfMode(ctx context.Context, conn *sql.Conn) (string, error) {
+	if conn == nil {
+		return "", sql.ErrConnDone
+	}
+	var mode string
+	if err := conn.QueryRowContext(ctx, "SHOW explain_perf_mode").Scan(&mode); err != nil {
+		return "", fmt.Errorf("read explain_perf_mode: %w", err)
+	}
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return "", fmt.Errorf("read explain_perf_mode: database returned an empty value")
+	}
+	return mode, nil
 }
 
 func workMemCalibrationSQL(
@@ -425,12 +449,27 @@ func workMemSortDataTable(schema string, rangeEnd int64) (string, error) {
 }
 
 func workMemSessionSetup(kind workMemKind, targetKB int64) ([]string, error) {
+	return buildWorkMemSessionSetup(kind, targetKB, false)
+}
+
+func workMemCalibrationSessionSetup(kind workMemKind, targetKB int64) ([]string, error) {
+	return buildWorkMemSessionSetup(kind, targetKB, true)
+}
+
+func buildWorkMemSessionSetup(
+	kind workMemKind,
+	targetKB int64,
+	forceNormalExplain bool,
+) ([]string, error) {
 	if targetKB < 64 {
 		return nil, fmt.Errorf("work_mem must be at least 64kB")
 	}
 	statements := []string{
 		"SET LOCAL work_mem='" + strconv.FormatInt(targetKB, 10) + "kB'",
 		"SET LOCAL query_dop=1",
+	}
+	if forceNormalExplain {
+		statements = append(statements, "SET LOCAL explain_perf_mode=normal")
 	}
 	switch kind {
 	case workMemSort:
@@ -576,6 +615,44 @@ func parseWorkMemPlan(kind workMemKind, plan string) (workMemObservation, error)
 		)
 	}
 	return observation, nil
+}
+
+func parseWorkMemPlanWithContext(
+	kind workMemKind,
+	plan string,
+	originalExplainPerfMode string,
+) (workMemObservation, error) {
+	observation, err := parseWorkMemPlan(kind, plan)
+	if err != nil {
+		return workMemObservation{}, fmt.Errorf(
+			"parse work_mem plan: original_explain_perf_mode=%q requested_explain_perf_mode=%q detected_output_mode=%q plan=%s: %w",
+			originalExplainPerfMode,
+			workMemExplainNormal,
+			detectWorkMemExplainOutputMode(plan),
+			workMemPlanDiagnostic(plan),
+			err,
+		)
+	}
+	observation.OriginalExplainPerfMode = originalExplainPerfMode
+	observation.EffectiveExplainPerfMode = workMemExplainNormal
+	return observation, nil
+}
+
+func detectWorkMemExplainOutputMode(plan string) string {
+	normalized := strings.ToLower(plan)
+	if strings.Contains(normalized, "operation") &&
+		strings.Contains(normalized, "peak memory") {
+		return "pretty"
+	}
+	return workMemExplainNormal
+}
+
+func workMemPlanDiagnostic(plan string) string {
+	runes := []rune(plan)
+	if len(runes) > workMemPlanDiagnosticMaxRunes {
+		plan = string(runes[:workMemPlanDiagnosticMaxRunes]) + "...<truncated>"
+	}
+	return strconv.QuoteToASCII(plan)
 }
 
 func calibrateWorkMemRange(
