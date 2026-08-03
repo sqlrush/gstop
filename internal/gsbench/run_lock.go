@@ -78,6 +78,71 @@ func AcquireDatabaseRunLock(
 	)
 }
 
+func DatabaseRunLockHeld(
+	ctx context.Context,
+	db *Database,
+	identity string,
+) (bool, error) {
+	if db == nil || db.pool == nil {
+		return false, fmt.Errorf("database advisory lock connection is unavailable")
+	}
+	return probeDatabaseRunLock(
+		ctx,
+		identity,
+		func(openCtx context.Context) (runLockSession, error) {
+			opCtx, cancel := db.operationContext(openCtx)
+			defer cancel()
+			conn, err := db.pool.Conn(opCtx)
+			if err != nil {
+				return nil, err
+			}
+			return &sqlRunLockSession{db: db, conn: conn}, nil
+		},
+	)
+}
+
+func probeDatabaseRunLock(
+	ctx context.Context,
+	identity string,
+	open func(context.Context) (runLockSession, error),
+) (bool, error) {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return false, fmt.Errorf("database advisory lock identity is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if open == nil {
+		return false, fmt.Errorf("database advisory lock session opener is required")
+	}
+	session, err := open(ctx)
+	if err != nil {
+		return false, fmt.Errorf("open database advisory lock probe session: %w", err)
+	}
+	acquired, err := session.TryLock(ctx, identity)
+	if err != nil {
+		return false, errors.Join(
+			fmt.Errorf("probe database advisory lock: %w", err),
+			session.Discard(),
+		)
+	}
+	if !acquired {
+		return true, session.Close()
+	}
+	released, unlockErr := session.Unlock(context.Background(), identity)
+	if unlockErr == nil && !released {
+		unlockErr = fmt.Errorf("database advisory lock %q was not held", identity)
+	}
+	if unlockErr != nil {
+		return false, errors.Join(
+			fmt.Errorf("release database advisory lock probe: %w", unlockErr),
+			session.Discard(),
+		)
+	}
+	return false, session.Close()
+}
+
 func acquireDatabaseRunLock(
 	ctx context.Context,
 	identity string,

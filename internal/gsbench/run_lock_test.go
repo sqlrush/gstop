@@ -152,3 +152,69 @@ func TestDatabaseRunLockDiscardsSessionWhenReleaseResultIsUncertain(t *testing.T
 		})
 	}
 }
+
+func TestProbeDatabaseRunLockReportsAnotherSessionHoldingLock(t *testing.T) {
+	session := &fakeRunLockSession{tryResult: false}
+	held, err := probeDatabaseRunLock(
+		context.Background(),
+		"gsbench:plan-workload:postgres:gsbench",
+		func(context.Context) (runLockSession, error) { return session, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !held {
+		t.Fatal("held=false want true")
+	}
+	if session.closed != 1 || session.discarded != 0 {
+		t.Fatalf("closed=%d discarded=%d", session.closed, session.discarded)
+	}
+	if strings.Join(session.keys, ",") !=
+		"try:gsbench:plan-workload:postgres:gsbench" {
+		t.Fatalf("events=%v", session.keys)
+	}
+}
+
+func TestProbeDatabaseRunLockReleasesProbeAcquisition(t *testing.T) {
+	session := &fakeRunLockSession{tryResult: true, unlockResult: true}
+	held, err := probeDatabaseRunLock(
+		context.Background(),
+		"gsbench:plan-workload:postgres:gsbench",
+		func(context.Context) (runLockSession, error) { return session, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatal("held=true want false")
+	}
+	want := "try:gsbench:plan-workload:postgres:gsbench," +
+		"unlock:gsbench:plan-workload:postgres:gsbench"
+	if strings.Join(session.keys, ",") != want ||
+		session.closed != 1 || session.discarded != 0 {
+		t.Fatalf(
+			"events=%v closed=%d discarded=%d",
+			session.keys,
+			session.closed,
+			session.discarded,
+		)
+	}
+}
+
+func TestProbeDatabaseRunLockDiscardsUncertainProbe(t *testing.T) {
+	session := &fakeRunLockSession{
+		tryResult: true,
+		unlockErr: errors.New("unlock failed"),
+	}
+	_, err := probeDatabaseRunLock(
+		context.Background(),
+		"gsbench:plan-workload:postgres:gsbench",
+		func(context.Context) (runLockSession, error) { return session, nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "unlock failed") {
+		t.Fatalf("error=%v", err)
+	}
+	if session.discarded != 1 {
+		t.Fatalf("discarded=%d want 1", session.discarded)
+	}
+}
