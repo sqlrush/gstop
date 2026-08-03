@@ -22,7 +22,7 @@ func TestPlanBaselinePlanVerificationRequiresExpectedToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPlanBaselinePlans(context.Background(), fixedPlanExplainer{plan: "Seq Scan (cost=0.00..1.00)"}, definitions[:1]); err != nil {
+	if err := verifyPlanBaselinePlans(context.Background(), fixedPlanExplainer{plan: "Index Scan using plan_data_lookup_idx (cost=0.00..1.00)"}, definitions[:1]); err != nil {
 		t.Fatal(err)
 	}
 	if err := verifyPlanBaselinePlans(context.Background(), fixedPlanExplainer{plan: "Seq Scan (cost=0.00..1.00)"}, definitions[1:2]); err == nil || !strings.Contains(err.Error(), "plan_index_unusable_idx") {
@@ -102,7 +102,7 @@ func TestPlanBaselineRepairStepsUseEveryCompleteCanonicalIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"CREATE INDEX IF NOT EXISTS plan_data_lookup_idx ON gsbench.plan_data (lookup_key,dist_key,id)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS plan_data_lookup_idx ON gsbench.plan_data (lookup_key,dist_key)",
 		"CREATE INDEX IF NOT EXISTS plan_stats_target_idx ON gsbench.plan_data (stats_target_key,dist_key,id)",
 		"CREATE INDEX IF NOT EXISTS plan_stats_ndistinct_idx ON gsbench.plan_data (stats_ndistinct_key,dist_key,id)",
 		"CREATE INDEX IF NOT EXISTS plan_stats_corr_idx ON gsbench.plan_data (stats_corr_a,stats_corr_b,dist_key,id)",
@@ -250,6 +250,8 @@ func planBaselineNamedString(args []driver.NamedValue, index int) string {
 
 func planBaselineTokenForExplain(query string) string {
 	switch {
+	case strings.Contains(query, "lookup_key"):
+		return "Index Scan using plan_data_lookup_idx"
 	case strings.Contains(query, "stats_target_key"):
 		return "Seq Scan"
 	case strings.Contains(query, "index_unusable_key"):
@@ -286,7 +288,7 @@ func (r *planBaselineCatalogRows) Next(dest []driver.Value) error {
 
 func planBaselineDefinitionsForTest() map[string]string {
 	return map[string]string{
-		"plan_data_lookup_idx":      "CREATE INDEX plan_data_lookup_idx ON gsbench.plan_data (lookup_key,dist_key,id)",
+		"plan_data_lookup_idx":      "CREATE UNIQUE INDEX plan_data_lookup_idx ON gsbench.plan_data (lookup_key,dist_key)",
 		"plan_stats_target_idx":     "CREATE INDEX plan_stats_target_idx ON gsbench.plan_data (stats_target_key,dist_key,id)",
 		"plan_stats_ndistinct_idx":  "CREATE INDEX plan_stats_ndistinct_idx ON gsbench.plan_data (stats_ndistinct_key,dist_key,id)",
 		"plan_stats_corr_idx":       "CREATE INDEX plan_stats_corr_idx ON gsbench.plan_data (stats_corr_a,stats_corr_b,dist_key,id)",

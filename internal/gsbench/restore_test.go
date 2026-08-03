@@ -701,8 +701,7 @@ func TestPrepareRestorePlanRestoresStatisticsBeforeAnalyze(t *testing.T) {
 		{
 			scenario: "planchange_stats_target",
 			want: []string{
-				`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_target_key SET STATISTICS -1`,
-				`ANALYZE "gsbench".plan_data(stats_target_key)`,
+				`CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data (lookup_key,dist_key)`,
 			},
 		},
 		{

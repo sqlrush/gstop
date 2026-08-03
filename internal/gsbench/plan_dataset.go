@@ -28,10 +28,11 @@ type planIndexDefinition struct {
 	Name    string
 	Table   string
 	Columns []string
+	Unique  bool
 }
 
 var canonicalPlanIndexDefinitions = [...]planIndexDefinition{
-	{Name: "plan_data_lookup_idx", Table: "plan_data", Columns: []string{"lookup_key", "dist_key", "id"}},
+	{Name: "plan_data_lookup_idx", Table: "plan_data", Columns: []string{"lookup_key", "dist_key"}, Unique: true},
 	{Name: "plan_stats_target_idx", Table: "plan_data", Columns: []string{"stats_target_key", "dist_key", "id"}},
 	{Name: "plan_stats_ndistinct_idx", Table: "plan_data", Columns: []string{"stats_ndistinct_key", "dist_key", "id"}},
 	{Name: "plan_stats_corr_idx", Table: "plan_data", Columns: []string{"stats_corr_a", "stats_corr_b", "dist_key", "id"}},
@@ -90,8 +91,13 @@ func planIndexDDL(
 	if ifNotExists {
 		existenceClause = " IF NOT EXISTS"
 	}
+	uniqueClause := ""
+	if definition.Unique {
+		uniqueClause = " UNIQUE"
+	}
 	return fmt.Sprintf(
-		"CREATE INDEX%s %s ON %s.%s (%s)",
+		"CREATE%s INDEX%s %s ON %s.%s (%s)",
+		uniqueClause,
 		existenceClause,
 		definition.Name,
 		quotedSchema,
@@ -164,9 +170,13 @@ func planDataPostMigrationDDL(schema string) []string {
 
 func isPlanDataIndexDDL(statement string) bool {
 	for _, definition := range planIndexDefinitions() {
+		prefix := "CREATE INDEX "
+		if definition.Unique {
+			prefix = "CREATE UNIQUE INDEX "
+		}
 		if strings.HasPrefix(
 			statement,
-			"CREATE INDEX "+definition.Name+" ",
+			prefix+definition.Name+" ",
 		) {
 			return true
 		}

@@ -22,6 +22,35 @@ func testDatasetEnvironment() Environment {
 	return Environment{Product: ProductOpenGauss, Topology: TopologyStandalone}
 }
 
+func TestParseDatasetObjectRecognizesPlainAndUniqueIndexes(t *testing.T) {
+	for _, test := range []struct {
+		statement string
+		name      string
+	}{
+		{
+			statement: `CREATE INDEX plain_idx ON "Bench".plan_data (lookup_key)`,
+			name:      "plain_idx",
+		},
+		{
+			statement: `CREATE UNIQUE INDEX plan_data_lookup_idx ON "Bench".plan_data (lookup_key,dist_key)`,
+			name:      "plan_data_lookup_idx",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			object, err := parseDatasetObject(test.statement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := DatasetObject{
+				Kind: DatasetObjectIndex, Name: test.name, DDL: test.statement,
+			}
+			if !reflect.DeepEqual(object, want) {
+				t.Fatalf("object=%+v want=%+v", object, want)
+			}
+		})
+	}
+}
+
 type guardedDatasetExecutor struct {
 	recordingDatasetExecutor
 	checks int
@@ -968,7 +997,9 @@ func TestDatasetInitCatalogChecksAndValidatesExistingObjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, statement := range exec.statements {
-		if strings.HasPrefix(statement, "CREATE TABLE") || strings.HasPrefix(statement, "CREATE INDEX") {
+		if strings.HasPrefix(statement, "CREATE TABLE") ||
+			strings.HasPrefix(statement, "CREATE INDEX") ||
+			strings.HasPrefix(statement, "CREATE UNIQUE INDEX") {
 			t.Fatalf("existing object recreated: %s", statement)
 		}
 	}

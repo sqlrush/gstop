@@ -1,6 +1,6 @@
-# gsbench v1.1.3 Linux ARM64 安装与操作手册
+# gsbench v1.1.4 Linux ARM64 安装与操作手册
 
-本文适用于 `gsbench v1.1.3` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
+本文适用于 `gsbench v1.1.4` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
 
 ## 1. 安装
 
@@ -13,8 +13,8 @@ uname -m
 输出应为 `aarch64` 或 `arm64`。将发布包复制到测试主机后执行：
 
 ```sh
-tar -xzf gsbench-v1.1.3-linux-arm64-20260803.tar.gz
-cd gsbench-v1.1.3-linux-arm64-20260803
+tar -xzf gsbench-v1.1.4-linux-arm64-20260803.tar.gz
+cd gsbench-v1.1.4-linux-arm64-20260803
 sha256sum -c SHA256SUMS
 chmod 0755 bin/gsbench
 chmod 0600 configs/gsbench.cfg
@@ -24,7 +24,7 @@ file bin/gsbench
 ./bin/gsbench scenarios
 ```
 
-`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.3`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
+`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.4`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
 
 ## 2. 配置数据库连接
 
@@ -168,4 +168,4 @@ GSBENCH_E2E_CFG=/absolute/path/gsbench-e2e.cfg
 
 应以 gsbench 输出的物理大小证据确认结果，而不能只按估算行数判断。完整的 65 场景串行运行、gstop 同步采样、19–21 GiB 判定和安全清理流程见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
 
-本版本已在本地 `og5` openGauss 容器及既有 100GB 数据集上完成 601 的 `init → fault → recover` 实测；这不替代客户目标版本、拓扑和数据规模上的现场验证。
+本版本的 Linux ARM64 二进制已在本地 `og5` openGauss 容器完成版本和命令烟测。为避免自动删除并重建既有 100GB 数据集上的大索引，发布验证未在主 schema 执行 601 的 `fault → recover`；客户环境首次执行前应预留索引转换和恢复时间。

@@ -1,4 +1,4 @@
-# gsbench v1.1.3 配置手册
+# gsbench v1.1.4 配置手册
 
 发布包的基准配置是 [`configs/gsbench.cfg`](../../configs/gsbench.cfg)。建议复制后修改并保持 `0600` 权限；不要新增程序未读取的“占位配置”。安装和命令流程见[安装手册](INSTALL.md)。
 
@@ -105,6 +105,10 @@ gsbench run 601 recover --config /absolute/path/gsbench.cfg
 ```
 
 602–606 使用相同语法并替换为同一个编号。`fault` 必须在对应 `init` 存活且显示 `RUNNING` 后启动；`recover` 在 `init` 退出后仍可执行。三阶段命令不接受 `--dry-run`，避免把没有真实执行的故障或恢复误报为预览成功。
+
+601 从 v1.1.4 起使用 `(lookup_key,dist_key)` 复合唯一索引按 lookup key 点查。已有数据集的
+同名普通索引会在第一次基线准备时转换为唯一索引；`fault` 删除索引，`recover`
+重建索引。数据量较大时，应确保 `safety.restore_timeout` 能覆盖索引创建时间。
 
 ## `[data]` 数据集
 

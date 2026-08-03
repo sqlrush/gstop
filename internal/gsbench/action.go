@@ -349,10 +349,9 @@ func SQLAction(m Mutation) Action {
 	}
 	if m.VerifyAction != "" {
 		comparison := ""
-		if strings.HasPrefix(
-			strings.ToUpper(strings.TrimSpace(m.VerifyValue)),
-			"CREATE INDEX ",
-		) {
+		verifyValue := strings.ToUpper(strings.TrimSpace(m.VerifyValue))
+		if strings.HasPrefix(verifyValue, "CREATE INDEX ") ||
+			strings.HasPrefix(verifyValue, "CREATE UNIQUE INDEX ") {
 			comparison = sqlVerifyComparisonIndexDDL
 		}
 		action.Verify = marshalActionPayload(struct {

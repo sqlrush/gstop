@@ -92,6 +92,80 @@ func TestPlanchangeDefinitionsUseApprovedIdentities(t *testing.T) {
 	}
 }
 
+func TestPlanchangeStatsTargetUsesUniquePointLookups(t *testing.T) {
+	definitions, err := PlanScenarioDefinitions("Bench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var definition PlanScenarioDefinition
+	for _, candidate := range definitions {
+		if candidate.Code == 601 {
+			definition = candidate
+			break
+		}
+	}
+	if definition.Code != 601 {
+		t.Fatal("601 definition is unavailable")
+	}
+	if got, want := definition.ExpectedBaselineToken, "plan_data_lookup_idx"; got != want {
+		t.Fatalf("601 baseline token=%q want=%q", got, want)
+	}
+	want := []string{
+		`SELECT id,payload FROM "Bench".plan_data WHERE lookup_key=1`,
+		`SELECT id,payload FROM "Bench".plan_data WHERE lookup_key=500000`,
+		`SELECT id,payload FROM "Bench".plan_data WHERE lookup_key=1000000`,
+	}
+	if !reflect.DeepEqual(definition.Candidates, want) {
+		t.Fatalf("601 candidates=%q want=%q", definition.Candidates, want)
+	}
+	for _, candidate := range definition.Candidates {
+		if strings.Contains(candidate, "stats_target_key") || strings.Contains(candidate, "BETWEEN") || strings.Contains(candidate, "dist_key=") {
+			t.Fatalf("601 must use only point lookup predicates: %q", candidate)
+		}
+	}
+}
+
+func TestPlanchangeStatsTargetDropsAndRecreatesCanonicalUniqueIndex(t *testing.T) {
+	mutations, err := PlanMutationSet("run-1", "Bench", "planchange_stats_target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mutations) != 1 {
+		t.Fatalf("601 mutations=%d want=1: %+v", len(mutations), mutations)
+	}
+	mutation := mutations[0]
+	if got, want := mutation.ForwardSQL, `DROP INDEX "Bench".plan_data_lookup_idx`; got != want {
+		t.Fatalf("601 forward=%q want=%q", got, want)
+	}
+	wantCreate := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "Bench".plan_data (lookup_key,dist_key)`
+	if got := mutation.InverseSQL; got != wantCreate {
+		t.Fatalf("601 inverse=%q want=%q", got, wantCreate)
+	}
+	if !strings.Contains(mutation.VerifySQL, "pg_get_indexdef") || mutation.VerifyValue != wantCreate {
+		t.Fatalf("601 verification=%q expected=%q", mutation.VerifySQL, mutation.VerifyValue)
+	}
+	if !mutation.SkipInverseWhenRestored {
+		t.Fatal("601 index drop must skip duplicate inverse when baseline is restored")
+	}
+}
+
+func TestPlanchangeIndexDropRetainsCanonicalBaselineIndex(t *testing.T) {
+	definitions, err := PlanScenarioDefinitions("Bench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, definition := range definitions {
+		if definition.Code != 605 {
+			continue
+		}
+		if got, want := definition.ExpectedBaselineToken, "plan_index_drop_idx"; got != want {
+			t.Fatalf("605 baseline token=%q want=%q", got, want)
+		}
+		return
+	}
+	t.Fatal("605 definition is unavailable")
+}
+
 func TestPlanDefinitionsPreserveMixedCaseSchemaIdentifiers(t *testing.T) {
 	definitions, err := PlanScenarioDefinitions("Bench")
 	if err != nil {
@@ -161,6 +235,7 @@ func TestNonIdempotentPlanInversesRequireBaselineSkipMarker(t *testing.T) {
 		scenario string
 		kind     string
 	}{
+		{"planchange_stats_target", "index_drop"},
 		{"planchange_stats_extended", "statistics_extended"},
 		{"planchange_index_drop", "index_drop"},
 		{"planchange_index_shape", "index_shape_drop_good"},
@@ -272,7 +347,6 @@ func TestCombinedPlanStatisticsRestoreExecutesPrerequisitesBeforeAnalyze(
 	var actions []Action
 	var sequence int64
 	for _, scenario := range []string{
-		"planchange_stats_target",
 		"planchange_stats_ndistinct",
 		"planchange_stats_extended",
 	} {
@@ -309,10 +383,8 @@ func TestCombinedPlanStatisticsRestoreExecutesPrerequisitesBeforeAnalyze(
 		`ALTER TABLE "gsbench".plan_data ADD STATISTICS ((stats_corr_a,stats_corr_b))`,
 		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key RESET (n_distinct)`,
 		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key SET STATISTICS -1`,
-		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_target_key SET STATISTICS -1`,
 		`SESSION: SET default_statistics_target=-2 | ANALYZE "gsbench".plan_data ((stats_corr_a,stats_corr_b)) | RESET default_statistics_target`,
 		`ANALYZE "gsbench".plan_data(stats_ndistinct_key)`,
-		`ANALYZE "gsbench".plan_data(stats_target_key)`,
 	}
 	if !reflect.DeepEqual(database.events, want) {
 		t.Fatalf("restore events=%q want=%q", database.events, want)
@@ -329,7 +401,7 @@ func compactPlanDDL(statement string) string {
 }
 
 func TestPlanChangeMutationsAreIndependentlyRestorable(t *testing.T) {
-	for _, scenario := range []string{"planchange_stats_target", "planchange_stats_ndistinct", "planchange_stats_extended"} {
+	for _, scenario := range []string{"planchange_stats_ndistinct", "planchange_stats_extended"} {
 		mutations, err := PlanMutationSet("run-1", "gsbench", scenario)
 		if err != nil {
 			t.Fatal(err)
@@ -340,10 +412,6 @@ func TestPlanChangeMutationsAreIndependentlyRestorable(t *testing.T) {
 			}
 		}
 	}
-	stats, _ := PlanMutationSet("run-1", "gsbench", "planchange_stats_target")
-	if !strings.Contains(stats[0].InverseSQL, "SET STATISTICS -1") {
-		t.Fatalf("stats target inverse=%q", stats[0].InverseSQL)
-	}
 	extended, _ := PlanMutationSet("run-1", "gsbench", "planchange_stats_extended")
 	if !strings.Contains(extended[0].InverseSQL, "ADD STATISTICS") {
 		t.Fatalf("extended statistics inverse=%q", extended[0].InverseSQL)
@@ -351,7 +419,7 @@ func TestPlanChangeMutationsAreIndependentlyRestorable(t *testing.T) {
 }
 
 func TestEveryPlanMutationRestoresAfterAnInterruptedAction(t *testing.T) {
-	for _, scenario := range []string{"planchange_stats_target", "planchange_stats_ndistinct", "planchange_stats_extended"} {
+	for _, scenario := range []string{"planchange_stats_ndistinct", "planchange_stats_extended"} {
 		mutations, err := PlanMutationSet("run-1", "gsbench", scenario)
 		if err != nil {
 			t.Fatal(err)

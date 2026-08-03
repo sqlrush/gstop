@@ -24,16 +24,17 @@ gsbench run 601 recover
 
 ```sql
 CREATE UNIQUE INDEX plan_data_lookup_idx
-ON <schema>.plan_data (dist_key, lookup_key);
+ON <schema>.plan_data (lookup_key, dist_key);
 ```
 
 索引包含分布键 `dist_key`，避免分布式 GaussDB 对唯一索引的限制；不删除或修改
 `plan_data` 的主键约束。现有同名普通索引由基线修复检测定义差异并重建为上述
 唯一索引。第一次在已有大数据集上运行新版 601 时，这次索引转换可能耗时。
 
-601 定义三个保证落在最小一百万行数据集内的字面量点查 SQL。每个 SQL 同时
-限定 `dist_key` 和 `lookup_key`，并读取非索引列，使基线计划明确使用
-`plan_data_lookup_idx` 的 `Index Scan`。`--worker N` 保持现有实现：N 个会话持续
+601 定义三个保证落在最小一百万行数据集内的字面量点查 SQL。每个 SQL 只限定
+数据本身唯一的 `lookup_key` 并读取非索引列，使基线计划明确使用以 lookup key
+为首列的 `plan_data_lookup_idx`。不把 `dist_key` 放进谓词，避免删除专用索引后
+回退使用主键 `(dist_key,id)`。`--worker N` 保持现有实现：N 个会话持续
 轮换这三个候选 SQL，直到 duration 到期或进程被 Ctrl+C 终止。
 
 ## 601 三阶段状态变化
@@ -72,7 +73,7 @@ holder 模式、waiter 模式、blocker application name、waiter application na
 按 TDD 分别先增加失败测试，再修改生产代码：
 
 - 601 canonical DDL 必须包含 `CREATE UNIQUE INDEX plan_data_lookup_idx` 和
-  `(dist_key,lookup_key)`；三个基线 SQL 必须为复合键等值点查并期望该索引。
+  `(lookup_key,dist_key)`；三个基线 SQL 必须只按 `lookup_key` 等值点查并期望该索引。
 - 601 fault 必须删除专用唯一索引，inverse/recover 必须精确重建唯一索引；605
   保持原有行为。
 - 锁证据驱动测试返回真实数据库 `NULL`，501 必须成功读取并保留 row-chain

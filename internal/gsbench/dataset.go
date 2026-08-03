@@ -1058,6 +1058,15 @@ func parseDatasetObject(statement string) (DatasetObject, error) {
 			Name: strings.Trim(fields[2], `"`),
 			DDL:  statement,
 		}, nil
+	case "UNIQUE":
+		if len(fields) < 6 || fields[2] != "INDEX" || fields[4] != "ON" {
+			return DatasetObject{}, fmt.Errorf("invalid dataset index DDL %q", statement)
+		}
+		return DatasetObject{
+			Kind: DatasetObjectIndex,
+			Name: strings.Trim(fields[3], `"`),
+			DDL:  statement,
+		}, nil
 	default:
 		return DatasetObject{}, fmt.Errorf("unsupported dataset DDL %q", statement)
 	}

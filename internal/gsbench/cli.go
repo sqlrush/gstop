@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.1.3"
+const Version = "v1.1.4"
 
 const ConfigEnv = "GSBENCH_CONFIG"
 

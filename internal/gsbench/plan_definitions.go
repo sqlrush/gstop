@@ -15,6 +15,12 @@ func PlanScenarioDefinitions(schema string) ([]PlanScenarioDefinition, error) {
 		return nil, fmt.Errorf("unsafe schema %q", schema)
 	}
 	table := quotedSchema + ".plan_data"
+	pointLookup := func(key int) string {
+		return fmt.Sprintf(
+			"SELECT id,payload FROM %s WHERE lookup_key=%d",
+			table, key,
+		)
+	}
 	rangeQueries := func(column string, widths ...int) []string {
 		out := make([]string, 0, len(widths))
 		for _, width := range widths {
@@ -29,12 +35,11 @@ func PlanScenarioDefinitions(schema string) ([]PlanScenarioDefinition, error) {
 		{
 			Code: 601, Name: "planchange_stats_target",
 			Candidates: []string{
-				fmt.Sprintf("SELECT count(*),sum(id) FROM %s WHERE stats_target_key=1", table),
-				fmt.Sprintf("SELECT count(*),sum(id) FROM %s WHERE stats_target_key=2", table),
-				fmt.Sprintf("SELECT count(*),sum(id) FROM %s WHERE stats_target_key=3", table),
-				fmt.Sprintf("SELECT count(*),sum(id) FROM %s WHERE stats_target_key=4", table),
+				pointLookup(1),
+				pointLookup(500_000),
+				pointLookup(1_000_000),
 			},
-			ExpectedBaselineToken: "Seq Scan",
+			ExpectedBaselineToken: "plan_data_lookup_idx",
 		},
 		{
 			Code: 602, Name: "planchange_index_unusable",
@@ -97,21 +102,27 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 	}
 	switch scenario {
 	case "planchange_stats_target":
-		verify := `SELECT attstattarget FROM pg_attribute WHERE attrelid='` + table + `'::regclass AND attname='stats_target_key'`
-		return []Mutation{
-			base(
-				"statistics_target", table+".stats_target_key",
-				"ALTER TABLE "+table+" ALTER COLUMN stats_target_key SET STATISTICS 1",
-				"ALTER TABLE "+table+" ALTER COLUMN stats_target_key SET STATISTICS -1",
-				verify, "-1",
-			),
-			base(
-				"statistics_target_analyze", table+".stats_target_key analyze",
-				"ANALYZE "+table+"(stats_target_key)",
-				"ANALYZE "+table+"(stats_target_key)",
-				"SELECT 1", "1",
-			),
-		}, nil
+		definition, ok := planIndexDefinitionByName("plan_data_lookup_idx")
+		if !ok {
+			return nil, fmt.Errorf("canonical plan index plan_data_lookup_idx is unavailable")
+		}
+		createIndex, err := planIndexDDL(schema, definition, false)
+		if err != nil {
+			return nil, err
+		}
+		verifyIndex, err := planIndexDefinitionLookupSQL(schema, definition)
+		if err != nil {
+			return nil, err
+		}
+		index := quotedSchema + "." + definition.Name
+		mutation := base(
+			"index_drop", index,
+			"DROP INDEX "+index,
+			createIndex,
+			verifyIndex, createIndex,
+		)
+		mutation.SkipInverseWhenRestored = true
+		return []Mutation{mutation}, nil
 	case "planchange_index_unusable":
 		index := quotedSchema + ".plan_index_unusable_idx"
 		return []Mutation{base(

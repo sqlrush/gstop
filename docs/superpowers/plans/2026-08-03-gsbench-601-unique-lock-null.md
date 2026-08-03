@@ -4,7 +4,7 @@
 
 **Goal:** Replace scenario 601 with a fixed-worker composite-unique-key lookup whose fault drops the index, fix scenario 501 lock evidence NULL scanning, and publish gsbench `v1.1.4`.
 
-**Architecture:** Scenario 601 keeps the existing three-process phase controller and worker engine, but changes its candidates and mutation catalog to a dedicated canonical `UNIQUE (dist_key,lookup_key)` index. Lock evidence keeps its SQL and verification semantics while centralizing row decoding in a NULL-safe scanner using `sql.NullString`. The two Go changes are file-disjoint and can be implemented in parallel, then integrated for versioning and packaging.
+**Architecture:** Scenario 601 keeps the existing three-process phase controller and worker engine, but changes its candidates and mutation catalog to a dedicated canonical `UNIQUE (lookup_key,dist_key)` index. Lock evidence keeps its SQL and verification semantics while centralizing row decoding in a NULL-safe scanner using `sql.NullString`. The two Go changes are file-disjoint and can be implemented in parallel, then integrated for versioning and packaging.
 
 **Tech Stack:** Go 1.22, `database/sql`, openGauss connector, Go tests, macOS local build, Linux ARM64 cross-build, Docker `og5` smoke test.
 
@@ -12,7 +12,7 @@
 
 - Keep the existing CLI forms: `gsbench run 601 init|fault|recover`.
 - Do not drop or alter the `plan_data` primary key.
-- The 601 unique index must contain the distribution column and be exactly `UNIQUE (dist_key,lookup_key)`.
+- The 601 unique index must contain the distribution column and be exactly `UNIQUE (lookup_key,dist_key)`.
 - Do not automatically execute DROP/CREATE of the large index on the 100GB primary schema during packaging verification.
 - All production changes follow RED-GREEN TDD.
 - Preserve unrelated user work and do not reset or rewrite the branch.
@@ -31,7 +31,7 @@
 
 **Interfaces:**
 - Consumes: existing `planIndexDefinition`, `planIndexDDL`, `PlanScenarioDefinitions`, and `PlanMutationSet`.
-- Produces: canonical `plan_data_lookup_idx` as a unique `(dist_key,lookup_key)` index; 601 point-query candidates; 601 DROP/CREATE mutation pair.
+- Produces: canonical `plan_data_lookup_idx` as a unique `(lookup_key,dist_key)` index; 601 point-query candidates; 601 DROP/CREATE mutation pair.
 
 - [ ] **Step 1: Add failing canonical-index tests**
 
@@ -40,19 +40,19 @@ Update the expected first canonical definition to carry uniqueness and exact col
 ```go
 {
     Name: "plan_data_lookup_idx", Table: "plan_data",
-    Columns: []string{"dist_key", "lookup_key"}, Unique: true,
+    Columns: []string{"lookup_key", "dist_key"}, Unique: true,
 }
 ```
 
 Assert `planIndexDDL` returns:
 
 ```sql
-CREATE UNIQUE INDEX plan_data_lookup_idx ON "Bench".plan_data (dist_key,lookup_key)
+CREATE UNIQUE INDEX plan_data_lookup_idx ON "Bench".plan_data (lookup_key,dist_key)
 ```
 
 - [ ] **Step 2: Add failing 601 definition and mutation tests**
 
-Assert all 601 candidates select `id,payload`, contain equality predicates for both key columns, do not reference `stats_target_key` or `BETWEEN`, use rows present in the minimum one-million-row dataset, and set `ExpectedBaselineToken` to `plan_data_lookup_idx`.
+Assert all 601 candidates select `id,payload`, contain only a `lookup_key` equality predicate, do not constrain `dist_key`, do not reference `stats_target_key` or `BETWEEN`, use rows present in the minimum one-million-row dataset, and set `ExpectedBaselineToken` to `plan_data_lookup_idx`.
 
 Assert `PlanMutationSet(..., "planchange_stats_target")` has one mutation with forward SQL:
 
@@ -74,15 +74,15 @@ Expected: FAIL because the index has no uniqueness metadata, 601 still uses `sta
 
 - [ ] **Step 4: Implement canonical unique-index DDL**
 
-Add `Unique bool` to `planIndexDefinition`. Mark only `plan_data_lookup_idx` unique and change its columns to `dist_key,lookup_key`. Teach `planIndexDDL` to emit `CREATE UNIQUE INDEX` only when `Unique` is true and preserve all other index SQL.
+Add `Unique bool` to `planIndexDefinition`. Mark only `plan_data_lookup_idx` unique and change its columns to `lookup_key,dist_key`. Teach `planIndexDDL` to emit `CREATE UNIQUE INDEX` only when `Unique` is true and preserve all other index SQL.
 
 - [ ] **Step 5: Implement 601 point lookups and DROP/CREATE mutation**
 
-Build three literal candidates from keys within `1..1_000_000`. For each key `g`, calculate `dist_key = mod(g,1048576)+1` and emit:
+Build three literal candidates from keys within `1..1_000_000` and emit:
 
 ```sql
 SELECT id,payload FROM <schema>.plan_data
-WHERE dist_key=<calculated> AND lookup_key=<g>
+WHERE lookup_key=<g>
 ```
 
 Set the baseline token to `plan_data_lookup_idx`. Replace only the 601 mutation case with the canonical-index DROP/inverse pattern already used by 605. Keep scenario code, name, CLI, and worker behavior unchanged.

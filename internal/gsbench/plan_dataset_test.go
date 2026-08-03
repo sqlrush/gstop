@@ -10,7 +10,7 @@ import (
 
 func TestPlanIndexDefinitionsReturnImmutableCanonicalCatalog(t *testing.T) {
 	want := []planIndexDefinition{
-		{Name: "plan_data_lookup_idx", Table: "plan_data", Columns: []string{"lookup_key", "dist_key", "id"}},
+		{Name: "plan_data_lookup_idx", Table: "plan_data", Columns: []string{"lookup_key", "dist_key"}, Unique: true},
 		{Name: "plan_stats_target_idx", Table: "plan_data", Columns: []string{"stats_target_key", "dist_key", "id"}},
 		{Name: "plan_stats_ndistinct_idx", Table: "plan_data", Columns: []string{"stats_ndistinct_key", "dist_key", "id"}},
 		{Name: "plan_stats_corr_idx", Table: "plan_data", Columns: []string{"stats_corr_a", "stats_corr_b", "dist_key", "id"}},
@@ -27,6 +27,34 @@ func TestPlanIndexDefinitionsReturnImmutableCanonicalCatalog(t *testing.T) {
 	first[0].Columns[0] = "mutated"
 	if second := planIndexDefinitions(); !reflect.DeepEqual(second, want) {
 		t.Fatalf("catalog was mutated through getter: %+v", second)
+	}
+}
+
+func TestPlanIndexDDLBuildsCanonicalUniqueLookupIndex(t *testing.T) {
+	definition, ok := planIndexDefinitionByName("plan_data_lookup_idx")
+	if !ok {
+		t.Fatal("canonical lookup index is unavailable")
+	}
+	got, err := planIndexDDL("Bench", definition, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "Bench".plan_data (lookup_key,dist_key)`
+	if got != want {
+		t.Fatalf("lookup index DDL=%q want=%q", got, want)
+	}
+}
+
+func TestCanonicalPlanIndexesHaveNoOtherLookupKeyAccessPath(t *testing.T) {
+	for _, definition := range planIndexDefinitions() {
+		if definition.Name == "plan_data_lookup_idx" {
+			continue
+		}
+		for _, column := range definition.Columns {
+			if column == "lookup_key" {
+				t.Fatalf("%s provides lookup_key access after 601 drops its index", definition.Name)
+			}
+		}
 	}
 }
 

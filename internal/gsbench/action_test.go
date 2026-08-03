@@ -387,3 +387,25 @@ func TestSQLActionBuildsTypedJSONPayloads(t *testing.T) {
 		t.Fatalf("verify payload = %s", action.Verify)
 	}
 }
+
+func TestSQLActionUsesCanonicalComparisonForEveryCreateIndexDDL(t *testing.T) {
+	for _, verifyValue := range []string{
+		"CREATE INDEX plan_index_drop_idx ON gsbench.plan_data (index_drop_key,dist_key,id)",
+		"CREATE UNIQUE INDEX plan_data_lookup_idx ON gsbench.plan_data (lookup_key,dist_key)",
+	} {
+		action := SQLAction(Mutation{
+			RunID: "run-1", ScenarioCode: 601,
+			TargetProduct: ProductGaussDB, TargetEndpoint: "gsbench.plan_data",
+			VerifyAction: "SELECT pg_catalog.pg_get_indexdef(1)", VerifyValue: verifyValue,
+		})
+		var verify struct {
+			Comparison string `json:"comparison"`
+		}
+		if err := json.Unmarshal(action.Verify, &verify); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := verify.Comparison, sqlVerifyComparisonIndexDDL; got != want {
+			t.Fatalf("comparison for %q=%q want=%q", verifyValue, got, want)
+		}
+	}
+}

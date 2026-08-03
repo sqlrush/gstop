@@ -759,12 +759,38 @@ func observeLockEvidence(ctx context.Context, rt *Runtime, definition LockDefini
 		return nil, err
 	}
 	defer rows.Close()
+	return scanLockEvidenceRows(rows, definition)
+}
+
+func scanLockEvidenceRows(rows *sql.Rows, definition LockDefinition) ([]LockEvidence, error) {
 	var evidence []LockEvidence
 	for rows.Next() {
 		var waitAgeSeconds float64
-		var item LockEvidence
-		if err := rows.Scan(&item.Node, &item.Object, &item.LockType, &item.HolderMode, &item.WaiterMode, &item.Granted, &item.BlockerTag, &item.WaiterTag, &waitAgeSeconds); err != nil {
+		var node, object, lockType, holderMode, waiterMode sql.NullString
+		var blockerTag, waiterTag sql.NullString
+		var granted bool
+		if err := rows.Scan(
+			&node,
+			&object,
+			&lockType,
+			&holderMode,
+			&waiterMode,
+			&granted,
+			&blockerTag,
+			&waiterTag,
+			&waitAgeSeconds,
+		); err != nil {
 			return nil, err
+		}
+		item := LockEvidence{
+			Node:       node.String,
+			Object:     object.String,
+			LockType:   lockType.String,
+			HolderMode: holderMode.String,
+			WaiterMode: waiterMode.String,
+			Granted:    granted,
+			BlockerTag: blockerTag.String,
+			WaiterTag:  waiterTag.String,
 		}
 		if definition.ExpectedKind == "row_chain" && item.LockType == "transactionid" {
 			item.Object = definition.Object
