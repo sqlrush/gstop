@@ -17,6 +17,10 @@ const (
 	KeyEnter
 	KeyBackspace
 	KeyEscape
+	KeyPageUp
+	KeyPageDown
+	KeyHome
+	KeyEnd
 )
 
 // Key is a normalised keypress. For KeyRune, Rune holds the character.
@@ -47,6 +51,14 @@ func mapKey(ev *tcell.EventKey) Key {
 		return Key{Kind: KeyBackspace}
 	case tcell.KeyEscape:
 		return Key{Kind: KeyEscape}
+	case tcell.KeyPgUp:
+		return Key{Kind: KeyPageUp}
+	case tcell.KeyPgDn:
+		return Key{Kind: KeyPageDown}
+	case tcell.KeyHome:
+		return Key{Kind: KeyHome}
+	case tcell.KeyEnd:
+		return Key{Kind: KeyEnd}
 	default:
 		return Key{Kind: KeyOther}
 	}

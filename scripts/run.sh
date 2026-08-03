@@ -1,7 +1,8 @@
 #!/bin/bash
-# Launch gstop from its install directory, resolving symlinks so the binary finds
-# its adjacent configs. Unlike the Python tool, no LD_LIBRARY_PATH is required —
-# the binary is statically linked and the driver is pure Go.
+# Launch gstop from a validated single-architecture v1.6.1 package. Resolve
+# symlinks first so ~/.local/bin/gstop still finds the package root.
+set -euo pipefail
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE" ]; do
     DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
@@ -9,6 +10,18 @@ while [ -L "$SOURCE" ]; do
     [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-cd "$SCRIPT_DIR"
+PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+GSTOP_BIN="$PACKAGE_ROOT/bin/gstop"
+GSTOP_CONFIG="$PACKAGE_ROOT/configs/gstop.cfg"
 
-exec ./gstop "$@"
+if [[ ! -x "$GSTOP_BIN" ]]; then
+    echo "安装包版本/目录结构不匹配: 文件不存在或不可执行: $GSTOP_BIN" >&2
+    exit 1
+fi
+if [[ ! -f "$GSTOP_CONFIG" ]]; then
+    echo "安装包版本/目录结构不匹配: 缺少配置文件: $GSTOP_CONFIG" >&2
+    exit 1
+fi
+
+cd "$PACKAGE_ROOT"
+exec "$GSTOP_BIN" "$@"

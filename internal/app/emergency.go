@@ -1,6 +1,8 @@
 package app
 
 import (
+	"time"
+
 	"github.com/gdamore/tcell/v2"
 
 	"gstop/internal/emergency"
@@ -14,19 +16,24 @@ import (
 // nine scenarios in the fixed dispatcher order. Port of the EmergencyMain setup
 // in gstop.py.
 func (a *App) buildEmergency(deps monitor.Deps) {
-	if !deps.Cfg.GetBool("emergency.enable", false) {
-		return
-	}
+	persist := emergency.NewMemPersist(deps.Cfg)
 	edeps := emergency.Deps{
 		Cfg:     deps.Cfg,
 		DB:      deps.DB,
 		OS:      deps.OS,
 		Logger:  logging.New("emergency", "gstop_emergency_run.log"),
 		Alarm:   deps.Alarm,
-		Persist: emergency.NewMemPersist(deps.Cfg),
+		Persist: persist,
+	}
+	planChange := emergency.NewPlanChange(edeps)
+	a.planChange = planChange
+	a.planPersist = persist
+	if !deps.Cfg.GetBool("emergency.enable", false) {
+		planChange.SetNotificationsEnabled(false)
+		return
 	}
 	scenarios := []emergency.Scenario{
-		emergency.NewPlanChange(edeps),
+		planChange,
 		emergency.NewMemoryFull(edeps),
 		emergency.NewIOFull(edeps),
 		emergency.NewCPUFull(edeps),
@@ -39,18 +46,31 @@ func (a *App) buildEmergency(deps monitor.Deps) {
 	a.emergency = emergency.NewEmergencyMain(edeps, 0, a.emergencyBeginY, model.MonitorWidth, scenarios, a.daemon)
 }
 
-// emergencyAnalyze runs the emergency scenarios against the current snapshot and
-// pushes their highlight targets back to the session and memory panels. Invoked
-// as the refresher's after-refresh hook, matching GstopRefresher.run.
-func (a *App) emergencyAnalyze() {
-	if a.emergency == nil {
-		return
+// afterMonitorRefresh always advances the plan-change snapshot engine. When the
+// emergency feature is enabled the regular dispatcher owns that analysis;
+// otherwise the same PlanChange instance runs in observation-only mode for the
+// independent health dashboard.
+func (a *App) afterMonitorRefresh() {
+	snapshot := a.buildSnapshot()
+	if a.healthCollector != nil {
+		a.healthCollector.RefreshFast()
 	}
-	a.emergency.Main(a.buildSnapshot())
-	a.session.SetEmergencySQLIDs(a.emergency.GetTriggerSQLIDs())
-	a.session.SetEmergencyPIDs(a.emergency.GetTriggerPIDs())
-	if a.memory != nil {
-		a.memory.SetMemoryFullType(a.emergency.GetMemoryFullType())
+	if a.emergency == nil {
+		snapshot.SnapID = a.planPersist.GetSnapID()
+		snapshot.SnapTS = time.Now()
+		a.planChange.Common().Reset()
+		a.planChange.Common().Inject(snapshot)
+		a.planChange.Analyze()
+	} else {
+		a.emergency.Main(snapshot)
+		a.session.SetEmergencySQLIDs(a.emergency.GetTriggerSQLIDs())
+		a.session.SetEmergencyPIDs(a.emergency.GetTriggerPIDs())
+		if a.memory != nil {
+			a.memory.SetMemoryFullType(a.emergency.GetMemoryFullType())
+		}
+	}
+	if a.healthCollector != nil {
+		a.healthCollector.UpdatePlanChanges(healthPlanEvents(a.planChange.Events()))
 	}
 }
 
@@ -114,17 +134,29 @@ func (a *App) emergencyMode() {
 // runEmergencyKeys implements handle_emergency_related_keys: arrow navigation and
 // k to run the selected scenario's remediation.
 func (a *App) runEmergencyKeys() {
-	cursorY, cursorX := model.EmergencyCursorYStart, model.EmergencyCursorXStart
 	screenW, screenH := a.screen.Size()
+	beginY := a.emergency.DisplayBeginY()
+	cursorY, _ := emergencyCursorRange(beginY, a.emergency.Height(), screenH)
+	cursorX := model.EmergencyCursorXStart
 	raw := a.screen.Raw()
 
 	for {
+		if a.exitRequested.Load() {
+			return
+		}
 		key, ok := a.screen.GetKey(-1)
 		if !ok {
 			continue
 		}
+		if a.exitRequested.Load() || key.IsRune('q') {
+			a.requestExit()
+			return
+		}
 		a.screen.FlushInput()
-		if a.handleEmergencyKey(key, &cursorY, &cursorX, screenH, screenW) {
+		if a.handleEmergencyKey(key, &cursorY, &cursorX, screenH, screenW, beginY) {
+			return
+		}
+		if a.exitRequested.Load() {
 			return
 		}
 		a.emergency.Draw(raw, cursorY)
@@ -133,13 +165,13 @@ func (a *App) runEmergencyKeys() {
 }
 
 // handleEmergencyKey applies one keypress, returning true to leave the sub-view.
-func (a *App) handleEmergencyKey(key tui.Key, cursorY, cursorX *int, screenH, screenW int) bool {
-	maxRow := minInt(model.EmergencyCursorYStart+a.emergency.Height(), screenH-1)
+func (a *App) handleEmergencyKey(key tui.Key, cursorY, cursorX *int, screenH, screenW, beginY int) bool {
+	topRow, maxRow := emergencyCursorRange(beginY, a.emergency.Height(), screenH)
 	switch {
 	case key.IsRune('e'):
 		// stay in the sub-view
 	case key.Kind == tui.KeyUp:
-		if *cursorY > model.EmergencyCursorYStart {
+		if *cursorY > topRow {
 			*cursorY--
 		}
 	case key.Kind == tui.KeyDown:
@@ -160,4 +192,16 @@ func (a *App) handleEmergencyKey(key tui.Key, cursorY, cursorX *int, screenH, sc
 		return true
 	}
 	return false
+}
+
+func emergencyCursorRange(beginY, panelHeight, screenHeight int) (int, int) {
+	if screenHeight <= 1 {
+		return 0, 0
+	}
+	start := minInt(beginY+1, screenHeight-1)
+	end := minInt(beginY+panelHeight-1, screenHeight-1)
+	if end < start {
+		end = start
+	}
+	return start, end
 }

@@ -11,11 +11,18 @@ MEM_THRESHOLD=1024     # MB
 EMERGENCY_LOGS_SAVE_DAYS=7
 
 HOSTNAME=$(hostname)
-INSTALL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-GSTOP_RUN_SCRIPT="${INSTALL_DIR}/run.sh"
-GSTOP_MANAGE_SCRIPT="${INSTALL_DIR}/gstop-manage.sh"
-GSTOP_MANAGE_LOG_FILE="${INSTALL_DIR}/gstop_manage.log"
-GSTOP_CONFIG_FILE="${INSTALL_DIR}/configs/gstop.cfg"
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+PACKAGE_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+GSTOP_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"
+GSTOP_MANAGE_SCRIPT="${SCRIPT_DIR}/gstop-manage.sh"
+GSTOP_MANAGE_LOG_FILE="${PACKAGE_ROOT}/gstop_manage.log"
+GSTOP_CONFIG_FILE="${PACKAGE_ROOT}/configs/gstop.cfg"
 GAUSS_ENV_FILE="/home/Ruby/gauss_env_file"
 
 # Daemon processes: the gstop binary running with -d.
@@ -90,7 +97,7 @@ check_pids() {
 check_log_modification() {
     local log_dir
     log_dir=$(grep "persist_file_base_dir" "${GSTOP_CONFIG_FILE}" | awk -F'"' '{print $2}')
-    local log_abs_dir="${INSTALL_DIR}/${log_dir}"
+    local log_abs_dir="${PACKAGE_ROOT}/${log_dir}"
 
     local latest_log_file
     latest_log_file=$(find "${log_abs_dir}" -name "*.log" -type f -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -1 | awk '{print $2}')
@@ -116,7 +123,7 @@ delete_logs_of_emergency() {
     local emergency_logs_dir
     emergency_logs_dir=$(grep "emergency_log_base_dir" "${GSTOP_CONFIG_FILE}" | awk -F'"' '{print $2}')
     [ -z "$emergency_logs_dir" ] && return
-    find "${INSTALL_DIR}/${emergency_logs_dir}" -type f -mtime +"${EMERGENCY_LOGS_SAVE_DAYS}" -delete 2>/dev/null
+    find "${PACKAGE_ROOT}/${emergency_logs_dir}" -type f -mtime +"${EMERGENCY_LOGS_SAVE_DAYS}" -delete 2>/dev/null
 }
 
 check_resource_usage() {

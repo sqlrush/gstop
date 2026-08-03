@@ -3,6 +3,8 @@ package tui
 import (
 	"testing"
 
+	"github.com/gdamore/tcell/v2"
+
 	"gstop/internal/model"
 )
 
@@ -47,5 +49,51 @@ func TestPadClearEmptiesDump(t *testing.T) {
 	p.Clear()
 	if len(p.DumpData()) != 0 {
 		t.Error("Clear did not empty dump")
+	}
+}
+
+func TestPadBlitViewportStartsAtRequestedSourceRow(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer screen.Fini()
+	screen.SetSize(6, 2)
+
+	pad := NewPad(5, 6)
+	pad.AddStr(0, 0, "zero", model.Normal)
+	pad.AddStr(2, 0, "two", model.Normal)
+	pad.AddStr(3, 0, "three", model.Normal)
+	pad.BlitViewport(screen, 0, 0, 2)
+
+	if got, _, _, _ := screen.GetContent(0, 0); got != 't' {
+		t.Fatalf("screen row 0 starts with %q, want source row 2", got)
+	}
+	if got, _, _, _ := screen.GetContent(0, 1); got != 't' {
+		t.Fatalf("screen row 1 starts with %q, want source row 3", got)
+	}
+}
+
+func TestPadBlitPreservesEveryWideRune(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer screen.Fini()
+	screen.SetSize(16, 1)
+
+	const text = "历史真实计划"
+	pad := NewPad(1, 16)
+	pad.AddStr(0, 0, text, model.Normal)
+	pad.Blit(screen, 0, 0)
+
+	for i, want := range []rune(text) {
+		column := i * 2
+		if got, _, _, _ := screen.GetContent(column, 0); got != want {
+			t.Fatalf("screen column %d = %q, want %q; wide text was not preserved", column, got, want)
+		}
+	}
+	if got := pad.DumpData().Text(); got != text+"\n" {
+		t.Fatalf("dump text = %q, want %q", got, text+"\n")
 	}
 }

@@ -14,9 +14,10 @@ const blockSplit = "**********************************************************"
 func (m *SessionMonitor) analyzeBlockStatus(rows []model.SessionRow, blockers []any) []model.SessionRow {
 	m.deps.Logger.Warning("%s PRINT BLOCK START %s", blockSplit, blockSplit)
 
+	blockerPIDs := newBlockerPIDSet(blockers)
 	blockingMap := map[int64]int64{}
 	for _, row := range rows {
-		m.classifyRow(row, blockers, blockingMap)
+		m.classifyRow(row, blockerPIDs, blockingMap)
 	}
 	m.logDeadlocks(blockingMap)
 
@@ -25,32 +26,45 @@ func (m *SessionMonitor) analyzeBlockStatus(rows []model.SessionRow, blockers []
 }
 
 // classifyRow sets one row's BLK status and records its blocking edge.
-func (m *SessionMonitor) classifyRow(row model.SessionRow, blockers []any, blockingMap map[int64]int64) {
+func (m *SessionMonitor) classifyRow(row model.SessionRow, blockers blockerPIDSet, blockingMap map[int64]int64) {
 	pid := row.Get(model.SIdxPID)
 	blocker := row.Get(model.SIdxBlocker)
 	sessionID := row.Get(model.SIdxSessionID)
 
-	if blocker != nil {
-		row[model.SIdxBLK] = lockWaiter
-		if pidInBlockers(pid, blockers) {
-			row[model.SIdxBLK] = lockHolderWaiter
-		}
+	role := blockRole(pid, blocker, blockers)
+	row[model.SIdxBLK] = role
+	switch role {
+	case lockWaiter, lockHolderWaiter:
 		if bID, ok := sInt64(blocker); ok {
 			if pID, ok2 := sInt64(pid); ok2 && pID != bID {
 				blockingMap[pID] = bID
 			}
 		}
-	} else if pid != nil && pidInBlockers(pid, blockers) {
-		row[model.SIdxBLK] = lockHolder
+	case lockHolder:
 		m.reportBlocker(pid, sessionID)
 	}
 
-	if blk := row.Display(model.SIdxBLK); blk != "" {
+	if role != "" {
 		m.deps.Logger.Warning("BLK: %s SESS: %v PID: %v BLOCKER: %v STATE: %v QUERY_START: %v XACT_START: %v UNIQUE_SQL_ID: %v QUERY: %v",
-			blk, model.DisplayValue(sessionID), model.DisplayValue(pid), model.DisplayValue(blocker),
+			role, model.DisplayValue(sessionID), model.DisplayValue(pid), model.DisplayValue(blocker),
 			model.DisplayValue(row.Get(model.SIdxState)), model.DisplayValue(row.Get(model.SIdxQueryStart)),
 			model.DisplayValue(row.Get(model.SIdxXactStart)), model.DisplayValue(row.Get(model.SIdxSQLID)),
 			model.DisplayValue(row.Get(model.SIdxSQL)))
+	}
+}
+
+func blockRole(pid, blocker any, blockers blockerPIDSet) string {
+	_, waiting := sInt64(blocker)
+	holding := blockers.contains(pid)
+	switch {
+	case waiting && holding:
+		return lockHolderWaiter
+	case waiting:
+		return lockWaiter
+	case holding:
+		return lockHolder
+	default:
+		return ""
 	}
 }
 

@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -71,6 +72,8 @@ type OSMonitor struct {
 
 	aquMu sync.Mutex
 	aquSz float64
+
+	runContext func(context.Context, string, bool) (string, bool)
 }
 
 // NewOSMonitor builds the operating-system panel.
@@ -266,8 +269,23 @@ func diskstatsCommand(devices []string) string {
 // Refresh runs the base probes, updates the /proc diffs, recomputes every cell,
 // and reports any threshold breaches.
 func (m *OSMonitor) Refresh() {
+	_ = m.RefreshWithContext(context.Background())
+}
+
+func (m *OSMonitor) RefreshContext(ctx context.Context) {
+	_ = m.RefreshWithContext(ctx)
+}
+
+func (m *OSMonitor) RefreshWithContext(ctx context.Context) error {
+	osValues, osOK, err := m.collectCommands(ctx)
+	if err != nil {
+		return err
+	}
+
 	now := time.Now()
-	m.runCommands()
+	m.mu.Lock()
+	m.osValues = osValues
+	m.osOK = osOK
 	m.buildDiskstats()
 	m.buildCPUInfo()
 
@@ -276,10 +294,7 @@ func (m *OSMonitor) Refresh() {
 		tmp[i] = m.computeValue(i, now)
 	}
 
-	m.mu.Lock()
 	m.values = tmp
-	m.mu.Unlock()
-
 	if m.osOK[0] {
 		m.lastDiskTime = now
 		m.hasDiskTime = true
@@ -290,23 +305,38 @@ func (m *OSMonitor) Refresh() {
 		m.hasCPUTime = true
 		m.lastCPUInfo = m.curCPUInfo
 	}
+	m.mu.Unlock()
 
 	m.checkAndReportAlarm(m.items, tmp)
+	return nil
 }
 
-// runCommands executes each base probe, recording its trimmed output and success
-// flag. An empty command (no devices discovered) is treated as a failed probe.
-func (m *OSMonitor) runCommands() {
-	for i, cmd := range m.osCmd {
-		if cmd == "" {
-			m.osValues[i] = ""
-			m.osOK[i] = false
-			continue
+// collectCommands executes every base probe into local arrays so a rejected
+// cycle cannot replace the previous snapshot or sampling baselines.
+func (m *OSMonitor) collectCommands(ctx context.Context) ([osCmdCount]string, [osCmdCount]bool, error) {
+	var values [osCmdCount]string
+	var ok [osCmdCount]bool
+	for i := 0; i < osCmdCount; i++ {
+		if i >= len(m.osCmd) {
+			return values, ok, fmt.Errorf("os probe %d is not configured", i)
 		}
-		out, ok := m.deps.OS.Run(cmd, true)
-		m.osValues[i] = out
-		m.osOK[i] = ok
+		cmd := m.osCmd[i]
+		if cmd == "" {
+			return values, ok, fmt.Errorf("os probe %d is not configured", i)
+		}
+		values[i], ok[i] = m.run(ctx, cmd, true)
+		if !ok[i] {
+			return values, ok, queryFailure(ctx, fmt.Sprintf("os probe %d", i))
+		}
 	}
+	return values, ok, nil
+}
+
+func (m *OSMonitor) run(ctx context.Context, command string, check bool) (string, bool) {
+	if m.runContext != nil {
+		return m.runContext(ctx, command, check)
+	}
+	return m.deps.OS.RunContext(ctx, command, check)
 }
 
 // buildDiskstats parses the current /proc/diskstats sample into curDiskstats,
@@ -384,7 +414,7 @@ func (m *OSMonitor) computeValue(i int, now time.Time) string {
 // computeIO derives one IO rate from the diskstats diff over the refresh interval.
 func (m *OSMonitor) computeIO(i int, now time.Time) string {
 	if !m.osOK[0] || !m.hasDiskTime {
-		return "0"
+		return ""
 	}
 	interval := now.Sub(m.lastDiskTime).Seconds()
 	return pyFloat(round2(m.ioStat(m.items[i], interval)))
@@ -394,8 +424,7 @@ func (m *OSMonitor) computeIO(i int, now time.Time) string {
 // the dynamic-memory throttle. Returns "0" until two samples exist.
 func (m *OSMonitor) computeCPU() string {
 	if !m.osOK[1] || !m.hasCPUTime {
-		m.deps.Health.UpdateCPUUsage(0)
-		return "0"
+		return ""
 	}
 	var total, busy int64
 	for j := 0; j < cpuFields; j++ {
@@ -416,7 +445,7 @@ func (m *OSMonitor) computeCPU() string {
 // computeScalar formats a probe whose stdout is already a percentage/load number.
 func (m *OSMonitor) computeScalar(idx int) string {
 	if !m.osOK[idx] {
-		return "0"
+		return ""
 	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(m.osValues[idx]), 64)
 	if err != nil {
@@ -573,6 +602,7 @@ func (m *OSMonitor) Draw(screen tcell.Screen) {
 	m.pad.Clear()
 	m.drawHeader()
 	m.drawValues()
+	m.drawRefreshBadgeLocked()
 	m.blit(screen)
 }
 

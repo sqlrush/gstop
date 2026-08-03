@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -45,13 +46,12 @@ func (w *lineWriter) prefixed(prefix, text string, style model.Style) {
 // PrintMoreDetails renders the session detail panel for the selected row and runs
 // its command menu until the user quits. Port of session.print_more_details.
 func (m *SessionMonitor) PrintMoreDetails(screen *tui.Screen, cursorY int) {
-	idx := m.SelectedIndex(cursorY)
-	if idx < 0 || idx >= len(m.values) {
+	row, ok := m.selectedSessionRow(cursorY)
+	if !ok {
 		return
 	}
 	pad := tui.NewPad(m.height+detailsExtraRows, m.width)
 	for {
-		row := m.values[idx]
 		w := &lineWriter{pad: pad, y: 0, height: m.height + detailsExtraRows}
 		pad.Clear()
 
@@ -124,7 +124,7 @@ func (m *SessionMonitor) handleDetailKey(screen *tui.Screen, key tui.Key, row mo
 	case key.IsRune('1'):
 		m.printDetailSQLText(screen, sessionID)
 	case key.IsRune('2'):
-		m.printExecutePlan(screen, sessionPID, sqlID)
+		m.printExecutePlan(screen, row)
 	case key.IsRune('3') && support:
 		if tui.TerminateConfirmPassed(screen, 0, confirmY) {
 			m.terminateSession(sessionPID, sessionID)
@@ -195,17 +195,18 @@ func (m *SessionMonitor) printBlockTreeSQL(screen *tui.Screen, sqlIDs []any, con
 
 // printExecutePlan shows the runtime and history execution plans in an overlay.
 // Port of print_execute_plan.
-func (m *SessionMonitor) printExecutePlan(screen *tui.Screen, sessionPID any, sqlID int64) {
+func (m *SessionMonitor) printExecutePlan(screen *tui.Screen, row model.SessionRow) {
 	pad := tui.NewPad(m.height+detailsExtraRows, m.width)
 	w := &lineWriter{pad: pad, y: 0, height: m.height + detailsExtraRows}
 	header := "SESSION DETAILS"
 	w.line(header+strings.Repeat(" ", max0(m.width-1-len(header))), model.Style{Pair: model.PairReverse})
 
 	w.line("[THE RUNTIME PLAN]", model.Normal)
-	m.appendRuntimePlan(w, sessionPID)
+	m.appendRuntimePlan(w, row)
 	w.line("[THE STATEMENT HISTORY PLAN]", model.Normal)
+	sqlID, _ := sInt64(row.Get(model.SIdxSQLID))
 	if sqlID != 0 {
-		q := fmt.Sprintf("SELECT query_plan FROM dbe_perf.statement_history WHERE unique_query_id = '%d' ORDER BY start_time DESC LIMIT 1;", sqlID)
+		q := fmt.Sprintf("SELECT query_plan FROM dbe_perf.statement_history WHERE start_time >= current_timestamp - interval '10 minutes' AND unique_query_id = '%d' ORDER BY start_time DESC LIMIT 1;", sqlID)
 		m.appendPlan(w, q, "No recorded query plan in dbe_perf.statement_history.")
 	}
 
@@ -222,7 +223,13 @@ func (m *SessionMonitor) printExecutePlan(screen *tui.Screen, sessionPID any, sq
 // such function, so it falls back to EXPLAIN of the session's current SQL — a
 // re-planned estimate, not the exact running instance — matching the
 // self-adaptive routing in internal/dbcompat.
-func (m *SessionMonitor) appendRuntimePlan(w *lineWriter, sessionPID any) {
+func (m *SessionMonitor) appendRuntimePlan(w *lineWriter, row model.SessionRow) {
+	query, active := m.validatedActiveQuery(row)
+	if !active {
+		w.line("The selected PID/session/SQL tuple is no longer active; runtime plan skipped.", model.Normal)
+		return
+	}
+	sessionPID := row.Get(model.SIdxPID)
 	if dbcompat.SupportsGsGetExplain(m.deps.DB.Kind()) {
 		if pid, ok := sInt64(sessionPID); ok && pid != 0 {
 			m.appendPlan(w, fmt.Sprintf("SELECT * FROM gs_get_explain(%d);", pid), "No recorded query plan in gs_get_explain().")
@@ -230,7 +237,6 @@ func (m *SessionMonitor) appendRuntimePlan(w *lineWriter, sessionPID any) {
 		return
 	}
 	w.line("(gs_get_explain is GaussDB-only; showing an EXPLAIN estimate of the current SQL)", model.Normal)
-	query := m.fullQueryByPID(sessionPID)
 	if strings.TrimSpace(query) == "" {
 		w.line("No active SQL to explain.", model.Normal)
 		return
@@ -238,11 +244,39 @@ func (m *SessionMonitor) appendRuntimePlan(w *lineWriter, sessionPID any) {
 	m.appendExplain(w, query)
 }
 
+// validatedActiveQuery rechecks the complete selected identity immediately
+// before runtime-plan lookup. This prevents PID reuse from showing the plan or
+// SQL text of a different session after the user entered the details panel.
+func (m *SessionMonitor) validatedActiveQuery(row model.SessionRow) (string, bool) {
+	pid, pidOK := sInt64(row.Get(model.SIdxPID))
+	sqlID, sqlIDOK := sInt64(row.Get(model.SIdxSQLID))
+	sessionID := model.DisplayValue(row.Get(model.SIdxSessionID))
+	if !pidOK || pid == 0 || !sqlIDOK || sqlID == 0 || sessionID == "" {
+		return "", false
+	}
+	sessionLiteral := strings.ReplaceAll(sessionID, "'", "''")
+	validation := fmt.Sprintf(
+		"SELECT query FROM pg_stat_activity WHERE state = 'active'"+
+			" AND pid = %d AND sessionid::text = '%s'"+
+			" AND unique_sql_id = %d LIMIT 1;",
+		pid, sessionLiteral, sqlID,
+	)
+	rows := m.query(context.Background(), validation)
+	if len(rows) != 1 {
+		return "", false
+	}
+	return rows[0].Str(0), true
+}
+
 // appendExplain runs EXPLAIN (plan only, no execution — read-only safe) on the
 // query and writes up to 20 plan lines, degrading gracefully when the statement
 // cannot be planned standalone (e.g. it uses bind parameters).
 func (m *SessionMonitor) appendExplain(w *lineWriter, query string) {
-	stmt := strings.TrimRight(strings.TrimSpace(query), ";")
+	stmt, err := dbcompat.SafeExplainStatement(query)
+	if err != nil {
+		w.line(err.Error(), model.Normal)
+		return
+	}
 	rows := m.deps.DB.Query("EXPLAIN " + stmt)
 	if rows == nil {
 		w.line("EXPLAIN failed (the statement may use bind parameters or be a utility command).", model.Normal)
@@ -322,6 +356,8 @@ func (m *SessionMonitor) printDetailSQLText(screen *tui.Screen, sessionID any) {
 // raw result. Port of get_sql_full_text_by_session_id.
 func (m *SessionMonitor) sqlFullTextBySessionID(sessionID any) string {
 	target := model.DisplayValue(sessionID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, row := range m.currSessResult {
 		if row.Str(3) == target {
 			return row.Str(5)
@@ -337,6 +373,8 @@ func (m *SessionMonitor) sqlTextByPID(pid any) string {
 	if !ok {
 		return ""
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, row := range m.values {
 		if p, ok := sInt64(row.Get(model.SIdxPID)); ok && p == target {
 			return row.Display(model.SIdxSQL)

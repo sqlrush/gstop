@@ -1,6 +1,8 @@
 package monitor
 
 import (
+	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -42,6 +44,8 @@ type SessionMonitor struct {
 	emergencySQLIDs []int64
 	emergencyPIDs   []int64
 	cursorY         int // app-tracked selection row; -1 when not selecting
+
+	queryContext func(context.Context, string) []dbconn.Row
 }
 
 // NewSessionMonitor builds the session panel.
@@ -103,36 +107,59 @@ func (m *SessionMonitor) SetCursor(y int) { m.cursorY = y }
 
 // Refresh runs the memory, soft-parse, and session queries and rebuilds the rows.
 func (m *SessionMonitor) Refresh() {
+	_ = m.RefreshWithContext(context.Background())
+}
+
+func (m *SessionMonitor) RefreshContext(ctx context.Context) {
+	_ = m.RefreshWithContext(ctx)
+}
+
+func (m *SessionMonitor) RefreshWithContext(ctx context.Context) error {
 	var memResult []dbconn.Row
 	if m.deps.Cfg.GetBool("main.dynamic_mem_enable", false) {
-		memResult = m.deps.DB.Query(sessionMemQuery)
+		memResult = m.query(ctx, sessionMemQuery)
 		if memResult == nil {
 			m.deps.Logger.Error("Exec session memory query failed.")
-			return
+			return queryFailure(ctx, "session memory query")
+		}
+		if !rowsHaveWidth(memResult, 2) {
+			return fmt.Errorf("session memory query returned invalid result shape")
 		}
 	}
 
-	statementResult := m.deps.DB.Query(sessionStatementQuery)
+	statementResult := m.query(ctx, sessionStatementQuery)
 	if statementResult == nil {
 		m.deps.Logger.Error("Exec session statement query failed.")
-		return
+		return queryFailure(ctx, "session statement query")
+	}
+	if !rowsHaveWidth(statementResult, 3) {
+		return fmt.Errorf("session statement query returned invalid result shape")
 	}
 
-	sessResult := m.deps.DB.Query(sessionQueryFor(m.deps.DB.Kind()))
+	sessResult := m.query(ctx, sessionQueryFor(m.deps.DB.Kind()))
 	if sessResult == nil {
 		m.deps.Logger.Error("Exec session query failed.")
-		return
+		return queryFailure(ctx, "session query")
+	}
+	if !rowsHaveWidth(sessResult, 21) {
+		return fmt.Errorf("session query returned invalid result shape")
 	}
 
 	m.handleSQLResult(memResult, statementResult, sessResult)
+	return nil
+}
+
+func (m *SessionMonitor) failRefresh() {}
+
+func (m *SessionMonitor) query(ctx context.Context, query string) []dbconn.Row {
+	if m.queryContext != nil {
+		return m.queryContext(ctx, query)
+	}
+	return m.deps.DB.QueryContext(ctx, query)
 }
 
 // handleSQLResult assembles the 24-element rows, runs block analysis, and sorts.
 func (m *SessionMonitor) handleSQLResult(memResult, statementResult, sessResult []dbconn.Row) {
-	m.mu.Lock()
-	m.currSessResult = sessResult
-	m.mu.Unlock()
-
 	memDict := buildMemDict(memResult)
 	stmtDict := buildStatementDict(statementResult)
 
@@ -149,10 +176,10 @@ func (m *SessionMonitor) handleSQLResult(memResult, statementResult, sessResult 
 	if len(blockers) != 0 {
 		rows = m.analyzeBlockStatus(rows, blockers)
 	}
-	m.sortSession(rows)
-
 	m.mu.Lock()
+	m.sortSession(rows)
 	m.values = rows
+	m.currSessResult = sessResult
 	m.mu.Unlock()
 }
 
@@ -196,8 +223,12 @@ func buildSessionRow(row dbconn.Row, memDict map[string]float64, stmtDict map[in
 		case 5: // SQL: first line only
 			mvpl = append(mvpl, sFirstLine(cv))
 		case 7: // BLOCKER
-			blocker = cv
-			mvpl = append(mvpl, cv)
+			if blockerID, ok := sInt64(cv); ok {
+				blocker = blockerID
+				mvpl = append(mvpl, blockerID)
+			} else {
+				mvpl = append(mvpl, "")
+			}
 		case 8: // E/T: microseconds -> milliseconds
 			mvpl = append(mvpl, elapsedMS(cv))
 		case 11: // EVENT, then the derived SParse, BLK, session id
@@ -258,6 +289,7 @@ func (m *SessionMonitor) Draw(screen tcell.Screen) {
 	m.pad.Clear()
 	m.drawHeader()
 	m.drawRows()
+	m.drawRefreshBadgeLocked()
 	m.blit(screen)
 }
 
@@ -350,9 +382,9 @@ func (m *SessionMonitor) RefreshByElapsedTime() { m.reorder(model.SIdxElapsedMS)
 func (m *SessionMonitor) RefreshByEvent()       { m.reorder(model.SIdxEvent) }
 
 func (m *SessionMonitor) reorder(col int) {
-	m.currOrderByCol = col
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.currOrderByCol = col
 	m.sortSession(m.values)
 }
 
@@ -365,6 +397,19 @@ func (m *SessionMonitor) PadLength() int { return m.currPadLength }
 // SelectedIndex maps the app cursor row to an index into values, or -1.
 func (m *SessionMonitor) SelectedIndex(cursorY int) int {
 	return cursorY - m.beginY - 1 + m.currPrintLoc
+}
+
+// selectedSessionRow resolves the cursor and copies its row while holding the
+// publication lock. Callers may safely keep the result across confirmation
+// prompts even if an already-running refresh publishes a new session list.
+func (m *SessionMonitor) selectedSessionRow(cursorY int) (model.SessionRow, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idx := cursorY - m.beginY - 1 + m.currPrintLoc
+	if idx < 0 || idx >= len(m.values) {
+		return nil, false
+	}
+	return append(model.SessionRow(nil), m.values[idx]...), true
 }
 
 // CheckHighlightLocation scrolls the view by step rows in the given direction,

@@ -55,7 +55,6 @@ func (m *MemoryMonitor) refreshSummaryInfo() memPanel {
 	rows := m.deps.DB.Query(memSummaryQuery)
 	if rows == nil {
 		m.deps.Logger.Error("Exec query failed.")
-		p.value = [][]any{zeroRow}
 		return p
 	}
 
@@ -101,9 +100,7 @@ func (m *MemoryMonitor) refreshDynamicInfo() memPanel {
 	rows := m.deps.DB.Query(memDynamicQuery)
 	if rows == nil {
 		m.deps.Logger.Error("Exec query failed.")
-		memAddColumn(&p, 10, []any{"", "TOTAL", "FREE"})
-		memAddColumn(&p, 10, []any{"SUM", 0, 0})
-		return p
+		return memPanel{title: memPanel1Title}
 	}
 
 	delta := m.calcDelta(20, memRowNames(rows, 0))
@@ -353,32 +350,64 @@ func (m *MemoryMonitor) calcDelta(reserved int, names []string) int {
 // terminate_session_or_thread. selected_index = cursorY - beginY - 1; rows
 // 9<idx<=9+len(panel2) are sessions, and rows 9+len(panel2)+3<idx<=... are threads
 // (the +3 skips the panel gap, Panel3 title, and Panel3 header).
-func (m *MemoryMonitor) TerminateSessionOrThread(screen *tui.Screen, cursorY int) {
+type memoryTerminateKind uint8
+
+const (
+	memoryTerminateSession memoryTerminateKind = iota + 1
+	memoryTerminateThread
+)
+
+type memoryTerminateSelection struct {
+	kind memoryTerminateKind
+	id   any
+}
+
+func (m *MemoryMonitor) memoryTerminateTarget(cursorY int) (memoryTerminateSelection, bool) {
 	selectedIndex := cursorY - m.beginY - 1
 	if selectedIndex < 0 {
+		return memoryTerminateSelection{}, false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	panel2 := m.panels[2]
+	panel3 := m.panels[3]
+	l2 := len(panel2.value)
+	l3 := len(panel3.value)
+	switch {
+	case selectedIndex > 9 && selectedIndex <= 9+l2:
+		idx := selectedIndex - 10
+		if idx >= 0 && idx < l2 && len(panel2.value[idx]) > 0 {
+			return memoryTerminateSelection{
+				kind: memoryTerminateSession,
+				id:   panel2.value[idx][0],
+			}, true
+		}
+	case selectedIndex > 9+l2+3 && selectedIndex <= 9+l2+3+l3:
+		idx := selectedIndex - (9 + l2 + 3 + 1)
+		if idx >= 0 && idx < l3 && len(panel3.value[idx]) > 0 {
+			return memoryTerminateSelection{
+				kind: memoryTerminateThread,
+				id:   panel3.value[idx][0],
+			}, true
+		}
+	}
+	return memoryTerminateSelection{}, false
+}
+
+func (m *MemoryMonitor) TerminateSessionOrThread(screen *tui.Screen, cursorY int) {
+	target, ok := m.memoryTerminateTarget(cursorY)
+	if !ok {
 		return
 	}
 	if !tui.TerminateConfirmPassed(screen, model.MemoryCursorXStart, cursorY) {
 		return
 	}
 
-	m.mu.Lock()
-	panel2 := m.panels[2]
-	panel3 := m.panels[3]
-	m.mu.Unlock()
-
-	l2 := len(panel2.value)
-	l3 := len(panel3.value)
-	switch {
-	case selectedIndex > 9 && selectedIndex <= 9+l2:
-		idx := selectedIndex - 10
-		if idx >= 0 && idx < l2 {
-			m.terminateSession(0, panel2.value[idx][0])
-		}
-	case selectedIndex > 9+l2+3 && selectedIndex <= 9+l2+3+l3:
-		idx := selectedIndex - (9 + l2 + 3 + 1)
-		if idx >= 0 && idx < l3 {
-			m.terminateBackend(panel3.value[idx][0])
-		}
+	switch target.kind {
+	case memoryTerminateSession:
+		m.terminateSession(0, target.id)
+	case memoryTerminateThread:
+		m.terminateBackend(target.id)
 	}
 }

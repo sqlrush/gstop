@@ -11,28 +11,26 @@ import (
 // TerminateSelected terminates the currently selected session after a second
 // confirmation. Port of session.terminate_selected_session.
 func (m *SessionMonitor) TerminateSelected(screen *tui.Screen, cursorY int) {
-	idx := m.SelectedIndex(cursorY)
-	if idx < 0 || idx >= len(m.values) {
+	row, ok := m.selectedSessionRow(cursorY)
+	if !ok {
 		return
 	}
 	if !tui.TerminateConfirmPassed(screen, 0, cursorY) {
 		return
 	}
-	row := m.values[idx]
 	m.terminateSession(row.Get(model.SIdxPID), row.Get(model.SIdxSessionID))
 }
 
 // TerminateAll terminates every session sharing the selected row's unique SQL id.
 // Port of session.terminate_all_sessions.
 func (m *SessionMonitor) TerminateAll(screen *tui.Screen, cursorY int) {
-	idx := m.SelectedIndex(cursorY)
-	if idx < 0 || idx >= len(m.values) {
+	row, ok := m.selectedSessionRow(cursorY)
+	if !ok {
 		return
 	}
 	if !tui.TerminateConfirmPassed(screen, 0, cursorY) {
 		return
 	}
-	row := m.values[idx]
 	sqlID, ok := sInt64(row.Get(model.SIdxSQLID))
 	if !ok || sqlID == 0 {
 		m.deps.Logger.Error("Cannot terminate the sessions with SQL ID is 0")
@@ -46,19 +44,27 @@ func (m *SessionMonitor) TerminateAll(screen *tui.Screen, cursorY int) {
 	m.deps.DB.NoReturn(cmd)
 }
 
-// pidInBlockers reports whether pid appears among the collected blocker values,
-// matching "pid in tmp_curr_sess_blocker" for integer pids.
-func pidInBlockers(pid any, blockers []any) bool {
-	p, ok := sInt64(pid)
+// blockerPIDSet provides O(1) holder lookup while classifying a session snapshot.
+// Values that are blank, NULL, or nonnumeric never enter the set.
+type blockerPIDSet map[int64]struct{}
+
+func newBlockerPIDSet(values []any) blockerPIDSet {
+	set := make(blockerPIDSet, len(values))
+	for _, value := range values {
+		if id, ok := sInt64(value); ok {
+			set[id] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (s blockerPIDSet) contains(value any) bool {
+	id, ok := sInt64(value)
 	if !ok {
 		return false
 	}
-	for _, b := range blockers {
-		if bID, ok := sInt64(b); ok && bID == p {
-			return true
-		}
-	}
-	return false
+	_, ok = s[id]
+	return ok
 }
 
 // sortKeyGreater orders a before b for a descending sort, comparing numerically
