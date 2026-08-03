@@ -248,6 +248,22 @@ func TestWorkMemPlanParseErrorIdentifiesPrettyOutput(t *testing.T) {
 	}
 }
 
+func TestWorkMemPlanRejectsPrettyHashWithNormalStyleMemoryDetail(t *testing.T) {
+	plan := "id | operation | A-rows | Peak Memory\n" +
+		"1 | -> Hash Join (2,3) | 1000 | 430 KB\n" +
+		"3 | -> Hash | 1000 | 430 KB\n" +
+		"Buckets: 32768  Batches: 1  Memory Usage: 430kB"
+	_, err := parseWorkMemPlanWithContext(workMemHash, plan, "pretty")
+	if err == nil {
+		t.Fatal("pretty Hash plan was accepted through its normal-style memory detail")
+	}
+	message := err.Error()
+	if !strings.Contains(message, `detected_output_mode="pretty"`) ||
+		!strings.Contains(message, "requested Hash operator") {
+		t.Fatalf("error=%q want explicit pretty Hash rejection", message)
+	}
+}
+
 func TestWorkMemPlanDiagnosticIsEscapedAndTruncated(t *testing.T) {
 	plan := "id | operation | Peak Memory\n\t" +
 		strings.Repeat("界", 600) + "UNIQUE_SUFFIX_AFTER_LIMIT"
@@ -263,6 +279,22 @@ func TestWorkMemPlanDiagnosticIsEscapedAndTruncated(t *testing.T) {
 	}
 	if strings.Contains(message, "UNIQUE_SUFFIX_AFTER_LIMIT") {
 		t.Fatalf("error exposed plan content beyond the diagnostic limit: %q", message)
+	}
+}
+
+func TestWorkMemPlanParseErrorDoesNotBypassDiagnosticLimit(t *testing.T) {
+	plan := "Sort Method: " + strings.Repeat("x", 600) +
+		"UNIQUE_SUFFIX_FROM_RAW_PARSER_ERROR"
+	_, err := parseWorkMemPlanWithContext(workMemSort, plan, "normal")
+	if err == nil {
+		t.Fatal("malformed Sort plan was accepted")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "truncated") {
+		t.Fatalf("error=%q want a truncated plan diagnostic", message)
+	}
+	if strings.Contains(message, "UNIQUE_SUFFIX_FROM_RAW_PARSER_ERROR") {
+		t.Fatalf("error bypassed the plan diagnostic limit: %q", message)
 	}
 }
 

@@ -564,12 +564,12 @@ func parseWorkMemPlan(kind workMemKind, plan string) (workMemObservation, error)
 			amount := workMemAmountRE.FindStringSubmatch(line)
 			if len(amount) != 3 {
 				return workMemObservation{}, fmt.Errorf(
-					"Sort operator did not report Memory or Disk usage: %q", line,
+					"Sort operator did not report Memory or Disk usage",
 				)
 			}
 			usedKB, err := strconv.ParseInt(amount[2], 10, 64)
 			if err != nil {
-				return workMemObservation{}, fmt.Errorf("parse Sort usage: %w", err)
+				return workMemObservation{}, fmt.Errorf("parse Sort usage: invalid integer")
 			}
 			if strings.EqualFold(amount[1], "Disk") {
 				observation.Spilled = true
@@ -577,7 +577,7 @@ func parseWorkMemPlan(kind workMemKind, plan string) (workMemObservation, error)
 			}
 			if !strings.Contains(strings.ToLower(line), "sort method: quicksort") {
 				return workMemObservation{}, fmt.Errorf(
-					"Sort operator did not use in-memory quicksort: %q", line,
+					"Sort operator did not use in-memory quicksort",
 				)
 			}
 			observation.TotalUsedKB += usedKB
@@ -589,11 +589,11 @@ func parseWorkMemPlan(kind workMemKind, plan string) (workMemObservation, error)
 		for _, match := range hashMemoryRE.FindAllStringSubmatch(plan, -1) {
 			batches, err := strconv.Atoi(match[1])
 			if err != nil {
-				return workMemObservation{}, fmt.Errorf("parse Hash batches: %w", err)
+				return workMemObservation{}, fmt.Errorf("parse Hash batches: invalid integer")
 			}
 			usedKB, err := strconv.ParseInt(match[2], 10, 64)
 			if err != nil {
-				return workMemObservation{}, fmt.Errorf("parse Hash usage: %w", err)
+				return workMemObservation{}, fmt.Errorf("parse Hash usage: invalid integer")
 			}
 			observation.OperatorCount++
 			observation.TotalUsedKB += usedKB
@@ -624,13 +624,25 @@ func parseWorkMemPlanWithContext(
 	plan string,
 	originalExplainPerfMode string,
 ) (workMemObservation, error) {
+	detectedOutputMode := detectWorkMemExplainOutputMode(plan)
+	if detectedOutputMode != workMemExplainNormal {
+		return workMemObservation{}, fmt.Errorf(
+			"parse work_mem plan: original_explain_perf_mode=%q requested_explain_perf_mode=%q detected_output_mode=%q plan=%s: EXPLAIN ANALYZE %s output cannot validate requested %s operator",
+			originalExplainPerfMode,
+			workMemExplainNormal,
+			detectedOutputMode,
+			workMemPlanDiagnostic(plan),
+			detectedOutputMode,
+			workMemKindName(kind),
+		)
+	}
 	observation, err := parseWorkMemPlan(kind, plan)
 	if err != nil {
 		return workMemObservation{}, fmt.Errorf(
 			"parse work_mem plan: original_explain_perf_mode=%q requested_explain_perf_mode=%q detected_output_mode=%q plan=%s: %w",
 			originalExplainPerfMode,
 			workMemExplainNormal,
-			detectWorkMemExplainOutputMode(plan),
+			detectedOutputMode,
 			workMemPlanDiagnostic(plan),
 			err,
 		)
