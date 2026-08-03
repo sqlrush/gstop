@@ -32,12 +32,22 @@ var lifecycleCommands = map[string]struct{}{
 	"init": {}, "run": {}, "status": {}, "stop": {}, "restore": {}, "cleanup": {}, "doctor": {}, "scenarios": {},
 }
 
+type PlanRunAction string
+
+const (
+	PlanRunInit    PlanRunAction = "init"
+	PlanRunFault   PlanRunAction = "fault"
+	PlanRunRecover PlanRunAction = "recover"
+)
+
 type CLIOptions struct {
 	Command       string
 	ConfigPath    string
 	AllowRisk     RiskLevel
 	ScenarioCodes []ScenarioCode
 	Duration      time.Duration
+	PlanAction    PlanRunAction
+	PlanWorkers   int
 	Workers       int
 	TPWorkers     int
 	APWorkers     int
@@ -115,6 +125,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var configPath, scenarios, durationText, sizeText, workMemText, allowRiskText string
+	var planWorkers int
 	options := CLIOptions{Command: command}
 	flags.StringVar(&configPath, "c", "", "config path")
 	flags.StringVar(&configPath, "config", "", "config path")
@@ -122,6 +133,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	flags.StringVar(&scenarios, "scenario", "", "comma-separated scenarios")
 	flags.StringVar(&durationText, "d", "", "pressure duration")
 	flags.StringVar(&durationText, "duration", "", "pressure duration")
+	flags.IntVar(&planWorkers, "worker", 0, "fixed workload workers for scenarios 601-606 init")
 	flags.IntVar(&options.Workers, "workers", 0, "fixed workers for scenarios 101/102 or 201/202")
 	flags.IntVar(&options.TPWorkers, "tp-workers", 0, "fixed TP workers for scenario 103")
 	flags.IntVar(&options.APWorkers, "ap-workers", 0, "fixed AP workers for scenario 103")
@@ -135,16 +147,23 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	flags.StringVar(&sizeText, "size", "", "target init data size (1GB-2TB)")
 	flags.StringVar(&allowRiskText, "allow-risk", "", "explicit maximum risk authorization (A, B, or C)")
 	parseArgs := append([]string(nil), args[1:]...)
-	if command == "run" && len(parseArgs) > 1 &&
+	if command == "run" && len(parseArgs) > 0 &&
 		!strings.HasPrefix(parseArgs[0], "-") {
-		positionalScenario := parseArgs[0]
-		parseArgs = append(parseArgs[1:], positionalScenario)
+		positionals := []string{parseArgs[0]}
+		parseArgs = parseArgs[1:]
+		if len(parseArgs) > 0 && !strings.HasPrefix(parseArgs[0], "-") {
+			positionals = append(positionals, parseArgs[0])
+			parseArgs = parseArgs[1:]
+		}
+		parseArgs = append(parseArgs, positionals...)
 	}
 	if err := flags.Parse(parseArgs); err != nil {
 		return CLIOptions{}, err
 	}
 	sizeSet := false
 	allowRiskSet := false
+	durationSet := false
+	planWorkersSet := false
 	workersSet := false
 	tpWorkersSet := false
 	apWorkersSet := false
@@ -153,12 +172,16 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	chainDepthSet := false
 	flags.Visit(func(value *flag.Flag) {
 		switch value.Name {
+		case "d", "duration":
+			durationSet = true
 		case "size":
 			sizeSet = true
 		case "allow-risk":
 			allowRiskSet = true
 		case "workers":
 			workersSet = true
+		case "worker":
+			planWorkersSet = true
 		case "tp-workers":
 			tpWorkersSet = true
 		case "ap-workers":
@@ -173,10 +196,11 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	})
 	workerOverrideSet := workersSet || tpWorkersSet || apWorkersSet
 	lockOverrideSet := sessionsSet || chainDepthSet
-	if (workerOverrideSet || workMemSet || lockOverrideSet) && command != "run" {
+	if (workerOverrideSet || planWorkersSet || workMemSet || lockOverrideSet) && command != "run" {
 		return CLIOptions{}, fmt.Errorf("workload overrides are only valid with run")
 	}
-	if (workersSet && options.Workers <= 0) ||
+	if (planWorkersSet && planWorkers <= 0) ||
+		(workersSet && options.Workers <= 0) ||
 		(tpWorkersSet && options.TPWorkers <= 0) ||
 		(apWorkersSet && options.APWorkers <= 0) {
 		return CLIOptions{}, fmt.Errorf("worker counts must be positive")
@@ -211,6 +235,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 		options.DatasetBytes = size
 		options.DatasetSize = strings.TrimSpace(sizeText)
 	}
+	planActionText := ""
 	if flags.NArg() != 0 {
 		if command == "run" && flags.NArg() == 3 && scenarios == "" && !allowRiskSet &&
 			flags.Arg(1) == "--allow-risk" {
@@ -218,10 +243,32 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 			allowRiskText = flags.Arg(2)
 			allowRiskSet = true
 		} else {
-			if command != "run" || flags.NArg() != 1 || scenarios != "" {
+			if command != "run" || flags.NArg() > 2 {
 				return CLIOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 			}
-			scenarios = flags.Arg(0)
+			if scenarios == "" {
+				scenarios = flags.Arg(0)
+				if flags.NArg() == 2 {
+					planActionText = flags.Arg(1)
+				}
+			} else {
+				if flags.NArg() != 1 {
+					return CLIOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+				}
+				planActionText = flags.Arg(0)
+			}
+		}
+	}
+	if planActionText != "" {
+		switch PlanRunAction(strings.ToLower(strings.TrimSpace(planActionText))) {
+		case PlanRunInit:
+			options.PlanAction = PlanRunInit
+		case PlanRunFault:
+			options.PlanAction = PlanRunFault
+		case PlanRunRecover:
+			options.PlanAction = PlanRunRecover
+		default:
+			return CLIOptions{}, fmt.Errorf("unknown plan action %q; use init, fault, or recover", planActionText)
 		}
 	}
 	if command == "cleanup" && options.WithData &&
@@ -258,6 +305,19 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	for i, definition := range definitions {
 		options.ScenarioCodes[i] = definition.Code
 	}
+	if err := applyPlanRunCLI(
+		&options,
+		planWorkers,
+		planWorkersSet,
+		workersSet,
+		durationSet,
+	); err != nil {
+		return CLIOptions{}, err
+	}
+	if options.PlanAction != "" {
+		workersSet = false
+		workerOverrideSet = tpWorkersSet || apWorkersSet
+	}
 	if (workerOverrideSet || workMemSet) && len(options.ScenarioCodes) > 0 {
 		if err := validateFixedWorkerOverrideCompatibility(
 			options.ScenarioCodes,
@@ -284,6 +344,67 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 func isPlanChangeCode(code ScenarioCode) bool {
 	definition, err := DefaultScenarioCatalog().LookupCode(code)
 	return err == nil && definition.Category == CategoryPlan && code >= 601 && code <= 606
+}
+
+func applyPlanRunCLI(
+	options *CLIOptions,
+	planWorkers int,
+	planWorkersSet bool,
+	workersSet bool,
+	durationSet bool,
+) error {
+	if options == nil {
+		return fmt.Errorf("CLI options are required")
+	}
+	containsPlan := false
+	for _, code := range options.ScenarioCodes {
+		if isPlanChangeCode(code) {
+			containsPlan = true
+			break
+		}
+	}
+	if options.PlanAction == "" {
+		if planWorkersSet {
+			return fmt.Errorf("--worker is only valid for scenarios 601-606 init")
+		}
+		if containsPlan {
+			return fmt.Errorf(
+				"a plan scenario from 601-606 requires an action: init, fault, or recover",
+			)
+		}
+		return nil
+	}
+	if len(options.ScenarioCodes) != 1 {
+		return fmt.Errorf("plan actions require exactly one scenario from 601-606")
+	}
+	if !isPlanChangeCode(options.ScenarioCodes[0]) {
+		return fmt.Errorf("plan actions are only valid for scenarios 601-606")
+	}
+	switch options.PlanAction {
+	case PlanRunInit:
+		if planWorkersSet && workersSet {
+			return fmt.Errorf("--worker cannot be combined with --workers")
+		}
+		if !planWorkersSet && !workersSet {
+			return fmt.Errorf("plan init requires --worker N")
+		}
+		if !durationSet {
+			return fmt.Errorf("plan init requires --duration DURATION")
+		}
+		if planWorkersSet {
+			options.PlanWorkers = planWorkers
+		} else {
+			options.PlanWorkers = options.Workers
+		}
+		options.Workers = 0
+	case PlanRunFault, PlanRunRecover:
+		if planWorkersSet || workersSet || durationSet {
+			return fmt.Errorf("plan %s does not accept worker or duration overrides", options.PlanAction)
+		}
+	default:
+		return fmt.Errorf("unknown plan action %q", options.PlanAction)
+	}
+	return nil
 }
 
 func resolveScenarioInputs(inputs []string) ([]ScenarioDefinition, error) {
@@ -439,6 +560,9 @@ func printUsage(w io.Writer) {
   gsbench run 501 --sessions N --chain-depth N --duration DURATION
   gsbench run 502 --sessions N --duration DURATION
   gsbench run 503 --sessions N --duration DURATION
+  gsbench run 601 init --worker N --duration DURATION
+  gsbench run 601 fault
+  gsbench run 601 recover
   gsbench restore [--run-id RUN_ID]
 	gsbench cleanup [--data]
   gsbench init --size 100GB
@@ -447,6 +571,7 @@ Options:
   -c, --config PATH       configuration file (legacy-compatible override)
   -s, --scenario LIST    comma-separated three-digit scenario codes or canonical names
   -d, --duration VALUE   pressure duration, for example 30s or 5m
+      --worker N         fixed workload workers for 601-606 init (--workers alias)
       --workers N        fixed workers for scenarios 101/102 or 201/202
       --tp-workers N     fixed TP workers for scenario 103 (use with --ap-workers)
       --ap-workers N     fixed AP workers for scenario 103 (use with --tp-workers)

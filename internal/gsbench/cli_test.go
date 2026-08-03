@@ -227,6 +227,9 @@ func TestCLIHelpDocumentsIndependentPlanScenariosAndRestore(t *testing.T) {
 		"gsbench restore", "601=planchange_stats_target", "602=planchange_index_unusable",
 		"603=planchange_stats_ndistinct", "604=planchange_stats_extended",
 		"605=planchange_index_drop", "606=planchange_index_shape",
+		"gsbench run 601 init --worker N --duration DURATION",
+		"gsbench run 601 fault", "gsbench run 601 recover",
+		"--worker N", "601-606 init", "--workers alias",
 	} {
 		if !strings.Contains(text, token) {
 			t.Errorf("help missing %q", token)
@@ -289,6 +292,81 @@ func TestParseCLIArgsSupportsFixedWorkerOverrides(t *testing.T) {
 				options.TPWorkers != test.tpWorkers ||
 				options.APWorkers != test.apWorkers {
 				t.Fatalf("worker options=%+v", options)
+			}
+		})
+	}
+}
+
+func TestParseCLIArgsSupportsThreePhasePlanCommands(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		args     []string
+		code     ScenarioCode
+		action   PlanRunAction
+		workers  int
+		duration time.Duration
+	}{
+		{
+			name: "init singular worker",
+			args: []string{
+				"run", "601", "init", "--worker", "10", "--duration", "1m",
+			},
+			code: 601, action: PlanRunInit, workers: 10, duration: time.Minute,
+		},
+		{
+			name: "init plural worker alias",
+			args: []string{
+				"run", "606", "init", "--workers", "3", "--duration", "30s",
+			},
+			code: 606, action: PlanRunInit, workers: 3, duration: 30 * time.Second,
+		},
+		{
+			name: "fault",
+			args: []string{"run", "603", "fault"},
+			code: 603, action: PlanRunFault,
+		},
+		{
+			name: "recover",
+			args: []string{"run", "planchange_index_drop", "recover"},
+			code: 605, action: PlanRunRecover,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options, err := ParseCLIArgs(test.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(options.ScenarioCodes, []ScenarioCode{test.code}) ||
+				options.PlanAction != test.action ||
+				options.PlanWorkers != test.workers ||
+				options.Duration != test.duration {
+				t.Fatalf("options=%+v", options)
+			}
+		})
+	}
+}
+
+func TestParseCLIArgsRejectsInvalidThreePhasePlanCommands(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "bare old command", args: []string{"run", "601"}, want: "requires an action"},
+		{name: "unknown action", args: []string{"run", "601", "break"}, want: "unknown plan action"},
+		{name: "non plan action", args: []string{"run", "101", "init", "--worker", "1", "--duration", "1m"}, want: "only valid for scenarios 601-606"},
+		{name: "multiple scenarios", args: []string{"run", "601,602", "fault"}, want: "exactly one"},
+		{name: "init missing worker", args: []string{"run", "601", "init", "--duration", "1m"}, want: "--worker"},
+		{name: "init missing duration", args: []string{"run", "601", "init", "--worker", "1"}, want: "--duration"},
+		{name: "fault worker", args: []string{"run", "601", "fault", "--worker", "1"}, want: "does not accept"},
+		{name: "recover duration", args: []string{"run", "601", "recover", "--duration", "1m"}, want: "does not accept"},
+		{name: "worker aliases together", args: []string{"run", "601", "init", "--worker", "1", "--workers", "1", "--duration", "1m"}, want: "cannot be combined"},
+		{name: "singular worker non plan", args: []string{"run", "101", "--worker", "1"}, want: "only valid for scenarios 601-606"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ParseCLIArgs(test.args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v want containing %q", err, test.want)
 			}
 		})
 	}
@@ -785,12 +863,12 @@ func TestParseCLIArgsSupportsShortFlags(t *testing.T) {
 }
 
 func TestParseCLIArgsResolvesThreeDigitScenarioCodes(t *testing.T) {
-	options, err := ParseCLIArgs([]string{"run", "-s", "101,102,103,401,402,201,501,601,801"})
+	options, err := ParseCLIArgs([]string{"run", "-s", "101,102,103,401,402,201,501,801"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []ScenarioCode{
-		101, 102, 103, 401, 402, 201, 501, 601, 801,
+		101, 102, 103, 401, 402, 201, 501, 801,
 	}
 	if !reflect.DeepEqual(options.ScenarioCodes, want) {
 		t.Fatalf(
@@ -802,17 +880,23 @@ func TestParseCLIArgsResolvesThreeDigitScenarioCodes(t *testing.T) {
 }
 
 func TestParseCLIArgsResolvesIndependentPlanScenarioCodes(t *testing.T) {
-	options, err := ParseCLIArgs([]string{"run", "-s", "601,602,603,604,605,606"})
+	definitions, err := resolveScenarioInputs([]string{
+		"601", "602", "603", "604", "605", "606",
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	options := make([]ScenarioCode, len(definitions))
+	for index, definition := range definitions {
+		options[index] = definition.Code
 	}
 	want := []ScenarioCode{
 		601, 602, 603, 604, 605, 606,
 	}
-	if !reflect.DeepEqual(options.ScenarioCodes, want) {
+	if !reflect.DeepEqual(options, want) {
 		t.Fatalf(
 			"scenario codes=%v want=%v",
-			options.ScenarioCodes,
+			options,
 			want,
 		)
 	}
