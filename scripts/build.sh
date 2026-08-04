@@ -30,7 +30,7 @@ for arch in arm64 amd64; do
     cp README.md "$out/docs/README.md"
     cp docs/gsbench/README.md "$out/docs/gsbench/README.md"
     cp scripts/run.sh scripts/install.sh scripts/gstop-manage.sh "$out/scripts/"
-    printf 'gstop %s\ngsbench v1.1.5\n' "$VERSION" > "$out/VERSION"
+    printf 'gstop %s\ngsbench v1.1.6\n' "$VERSION" > "$out/VERSION"
     chmod +x "$out/bin/gstop" "$out/bin/gsbench" \
         "$out/scripts/run.sh" "$out/scripts/install.sh" "$out/scripts/gstop-manage.sh"
     (

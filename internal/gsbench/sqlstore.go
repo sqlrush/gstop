@@ -1458,9 +1458,13 @@ func (s *sqlJournalStore) Pending(ctx context.Context, runID string) ([]Action, 
 	for rows.Next() {
 		var action Action
 		var (
-			kind, targetProduct                       string
-			original, forward, inverse, verify        string
-			legacyVerifyExpected, state, lastErrorRaw string
+			kind, targetProduct  string
+			forward, inverse     string
+			state                string
+			node, target         sql.NullString
+			original, verify     sql.NullString
+			legacyVerifyExpected sql.NullString
+			lastErrorRaw         sql.NullString
 		)
 		if err := rows.Scan(
 			&action.Sequence,
@@ -1468,8 +1472,8 @@ func (s *sqlJournalStore) Pending(ctx context.Context, runID string) ([]Action, 
 			&action.ScenarioCode,
 			&kind,
 			&targetProduct,
-			&action.Node,
-			&action.Target,
+			&node,
+			&target,
 			&original,
 			&forward,
 			&inverse,
@@ -1480,10 +1484,12 @@ func (s *sqlJournalStore) Pending(ctx context.Context, runID string) ([]Action, 
 		); err != nil {
 			return nil, err
 		}
+		action.Node = node.String
+		action.Target = target.String
 		action.Kind = ActionKind(kind)
 		action.TargetProduct = Product(targetProduct)
 		action.LegacySQL = storedJournalPayloadIsLegacy(
-			original, forward, inverse, verify,
+			original.String, forward, inverse, verify.String,
 		)
 		if action.LegacySQL && !action.Kind.valid() {
 			action.Kind = ActionSQLMutation
@@ -1491,12 +1497,15 @@ func (s *sqlJournalStore) Pending(ctx context.Context, runID string) ([]Action, 
 		if action.LegacySQL && action.TargetProduct == "" {
 			action.TargetProduct = ProductUnknown
 		}
-		action.Original = storedActionValuePayload(original)
+		action.Original = storedActionValuePayload(original.String)
 		action.Forward = storedSQLActionPayload(forward, "")
 		action.Inverse = storedSQLActionPayload(inverse, "")
-		action.Verify = storedSQLActionPayload(verify, legacyVerifyExpected)
+		action.Verify = storedSQLActionPayload(
+			verify.String,
+			legacyVerifyExpected.String,
+		)
 		action.State = MutationState(state)
-		action.LastError = lastErrorRaw
+		action.LastError = lastErrorRaw.String
 		if err := validateLoadedJournalAction(action); err != nil {
 			return nil, fmt.Errorf(
 				"validate journal action %s/%d: %w",

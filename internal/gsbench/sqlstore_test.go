@@ -3,6 +3,7 @@ package gsbench
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"reflect"
@@ -140,6 +141,35 @@ type sliceJournalRows struct {
 	index int
 }
 
+type databaseSQLJournalRows struct {
+	rows *sql.Rows
+}
+
+func (d databaseSQLJournalRows) Scan(
+	context.Context,
+	string,
+	[]any,
+	...any,
+) error {
+	return errors.New("unexpected Scan call")
+}
+
+func (d databaseSQLJournalRows) Exec(
+	context.Context,
+	string,
+	...any,
+) (sql.Result, error) {
+	return nil, errors.New("unexpected Exec call")
+}
+
+func (d databaseSQLJournalRows) Query(
+	context.Context,
+	string,
+	...any,
+) (journalRows, error) {
+	return d.rows, nil
+}
+
 type fakeDatasetTransaction struct {
 	queries    []string
 	args       [][]any
@@ -197,6 +227,12 @@ func (r *sliceJournalRows) Scan(dest ...any) error {
 		)
 	}
 	for i, value := range values {
+		if scanner, ok := dest[i].(sql.Scanner); ok {
+			if err := scanner.Scan(value); err != nil {
+				return err
+			}
+			continue
+		}
 		target := reflect.ValueOf(dest[i]).Elem()
 		source := reflect.ValueOf(value)
 		if source.Type().ConvertibleTo(target.Type()) {
@@ -267,6 +303,38 @@ func TestSQLActionStoreUsesParameterizedJSONAndScansTypedAction(t *testing.T) {
 	}
 	if !reflect.DeepEqual(runs, []string{"run-1"}) {
 		t.Fatalf("stale runs=%v", runs)
+	}
+}
+
+func TestSQLActionStorePendingAcceptsNullableTextFromDatabaseSQL(t *testing.T) {
+	rows := openExplainRowsForTest(t, &explainRowsTestRows{
+		columns: []string{
+			"action_id", "run_id", "scenario_code", "action_kind",
+			"target_product", "target_node", "target_endpoint",
+			"original_state", "forward_action", "inverse_action",
+			"verify_action", "verify_value", "state", "last_error",
+		},
+		values: [][]driver.Value{{
+			int64(1), "run-ora", int64(601), "SQL_MUTATION", "GaussDB",
+			nil, "gsbench.plan_data_lookup_idx", nil,
+			`{"sql":"DROP INDEX gsbench.plan_data_lookup_idx"}`,
+			`{"sql":"CREATE UNIQUE INDEX plan_data_lookup_idx ON gsbench.plan_data (lookup_key,dist_key)"}`,
+			nil, nil, "applied", nil,
+		}},
+	})
+	store := newSQLJournalStore(databaseSQLJournalRows{rows: rows}, "gsbench")
+
+	pending, err := store.Pending(context.Background(), "run-ora")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%+v", pending)
+	}
+	action := pending[0]
+	if action.Node != "" || len(action.Original) != 0 ||
+		len(action.Verify) != 0 || action.LastError != "" {
+		t.Fatalf("nullable fields were not normalized: %+v", action)
 	}
 }
 

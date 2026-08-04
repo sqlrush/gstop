@@ -1,6 +1,6 @@
 # gstop (Go)
 
-当前版本：**gstop v1.6.3 / gsbench v1.1.5**
+当前版本：**gstop v1.6.3 / gsbench v1.1.6**
 
 GaussDB / openGauss 实时监控与应急诊断终端工具 —— 原 Python 工具
 [gausstop](https://gitee.com/sqlrush/gausstop)（`gstop_ABC_1.4` 分支，作者：吴海存）的
