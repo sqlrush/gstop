@@ -176,7 +176,7 @@ func TestCLIVersionPrintsAuthor(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Author: WangYingJie <sqlrush@gmail.com>") {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.6\n") {
+	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.7\n") {
 		t.Fatalf("version=%q", stdout.String())
 	}
 }
@@ -224,7 +224,7 @@ func TestCLIHelpDocumentsIndependentPlanScenariosAndRestore(t *testing.T) {
 	}
 	text := stdout.String()
 	for _, token := range []string{
-		"gsbench restore", "601=planchange_stats_target", "602=planchange_index_unusable",
+		"gsbench restore", "601=planchange_stats_target", "602=planchange_stats_lookup",
 		"603=planchange_stats_ndistinct", "604=planchange_stats_extended",
 		"605=planchange_index_drop", "606=planchange_index_shape",
 		"gsbench run 601 init --worker N --duration DURATION",
@@ -329,6 +329,13 @@ func TestParseCLIArgsSupportsThreePhasePlanCommands(t *testing.T) {
 			name: "recover",
 			args: []string{"run", "planchange_index_drop", "recover"},
 			code: 605, action: PlanRunRecover,
+		},
+		{
+			name: "legacy 602 name",
+			args: []string{
+				"run", "planchange_index_unusable", "fault",
+			},
+			code: 602, action: PlanRunFault,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
