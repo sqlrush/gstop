@@ -2579,7 +2579,10 @@ func (b *databaseRestoreBackend) verifyPlanBaselineForActions(
 	ctx context.Context,
 	actions []Action,
 ) error {
-	if !b.cfg.Run.ValidationEnabled || !restoreActionsContainPlanChange(actions) {
+	if !restorePlanVerificationRequired(
+		b.cfg.Run.ValidationEnabled,
+		actions,
+	) {
 		return nil
 	}
 	exists, err := b.planBaselineExists(ctx)
@@ -2610,6 +2613,24 @@ func (b *databaseRestoreBackend) verifyPlanBaselineForActions(
 		return fmt.Errorf("verify benchmark baseline: %w", err)
 	}
 	return nil
+}
+
+func restorePlanVerificationRequired(
+	validationEnabled bool,
+	actions []Action,
+) bool {
+	if !restoreActionsContainPlanChange(actions) {
+		return false
+	}
+	if validationEnabled {
+		return true
+	}
+	for _, action := range actions {
+		if action.ScenarioCode == 602 {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *databaseRestoreBackend) planBaselineExists(

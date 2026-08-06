@@ -1247,7 +1247,7 @@ func legacyJournalScenarioCodes() map[string]ScenarioCode {
 	}
 	for legacy, canonical := range map[string]string{
 		"plan_stats_target":    "planchange_stats_target",
-		"plan_index_unusable":  "planchange_index_unusable",
+		"plan_index_unusable":  "planchange_stats_lookup",
 		"plan_stats_ndistinct": "planchange_stats_ndistinct",
 		"plan_stats_extended":  "planchange_stats_extended",
 		"plan_index_drop":      "planchange_index_drop",
@@ -1259,6 +1259,7 @@ func legacyJournalScenarioCodes() map[string]ScenarioCode {
 		}
 		codes[legacy] = definition.Code
 	}
+	codes["planchange_index_unusable"] = 602
 	return codes
 }
 

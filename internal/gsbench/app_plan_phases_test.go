@@ -347,3 +347,15 @@ func TestRunCommandNeedsGeneratedRunIDOnlyForWorkloadOwners(t *testing.T) {
 		}
 	}
 }
+
+func TestStrictPlanInitVerificationIsMandatoryOnlyFor602(t *testing.T) {
+	if !strictPlanInitVerificationRequired(false, 602) {
+		t.Fatal("602 init skipped strict plan verification")
+	}
+	if strictPlanInitVerificationRequired(false, 601) {
+		t.Fatal("601 validation behavior changed")
+	}
+	if strictPlanInitVerificationRequired(true, 602) {
+		t.Fatal("602 duplicated general plan verification")
+	}
+}

@@ -372,8 +372,10 @@ git commit -m "feat(gsbench): reject unverified 602 faults"
 
 **Files:**
 - Modify: `internal/gsbench/app.go`
+- Modify: `internal/gsbench/app_plan_phases.go`
 - Modify: `internal/gsbench/sqlstore.go`
-- Test: `internal/gsbench/app_plan_test.go`
+- Test: `internal/gsbench/app_plan_phases_test.go`
+- Test: `internal/gsbench/cli_test.go`
 - Test: `internal/gsbench/sqlstore_test.go`
 
 **Interfaces:**

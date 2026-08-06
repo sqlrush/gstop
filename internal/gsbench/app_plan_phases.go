@@ -615,6 +615,23 @@ func runPlanInit(
 		RepairPlanBaseline,
 		VerifyPlanBaseline,
 	)
+	if prepareErr == nil && strictPlanInitVerificationRequired(
+		cfg.Run.ValidationEnabled,
+		definition.Code,
+	) {
+		if err := VerifyPlanBaselineScenarios(
+			prepareCtx,
+			db,
+			cfg.Data.Schema,
+			[]ScenarioCode{definition.Code},
+		); err != nil {
+			prepareErr = fmt.Errorf(
+				"verify strict scenario %03d baseline: %w",
+				definition.Code,
+				err,
+			)
+		}
+	}
 	cancelPrepare()
 	if prepareErr != nil {
 		log.Error("prepare plan baseline: %v", prepareErr)
@@ -791,4 +808,11 @@ func runPlanInit(
 		cfg.Run.Duration,
 	)
 	return 0
+}
+
+func strictPlanInitVerificationRequired(
+	validationEnabled bool,
+	code ScenarioCode,
+) bool {
+	return !validationEnabled && code == 602
 }

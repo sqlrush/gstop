@@ -859,6 +859,22 @@ func TestVerifyRestorePlanBaselineHonorsDisabledValidation(t *testing.T) {
 	}
 }
 
+func TestRestorePlanVerificationIsMandatoryFor602(t *testing.T) {
+	actions := []Action{{
+		ScenarioCode: 602,
+		Kind:         ActionSQLMutation,
+	}}
+	if !restorePlanVerificationRequired(false, actions) {
+		t.Fatal("602 recover skipped strict plan verification")
+	}
+	if restorePlanVerificationRequired(false, []Action{{
+		ScenarioCode: 601,
+		Kind:         ActionSQLMutation,
+	}}) {
+		t.Fatal("601 disabled-validation behavior changed")
+	}
+}
+
 func TestParseCLIArgsSupportsShortFlags(t *testing.T) {
 	options, err := ParseCLIArgs([]string{"run", "-s", "101,ap_cpu,lock_row_chain", "-d", "45s"})
 	if err != nil {

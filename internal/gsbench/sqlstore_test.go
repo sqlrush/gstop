@@ -876,6 +876,15 @@ func TestLegacyJournalMigrationConvergesFormalCompositeKeyContract(t *testing.T)
 	}
 }
 
+func TestLegacyJournalScenarioCodesPreserveOld602Name(t *testing.T) {
+	codes := legacyJournalScenarioCodes()
+	if codes["planchange_index_unusable"] != 602 ||
+		codes["planchange_stats_lookup"] != 602 ||
+		codes["plan_index_unusable"] != 602 {
+		t.Fatalf("602 legacy scenario codes=%v", codes)
+	}
+}
+
 func TestFormalJournalMigrationDoesNotDuplicateColumnsOrKeys(t *testing.T) {
 	columns := map[string]bool{
 		"run_id": true, "action_id": true, "scenario_code": true,
