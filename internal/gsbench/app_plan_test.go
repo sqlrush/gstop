@@ -1119,6 +1119,149 @@ func TestWithPlanRunPreparationDatabaseLockProtectsStaleRestore(
 	}
 }
 
+func TestPoolOnlyRecoveryFailureContinuationPolicy(t *testing.T) {
+	errStop := errors.New("stop failed")
+	tests := []struct {
+		name    string
+		summary RestoreSummary
+		want    bool
+	}{
+		{
+			name: "401 and 402 without actions",
+			summary: RestoreSummary{
+				Failed:              true,
+				Err:                 errStop,
+				DiscoveryComplete:   true,
+				RestoreLockReleased: true,
+				Runs: []RestoreRun{
+					{RunID: "a", ScenarioCodes: []ScenarioCode{401}},
+					{RunID: "b", ScenarioCodes: []ScenarioCode{402}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "success is not an exception",
+			summary: RestoreSummary{Runs: []RestoreRun{{
+				RunID: "a", ScenarioCodes: []ScenarioCode{401},
+			}}},
+		},
+		{
+			name:    "no discovered runs",
+			summary: RestoreSummary{Failed: true, Err: errStop},
+		},
+		{
+			name: "discovery failure",
+			summary: RestoreSummary{
+				Failed: true, Err: errStop, RestoreLockReleased: true,
+				Runs: []RestoreRun{{
+					RunID: "a", ScenarioCodes: []ScenarioCode{401},
+				}},
+			},
+		},
+		{
+			name: "restore lock release failure",
+			summary: RestoreSummary{
+				Failed: true, Err: errStop, DiscoveryComplete: true,
+				Runs: []RestoreRun{{
+					RunID: "a", ScenarioCodes: []ScenarioCode{401},
+				}},
+			},
+		},
+		{
+			name: "new run startup failure",
+			summary: RestoreSummary{
+				Failed: true, Err: errStop,
+				DiscoveryComplete:     true,
+				RestoreLockReleased:   true,
+				AfterSuccessAttempted: true,
+				Runs: []RestoreRun{{
+					RunID: "a", ScenarioCodes: []ScenarioCode{401},
+				}},
+			},
+		},
+		{
+			name: "unknown run identity",
+			summary: RestoreSummary{
+				Failed: true, Err: errStop,
+				DiscoveryComplete:   true,
+				RestoreLockReleased: true,
+				Runs:                []RestoreRun{{RunID: "a"}},
+			},
+		},
+		{
+			name: "non-pool scenario",
+			summary: RestoreSummary{
+				Failed: true, Err: errStop,
+				DiscoveryComplete:   true,
+				RestoreLockReleased: true,
+				Runs: []RestoreRun{{
+					RunID: "a", ScenarioCodes: []ScenarioCode{401, 301},
+				}},
+			},
+		},
+		{
+			name: "database or local action",
+			summary: RestoreSummary{
+				Failed: true, Err: errStop,
+				DiscoveryComplete:   true,
+				RestoreLockReleased: true,
+				Runs: []RestoreRun{{
+					RunID: "a", ScenarioCodes: []ScenarioCode{402},
+				}},
+				PlannedActions: []Action{{RunID: "a", ScenarioCode: 402}},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := canContinueAfterPoolOnlyRecoveryFailure(
+				test.summary,
+			); got != test.want {
+				t.Fatalf(
+					"got=%v want=%v summary=%+v",
+					got,
+					test.want,
+					test.summary,
+				)
+			}
+		})
+	}
+}
+
+func TestContinueAfterPoolOnlyRecoveryFailureStartsNewRun(t *testing.T) {
+	var output bytes.Buffer
+	log, err := NewRunLog(&output, "", Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	starts := 0
+	summary := RestoreSummary{
+		Failed:              true,
+		Err:                 errors.New("stop stale sessions failed"),
+		DiscoveryComplete:   true,
+		RestoreLockReleased: true,
+		Runs: []RestoreRun{{
+			RunID: "old", ScenarioCodes: []ScenarioCode{401},
+		}},
+	}
+	if err := continueAfterPoolOnlyRecoveryFailure(
+		summary,
+		log,
+		func() error {
+			starts++
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 || !strings.Contains(output.String(), "WARN") ||
+		!strings.Contains(output.String(), "stop stale sessions failed") {
+		t.Fatalf("starts=%d output=%s", starts, output.String())
+	}
+}
+
 func TestWithPlanRunPreparationDatabaseLockFailsBusyBeforeStaleRestore(
 	t *testing.T,
 ) {

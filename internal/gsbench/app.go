@@ -783,6 +783,39 @@ func commandRunCore(
 	// Run preparation always executes under the outer plan/schema lock.
 	// The restore backend must not try to reacquire that session lock.
 	backend.requirePlanLock = false
+	startPreparedRun := func(ctx context.Context) error {
+		if scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes) {
+			activeRunID, err := findActivePlanRun(
+				ctx,
+				db,
+				cfg.Data.Schema,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"check active plan-change run: %w",
+					err,
+				)
+			}
+			if activeRunID != "" {
+				return fmt.Errorf(
+					"plan-change run %s is already active; "+
+						"stop or restore it first",
+					activeRunID,
+				)
+			}
+			if err := preparePlanRunBaseline(
+				ctx,
+				db,
+				cfg,
+				log,
+				RepairPlanBaseline,
+				VerifyPlanBaseline,
+			); err != nil {
+				return err
+			}
+		}
+		return startRun(ctx, db, cfg, runID)
+	}
 	var staleSummary RestoreSummary
 	prepareRun := func() int {
 		staleSummary = NewRestoreCoordinatorWithValidation(
@@ -794,44 +827,21 @@ func commandRunCore(
 				ctx context.Context,
 				_ RestoreLock,
 			) error {
-				if scenarioCodesContainPlanChange(
-					cfg.Run.ScenarioCodes,
-				) {
-					activeRunID, err := findActivePlanRun(
-						ctx,
-						db,
-						cfg.Data.Schema,
-					)
-					if err != nil {
-						return fmt.Errorf(
-							"check active plan-change run: %w",
-							err,
-						)
-					}
-					if activeRunID != "" {
-						return fmt.Errorf(
-							"plan-change run %s is already active; "+
-								"stop or restore it first",
-							activeRunID,
-						)
-					}
-					if err := preparePlanRunBaseline(
-						ctx,
-						db,
-						cfg,
-						log,
-						RepairPlanBaseline,
-						VerifyPlanBaseline,
-					); err != nil {
-						return err
-					}
-				}
-				return startRun(ctx, db, cfg, runID)
+				return startPreparedRun(ctx)
 			}},
 		)
 		if staleSummary.Failed {
-			log.Error("recover stale state and record run: %v", staleSummary.Err)
-			return 1
+			if err := continueAfterPoolOnlyRecoveryFailure(
+				staleSummary,
+				log,
+				func() error {
+					return startPreparedRun(parent)
+				},
+			); err != nil {
+				log.Error("recover stale state and record run: %v", err)
+				return 1
+			}
+			return 0
 		}
 		if len(staleSummary.RunIDs) != 0 {
 			log.Info(
@@ -910,6 +920,50 @@ func commandRunCore(
 		}
 	}
 	return exitCodeForOutcome(summary.Outcome)
+}
+
+func canContinueAfterPoolOnlyRecoveryFailure(
+	summary RestoreSummary,
+) bool {
+	if !summary.Failed || summary.Err == nil ||
+		!summary.DiscoveryComplete || !summary.RestoreLockReleased ||
+		summary.AfterSuccessAttempted || len(summary.Runs) == 0 ||
+		len(summary.PlannedActions) != 0 {
+		return false
+	}
+	for _, run := range summary.Runs {
+		if len(run.ScenarioCodes) == 0 {
+			return false
+		}
+		for _, code := range run.ScenarioCodes {
+			if code != 401 && code != 402 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func continueAfterPoolOnlyRecoveryFailure(
+	summary RestoreSummary,
+	log *RunLog,
+	start func() error,
+) error {
+	if !canContinueAfterPoolOnlyRecoveryFailure(summary) {
+		if summary.Err != nil {
+			return summary.Err
+		}
+		return fmt.Errorf("stale recovery failed without a recorded cause")
+	}
+	log.Warn(
+		"stale pool-only recovery FAILED but will not block later tests: runs=%d error=%v",
+		len(summary.Runs),
+		summary.Err,
+	)
+	if start == nil {
+		return fmt.Errorf("new run recorder is unavailable")
+	}
+	return start()
 }
 
 type planBaselineRepairFunc func(
@@ -2006,7 +2060,7 @@ func (b *databaseRestoreBackend) restoreLocalControlPlane(
 		b.cfg.Run.ValidationEnabled,
 	)
 	var errs []error
-	for _, runID := range runs {
+	for _, runID := range restoreRunIDs(runs) {
 		group := restoreActionGroup(
 			actions,
 			runID,
@@ -2229,12 +2283,14 @@ func (b *databaseRestoreBackend) addPendingRunMetadata(
 			continue
 		}
 		seen[action.RunID] = true
+		var scenarios string
 		var startedAt time.Time
 		err := b.db.Scan(
 			ctx,
-			"SELECT started_at FROM "+quotedSchema+
+			"SELECT scenarios,started_at FROM "+quotedSchema+
 				".meta_runs WHERE run_id=$1",
 			[]any{action.RunID},
+			&scenarios,
 			&startedAt,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2248,8 +2304,18 @@ func (b *databaseRestoreBackend) addPendingRunMetadata(
 				err,
 			)
 		}
+		codes, err := parseStoredScenarioCodes(scenarios)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"discover pending run %s scenarios: %w",
+				action.RunID,
+				err,
+			)
+		}
 		runs = append(runs, RestoreRun{
-			RunID: action.RunID, StartedAt: startedAt,
+			RunID:         action.RunID,
+			StartedAt:     startedAt,
+			ScenarioCodes: codes,
 		})
 	}
 	return runs, nil
@@ -2264,12 +2330,14 @@ func (b *databaseRestoreBackend) discoverMetaRuns(
 		return nil, fmt.Errorf("unsafe dataset schema %q", b.cfg.Data.Schema)
 	}
 	if requested != "" {
+		var scenarios string
 		var startedAt time.Time
 		err := b.db.Scan(
 			ctx,
-			"SELECT started_at FROM "+quotedSchema+
+			"SELECT scenarios,started_at FROM "+quotedSchema+
 				".meta_runs WHERE run_id=$1",
 			[]any{requested},
+			&scenarios,
 			&startedAt,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2278,11 +2346,22 @@ func (b *databaseRestoreBackend) discoverMetaRuns(
 		if err != nil {
 			return nil, fmt.Errorf("discover requested meta run: %w", err)
 		}
-		return []RestoreRun{{RunID: requested, StartedAt: startedAt}}, nil
+		codes, err := parseStoredScenarioCodes(scenarios)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"discover requested meta run scenarios: %w",
+				err,
+			)
+		}
+		return []RestoreRun{{
+			RunID:         requested,
+			StartedAt:     startedAt,
+			ScenarioCodes: codes,
+		}}, nil
 	}
 	rows, err := b.db.Query(
 		ctx,
-		"SELECT run_id,started_at FROM "+quotedSchema+
+		"SELECT run_id,scenarios,started_at FROM "+quotedSchema+
 			".meta_runs WHERE status IN ("+
 			"'running','stop_requested','restore_requested',"+
 			"'restore_failed','RESTORE_FAILED') "+
@@ -2295,12 +2374,58 @@ func (b *databaseRestoreBackend) discoverMetaRuns(
 	var runs []RestoreRun
 	for rows.Next() {
 		var run RestoreRun
-		if err := rows.Scan(&run.RunID, &run.StartedAt); err != nil {
+		var scenarios string
+		if err := rows.Scan(
+			&run.RunID,
+			&scenarios,
+			&run.StartedAt,
+		); err != nil {
 			return nil, fmt.Errorf("scan active meta run: %w", err)
 		}
+		codes, err := parseStoredScenarioCodes(scenarios)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"parse active meta run %s scenarios: %w",
+				run.RunID,
+				err,
+			)
+		}
+		run.ScenarioCodes = codes
 		runs = append(runs, run)
 	}
 	return runs, rows.Err()
+}
+
+func parseStoredScenarioCodes(value string) ([]ScenarioCode, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, fmt.Errorf("stored scenario list is empty")
+	}
+	parts := strings.Split(value, ",")
+	codes := make([]ScenarioCode, 0, len(parts))
+	seen := make(map[ScenarioCode]bool, len(parts))
+	for _, raw := range parts {
+		part := strings.TrimSpace(raw)
+		if part == "" {
+			return nil, fmt.Errorf(
+				"stored scenario list contains an empty item",
+			)
+		}
+		number, err := strconv.ParseUint(part, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid stored scenario %q", part)
+		}
+		code := ScenarioCode(number)
+		if _, err := DefaultScenarioCatalog().LookupCode(code); err != nil {
+			return nil, err
+		}
+		if seen[code] {
+			return nil, fmt.Errorf("duplicate stored scenario %03d", code)
+		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	return codes, nil
 }
 
 func (b *databaseRestoreBackend) MarkRestoreRequested(
