@@ -169,9 +169,10 @@ gstop -d              # 守护模式
 
 健康大盘内：方向键滚动，`s` 开关 SQL 光标选择，`p` 查看选中 SQL 的全文和执行计划，
 `r` 立即刷新跨库统计信息/失效索引，`Esc` 从明细返回健康大盘、再返回主监控；`q` 在任何页面
-立即取消明细查询和采集并退出进程。SQL/等待/计划跳变跟随 `main.interval`，动态内存跟随
-`main.mem_interval`，跨库慢项跟随 `main.health_slow_interval`（默认 300 秒）；动态内存查询
-同时沿用 CPU 阈值和最小刷新间隔保护。
+立即取消明细查询和采集并退出进程。SQL/等待/计划跳变跟随 `main.interval`；`m` 内存大盘
+跟随 `main.mem_interval`（默认 5 秒），每轮刷新全部内存面板；健康大盘的动态内存候选采集
+也跟随 `main.mem_interval`，但仍受 CPU 阈值和 `main.dynamic_mem_interval` 最短间隔保护；
+跨库慢项跟随 `main.health_slow_interval`（默认 300 秒）。
 
 ### CURRENT ACTIVE SQL ELAPSED TOP5
 
