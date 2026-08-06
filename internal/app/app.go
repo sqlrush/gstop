@@ -127,7 +127,7 @@ func (a *App) buildMonitors(deps monitor.Deps) {
 // starts hidden (print_to_screen = False) and overlays the resident panels when
 // the memory view is toggled on.
 func (a *App) buildMemory(deps monitor.Deps) {
-	if deps.Cfg.GetInt("main.mem_interval", 30) == 0 || !deps.Cfg.GetBool("main.dynamic_mem_enable", false) {
+	if deps.Cfg.GetInt("main.mem_interval", 5) == 0 || !deps.Cfg.GetBool("main.dynamic_mem_enable", false) {
 		return
 	}
 	a.memory = monitor.NewMemoryMonitor(deps)

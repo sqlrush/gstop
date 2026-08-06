@@ -18,8 +18,8 @@ const (
 	memPanel3Title = "TOP 10 THREAD MEMORY"
 
 	// memDefaultInterval is the fallback refresh cadence when main.mem_interval is
-	// missing or non-positive (which the original never created the monitor for).
-	memDefaultInterval = 30
+	// missing or non-positive (which the app never creates the monitor for).
+	memDefaultInterval = 5
 )
 
 // Emergency memory-full types shared with the emergency subsystem, matching the
@@ -172,25 +172,20 @@ func (m *MemoryMonitor) cycle() {
 	m.renderAndShow()
 }
 
-// Refresh rebuilds the summary and dynamic panels every cycle and the session and
-// thread panels only when the dynamic-memory throttle allows it. Port of
-// MemoryMonitor.refresh.
+// Refresh rebuilds all four memory panels every cycle. The memory dashboard's
+// explicit cadence is its only refresh throttle; the health dashboard keeps its
+// independent CPU and minimum-interval gate.
 func (m *MemoryMonitor) Refresh() {
 	p0 := m.refreshSummaryInfo()
 	p1 := m.refreshDynamicInfo()
+	p2 := m.refreshSessionInfo()
+	p3 := m.refreshThreadInfo()
 	m.mu.Lock()
 	m.panels[0] = p0
 	m.panels[1] = p1
+	m.panels[2] = p2
+	m.panels[3] = p3
 	m.mu.Unlock()
-
-	if m.deps.Health.ShouldRefreshMemory("memory") {
-		p2 := m.refreshSessionInfo()
-		p3 := m.refreshThreadInfo()
-		m.mu.Lock()
-		m.panels[2] = p2
-		m.panels[3] = p3
-		m.mu.Unlock()
-	}
 }
 
 // Draw attaches screen and renders once, letting the app force a frame (e.g. when
