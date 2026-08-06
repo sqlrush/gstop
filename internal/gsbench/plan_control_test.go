@@ -198,7 +198,7 @@ func TestPlanControlMarksFaultFailureRecoverable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.MarkFaultFailed(
-		context.Background(), "fault-1", errors.New("DDL failed"),
+		context.Background(), "fault-1", errors.New("DDL failed"), false,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +206,40 @@ func TestPlanControlMarksFaultFailureRecoverable(t *testing.T) {
 		if !containsAnyString(db.execArgs, token) {
 			t.Fatalf("query=%q args=%v missing %q", db.execQuery, db.execArgs, token)
 		}
+	}
+}
+
+func TestPlanControlMarksRejectedFaultRestoredAndInactive(t *testing.T) {
+	db := &planControlTestDB{}
+	store, err := newPlanControlStore(db, "gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFaultFailed(
+		context.Background(),
+		"fault-602",
+		errors.New("fault plan did not change"),
+		true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{
+		string(PhaseRestore),
+		string(OutcomeFailed),
+		"fault plan did not change",
+		"fault-602",
+	} {
+		if !containsAnyString(db.execArgs, token) {
+			t.Fatalf(
+				"query=%q args=%v missing %q",
+				db.execQuery,
+				db.execArgs,
+				token,
+			)
+		}
+	}
+	if !strings.Contains(db.execQuery, "phase=$1,status=$2") {
+		t.Fatalf("query=%q args=%v", db.execQuery, db.execArgs)
 	}
 }
 

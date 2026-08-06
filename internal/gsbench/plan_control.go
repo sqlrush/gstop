@@ -195,20 +195,35 @@ func (s *planControlStore) MarkFaultFailed(
 	ctx context.Context,
 	runID string,
 	faultErr error,
+	restored bool,
 ) error {
 	detail := "plan fault failed"
 	if faultErr != nil {
 		detail = journalSafeErrorText(faultErr.Error())
 	}
-	_, err := s.db.Exec(
-		ctx,
-		"UPDATE "+s.schema+
-			".meta_runs SET status=$1,detail=$2,updated_at=current_timestamp "+
-			"WHERE run_id=$3",
-		"restore_failed",
-		detail,
-		runID,
-	)
+	var err error
+	if restored {
+		_, err = s.db.Exec(
+			ctx,
+			"UPDATE "+s.schema+
+				".meta_runs SET phase=$1,status=$2,detail=$3,"+
+				"updated_at=current_timestamp WHERE run_id=$4",
+			string(PhaseRestore),
+			string(OutcomeFailed),
+			detail,
+			runID,
+		)
+	} else {
+		_, err = s.db.Exec(
+			ctx,
+			"UPDATE "+s.schema+
+				".meta_runs SET status=$1,detail=$2,"+
+				"updated_at=current_timestamp WHERE run_id=$3",
+			"restore_failed",
+			detail,
+			runID,
+		)
+	}
 	return err
 }
 

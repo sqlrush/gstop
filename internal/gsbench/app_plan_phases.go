@@ -15,8 +15,9 @@ type planActionBackend interface {
 	ResolveFault(context.Context, ScenarioCode) (planRunRecord, error)
 	StartFault(context.Context, string, ScenarioCode) error
 	ApplyFault(context.Context, string, ScenarioCode) error
+	VerifyFault(context.Context, ScenarioCode) error
 	MarkFaultActive(context.Context, string) error
-	MarkFaultFailed(context.Context, string, error) error
+	MarkFaultFailed(context.Context, string, error, bool) error
 	RestoreFault(context.Context, string) error
 }
 
@@ -59,16 +60,61 @@ func executePlanFaultAction(
 		return "", fmt.Errorf("record plan fault: %w", err)
 	}
 	if applyErr := backend.ApplyFault(ctx, runID, code); applyErr != nil {
-		markErr := backend.MarkFaultFailed(ctx, runID, applyErr)
-		return runID, errors.Join(
-			fmt.Errorf("apply plan fault: %w", applyErr),
-			markErr,
+		return runID, rejectPlanFault(
+			ctx,
+			backend,
+			runID,
+			"apply plan fault",
+			applyErr,
+		)
+	}
+	if verifyErr := backend.VerifyFault(ctx, code); verifyErr != nil {
+		return runID, rejectPlanFault(
+			ctx,
+			backend,
+			runID,
+			"verify fault plan",
+			verifyErr,
 		)
 	}
 	if err := backend.MarkFaultActive(ctx, runID); err != nil {
-		return runID, fmt.Errorf("mark plan fault active: %w", err)
+		return runID, rejectPlanFault(
+			ctx,
+			backend,
+			runID,
+			"mark plan fault active",
+			err,
+		)
 	}
 	return runID, nil
+}
+
+func rejectPlanFault(
+	ctx context.Context,
+	backend planActionBackend,
+	runID string,
+	operation string,
+	faultErr error,
+) error {
+	restoreErr := backend.RestoreFault(ctx, runID)
+	restored := restoreErr == nil
+	markErr := backend.MarkFaultFailed(
+		ctx,
+		runID,
+		faultErr,
+		restored,
+	)
+	if restoreErr != nil {
+		restoreErr = fmt.Errorf(
+			"automatically restore rejected plan fault: %w",
+			restoreErr,
+		)
+	}
+	return errors.Join(
+		fmt.Errorf("%s: %w", operation, faultErr),
+		restoreErr,
+		markErr,
+	)
 }
 
 func executePlanRecoverAction(
@@ -306,6 +352,29 @@ func (b *databasePlanActionBackend) ApplyFault(
 	return nil
 }
 
+func (b *databasePlanActionBackend) VerifyFault(
+	ctx context.Context,
+	code ScenarioCode,
+) error {
+	if code != 602 {
+		return nil
+	}
+	operationCtx, cancel := planMaintenanceContext(ctx, b.cfg)
+	defer cancel()
+	definition, err := planScenarioDefinitionForCode(
+		b.cfg.Data.Schema,
+		code,
+	)
+	if err != nil {
+		return err
+	}
+	return verifyPlanFaultPlans(
+		operationCtx,
+		databasePlanBaselineExplainer{db: b.db},
+		definition,
+	)
+}
+
 func (b *databasePlanActionBackend) MarkFaultActive(
 	ctx context.Context,
 	runID string,
@@ -322,8 +391,9 @@ func (b *databasePlanActionBackend) MarkFaultFailed(
 	ctx context.Context,
 	runID string,
 	faultErr error,
+	restored bool,
 ) error {
-	return b.control.MarkFaultFailed(ctx, runID, faultErr)
+	return b.control.MarkFaultFailed(ctx, runID, faultErr, restored)
 }
 
 func (b *databasePlanActionBackend) RestoreFault(
