@@ -123,3 +123,56 @@ func TestConnectionScenarioStopCleansResourcesAfterJoinTimeout(t *testing.T) {
 			scenario.transactions, scenario.connections)
 	}
 }
+
+func TestConnectionFrozenSampleNeverRequestsTopUp(t *testing.T) {
+	scenario := &ConnectionScenario{budget: ConnectionBudget{
+		UsableCapacity: 100,
+		DesiredTotal:   90,
+		WorkloadTarget: 10,
+	}}
+	if err := scenario.acceptRampSample(90, 10); err != nil {
+		t.Fatal(err)
+	}
+	if scenario.liveTagged != 10 {
+		t.Fatalf("live tagged=%d", scenario.liveTagged)
+	}
+	if err := scenario.acceptFrozenSample(75, 10); err != nil {
+		t.Fatalf("external connection loss changed frozen injection: %v", err)
+	}
+	if !scenario.targetReached {
+		t.Fatal("a later external loss erased successful target evidence")
+	}
+}
+
+func TestConnectionFrozenSampleFailsWhenInjectedSessionIsLost(t *testing.T) {
+	scenario := &ConnectionScenario{budget: ConnectionBudget{
+		UsableCapacity: 100,
+		WorkloadTarget: 10,
+	}}
+	if err := scenario.acceptFrozenSample(89, 9); err == nil {
+		t.Fatal("lost tagged session was accepted")
+	}
+}
+
+func TestConnectionRampSampleMustReachTargetOnce(t *testing.T) {
+	scenario := &ConnectionScenario{budget: ConnectionBudget{
+		UsableCapacity: 100,
+		DesiredTotal:   90,
+		WorkloadTarget: 10,
+	}}
+	if err := scenario.acceptRampSample(90, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := scenario.acceptRampSample(89, 10); err == nil {
+		t.Fatal("ramp accepted an unreached total target")
+	}
+}
+
+func TestConnectionRampDeadlineRemainsFailureWithoutWrappingDeadline(
+	t *testing.T,
+) {
+	err := connectionTargetRampError(context.DeadlineExceeded, 7, 10)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline target error=%v", err)
+	}
+}

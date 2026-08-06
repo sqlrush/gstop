@@ -43,15 +43,37 @@ func TestConnectionBudgetSubtractsReservedAndExistingSessions(t *testing.T) {
 	}
 }
 
-func TestConnectionTopUpUsesObservedLiveSessions(t *testing.T) {
-	if got := connectionTopUp(94, 91, 84, 87); got != 3 {
-		t.Fatalf("top-up=%d", got)
+func TestConnectionBudgetInjectsOnlyBaselineDelta(t *testing.T) {
+	budget, err := calculateConnectionBudget(103, 3, 80, 90, 100)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := connectionTopUp(94, 91, 87, 87); got != 0 {
-		t.Fatalf("top-up exceeded workload safety limit: %d", got)
+	if budget.UsableCapacity != 100 || budget.DesiredTotal != 90 ||
+		budget.WorkloadTarget != 10 || budget.BaselinePercent != 80 {
+		t.Fatalf("budget=%+v", budget)
 	}
-	if got := connectionTopUp(98, 94, 86, 87); got != 1 {
-		t.Fatalf("closed tagged session was not replenished: %d", got)
+}
+
+func TestConnectionBudgetRejectsTargetAtOrBelowBaseline(t *testing.T) {
+	for _, target := range []int{79, 80} {
+		if _, err := calculateConnectionBudget(
+			103, 3, 80, target, 100,
+		); err == nil {
+			t.Fatalf("target %d accepted at 80%% baseline", target)
+		}
+	}
+}
+
+func TestConnectionScenarioRejectsUnreachableBudgetBeforeRamp(t *testing.T) {
+	budget, err := calculateConnectionBudget(103, 3, 80, 90, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !budget.Limited || budget.WorkloadTarget != 5 {
+		t.Fatalf("budget=%+v", budget)
+	}
+	if err := validateConnectionBudget(budget); err == nil {
+		t.Fatal("unreachable connection budget was accepted")
 	}
 }
 

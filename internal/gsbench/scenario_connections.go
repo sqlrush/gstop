@@ -21,15 +21,16 @@ func connectionTarget(instanceMax, targetPercent, safetyMax int) int {
 }
 
 type ConnectionBudget struct {
-	InstanceMax    int
-	Reserved       int
-	Existing       int
-	UsableCapacity int
-	DesiredTotal   int
-	WorkloadTarget int
-	ReachableTotal int
-	CeilingPercent float64
-	Limited        bool
+	InstanceMax     int
+	Reserved        int
+	Existing        int
+	UsableCapacity  int
+	DesiredTotal    int
+	WorkloadTarget  int
+	ReachableTotal  int
+	BaselinePercent float64
+	CeilingPercent  float64
+	Limited         bool
 }
 
 func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, safetyMax int) (ConnectionBudget, error) {
@@ -49,6 +50,13 @@ func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, s
 		return ConnectionBudget{}, fmt.Errorf("connection safety maximum must be positive")
 	}
 	usable := instanceMax - reserved
+	baselinePercent := float64(existing) / float64(usable) * 100
+	if float64(targetPercent) <= baselinePercent {
+		return ConnectionBudget{}, fmt.Errorf(
+			"connection target %.1f%% must be above baseline %.1f%%",
+			float64(targetPercent), baselinePercent,
+		)
+	}
 	desired := int(math.Ceil(float64(usable) * float64(targetPercent) / 100))
 	needed := max(0, desired-existing)
 	headroom := max(0, usable-existing)
@@ -59,12 +67,21 @@ func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, s
 		InstanceMax: instanceMax, Reserved: reserved, Existing: existing,
 		UsableCapacity: usable, DesiredTotal: desired,
 		WorkloadTarget: workloadTarget, ReachableTotal: reachable,
-		CeilingPercent: ceilingPercent, Limited: reachable < desired,
+		BaselinePercent: baselinePercent,
+		CeilingPercent:  ceilingPercent, Limited: reachable < desired,
 	}, nil
 }
 
-func connectionTopUp(usableCapacity, observedTotal, observedTagged, workloadLimit int) int {
-	return max(0, min(usableCapacity-observedTotal, workloadLimit-observedTagged))
+func validateConnectionBudget(budget ConnectionBudget) error {
+	if budget.Limited || budget.ReachableTotal < budget.DesiredTotal {
+		return fmt.Errorf(
+			"connection target is unreachable: target=%d reachable=%d ceiling=%.1f%%",
+			budget.DesiredTotal,
+			budget.ReachableTotal,
+			budget.CeilingPercent,
+		)
+	}
+	return nil
 }
 
 type connectionCapacityFacts struct {
@@ -126,6 +143,7 @@ type ConnectionScenario struct {
 	actualPercent  float64
 	reachableMax   float64
 	liveTagged     int
+	targetReached  bool
 	nextID         int
 	operations     atomic.Int64
 	errors         atomic.Int64
@@ -146,12 +164,15 @@ func (s *ConnectionScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if err != nil {
 		return err
 	}
-	s.targetPercent = runtimeInt(rt, "scenario.connection_pool.target_percent", 95)
+	s.targetPercent = rt.Config.PoolTargets.ConnectionPercent
 	s.budget, err = calculateConnectionBudget(
 		facts.InstanceMax, facts.Reserved, facts.Existing,
 		s.targetPercent, rt.Config.Safety.MaxConnections,
 	)
 	if err != nil {
+		return err
+	}
+	if err := validateConnectionBudget(s.budget); err != nil {
 		return err
 	}
 	s.idlePercent = runtimeInt(rt, "scenario.connection_pool.idle_percent", 60)
@@ -162,29 +183,24 @@ func (s *ConnectionScenario) Prepare(ctx context.Context, rt *Runtime) error {
 func (s *ConnectionScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	activeCtx, cancel := context.WithCancel(ctx)
 	s.activeCancel = cancel
-	return s.reconcile(activeCtx, rt)
-}
-
-func (s *ConnectionScenario) reconcile(ctx context.Context, rt *Runtime) error {
-	select {
-	case err := <-s.activeErrors:
-		return err
-	default:
-	}
-	total, tagged, err := s.sampleConnections(ctx, rt)
-	if err != nil {
-		return err
-	}
-	s.updateConnectionSample(total, tagged)
-	for range connectionTopUp(s.budget.UsableCapacity, total, tagged, s.budget.WorkloadTarget) {
-		if err := s.openConnection(ctx, rt); err != nil {
-			return err
+	for range s.budget.WorkloadTarget {
+		if err := s.openConnection(activeCtx, rt); err != nil {
+			return connectionTargetRampError(
+				err,
+				len(s.connections),
+				s.budget.WorkloadTarget,
+			)
 		}
-		total++
-		tagged++
 	}
-	s.updateConnectionSample(total, tagged)
-	return nil
+	total, tagged, err := s.sampleConnections(activeCtx, rt)
+	if err != nil {
+		return connectionTargetRampError(
+			err,
+			len(s.connections),
+			s.budget.WorkloadTarget,
+		)
+	}
+	return s.acceptRampSample(total, tagged)
 }
 
 func (s *ConnectionScenario) sampleConnections(ctx context.Context, rt *Runtime) (total, tagged int, err error) {
@@ -213,6 +229,44 @@ func (s *ConnectionScenario) updateConnectionSample(total, tagged int) {
 	if s.actualPercent > s.reachableMax {
 		s.reachableMax = s.actualPercent
 	}
+}
+
+func (s *ConnectionScenario) acceptFrozenSample(total, tagged int) error {
+	s.updateConnectionSample(total, tagged)
+	if tagged != s.budget.WorkloadTarget {
+		return fmt.Errorf(
+			"connection_pool injected sessions changed: actual=%d target=%d",
+			tagged,
+			s.budget.WorkloadTarget,
+		)
+	}
+	return nil
+}
+
+func (s *ConnectionScenario) acceptRampSample(total, tagged int) error {
+	if err := s.acceptFrozenSample(total, tagged); err != nil {
+		return err
+	}
+	if total < s.budget.DesiredTotal {
+		return fmt.Errorf(
+			"connection_pool target was not reached: actual=%d target=%d",
+			total,
+			s.budget.DesiredTotal,
+		)
+	}
+	s.targetReached = true
+	return nil
+}
+
+func connectionTargetRampError(err error, opened, target int) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf(
+			"connection_pool target was not reached before --duration: opened=%d target=%d",
+			opened,
+			target,
+		)
+	}
+	return err
 }
 
 func (s *ConnectionScenario) openConnection(ctx context.Context, rt *Runtime) error {
@@ -272,12 +326,6 @@ func (s *ConnectionScenario) Hold(ctx context.Context, rt *Runtime) error {
 	timer := time.NewTimer(rt.Config.Run.Duration)
 	defer timer.Stop()
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := s.reconcile(ctx, rt); err != nil {
-			return err
-		}
 		select {
 		case err := <-s.activeErrors:
 			return err
@@ -286,13 +334,20 @@ func (s *ConnectionScenario) Hold(ctx context.Context, rt *Runtime) error {
 		case <-timer.C:
 			return nil
 		case <-ticker.C:
+			total, tagged, err := s.sampleConnections(ctx, rt)
+			if err != nil {
+				return err
+			}
+			if err := s.acceptFrozenSample(total, tagged); err != nil {
+				return err
+			}
 		}
 	}
 }
 func (s *ConnectionScenario) Verify(context.Context, *Runtime) (Result, error) {
 	control := ControlResult{
 		Actual: s.actualPercent, ReachableMax: s.reachableMax,
-		Reached: s.actualPercent >= float64(s.targetPercent),
+		Reached: s.targetReached,
 		Ceiling: s.budget.Limited,
 	}
 	result := verifyControlledCapacityResult(s.Name(), float64(s.targetPercent), true, control, int64(s.liveTagged))
