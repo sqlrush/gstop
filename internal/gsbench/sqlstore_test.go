@@ -563,6 +563,21 @@ func TestDatasetIndexMatchesRejectsEqualColumnSemanticDifferences(t *testing.T) 
 	}
 }
 
+func TestDatasetIndexMatchesAcceptsSearchPathQualifiedEquivalent(t *testing.T) {
+	expected := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data (lookup_key,dist_key)`
+	actual := `CREATE UNIQUE INDEX plan_data_lookup_idx ON plan_data USING btree (lookup_key, dist_key) TABLESPACE pg_default`
+
+	if !datasetIndexMatches(actual, expected) {
+		t.Fatalf("search_path-qualified index rejected:\nactual:   %s\nexpected: %s", actual, expected)
+	}
+	if datasetIndexMatches(
+		`CREATE UNIQUE INDEX plan_data_lookup_idx ON other.plan_data USING btree (lookup_key, dist_key) TABLESPACE pg_default`,
+		expected,
+	) {
+		t.Fatal("explicitly different schema was accepted")
+	}
+}
+
 func TestSQLActionExecutorRejectsNonSQLActionKind(t *testing.T) {
 	db := &fakeSQLActionDatabase{}
 	executor := dbActionExecutor{db: db}

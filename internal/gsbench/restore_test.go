@@ -48,6 +48,19 @@ type ownershipRestoreBackend struct {
 	err error
 }
 
+type reconcilingRestoreBackend struct {
+	*fakeRestoreBackend
+	reconcileErr error
+}
+
+func (b *reconcilingRestoreBackend) ReconcileRestoredActions(
+	_ context.Context,
+	_ []Action,
+) error {
+	b.events = append(b.events, "reconcile")
+	return b.reconcileErr
+}
+
 func (b *ownershipRestoreBackend) ValidateRestoreOwnership(
 	context.Context,
 ) error {
@@ -547,6 +560,55 @@ func TestRestoreCoordinatorRestoreFailureSupersedesBenchmarkOutcome(
 		"outcome:run-result:RESTORE_FAILED",
 	) {
 		t.Fatalf("events=%v", backend.events)
+	}
+}
+
+func TestRestoreCoordinatorAcceptsActionFailureReconciledAfterBaseline(
+	t *testing.T,
+) {
+	base := &fakeRestoreBackend{
+		discovery: RestoreDiscovery{
+			Runs: []RestoreRun{{RunID: "run-reconciled"}},
+			DatabaseActions: []Action{
+				restoreTestAction(
+					"run-reconciled",
+					1,
+					ActionSQLMutation,
+					`"gsbench".plan_data_lookup_idx`,
+				),
+			},
+		},
+		fail: map[string]error{
+			"action:run-reconciled:SQL_MUTATION": errors.New(
+				`pq: Relation "plan_data_lookup_idx" already exists`,
+			),
+		},
+	}
+	backend := &reconcilingRestoreBackend{fakeRestoreBackend: base}
+
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{RunID: "run-reconciled"},
+	)
+
+	if summary.Failed || summary.Outcome != OutcomeSuccess {
+		t.Fatalf("reconciled restore summary=%+v", summary)
+	}
+	wantOrder := []string{
+		"action:run-reconciled:SQL_MUTATION:\"gsbench\".plan_data_lookup_idx",
+		"baseline",
+		"reconcile",
+		"topology",
+		"verify:run-reconciled",
+	}
+	joined := strings.Join(backend.events, "\n")
+	position := -1
+	for _, event := range wantOrder {
+		next := strings.Index(joined[position+1:], event)
+		if next < 0 {
+			t.Fatalf("events=%v missing ordered event %q", backend.events, event)
+		}
+		position += next + 1
 	}
 }
 
@@ -1961,6 +2023,54 @@ func TestDatabaseRestoreBackendReconcilesOfflineRestoredMirrorWithoutInverse(
 	}
 	if got := store.states[databaseAction.Sequence]; got != MutationRestored {
 		t.Fatalf("database mirror state=%q want=%q", got, MutationRestored)
+	}
+}
+
+func TestDatabaseRestoreBackendReconcilesPlanJournalAfterBaselineRepair(
+	t *testing.T,
+) {
+	mutations, err := PlanMutationSet(
+		"run-reconciled",
+		"gsbench",
+		"planchange_stats_target",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := SQLAction(mutations[0])
+	action.Sequence = 1
+	action.State = MutationRestoreFailed
+	store := &memoryActionStore{entries: []Action{action}}
+	actionStore := newCoordinatorActionStore(
+		store,
+		nil,
+		[]Action{action},
+		nil,
+	)
+	database := &fakeSQLActionDatabase{actual: `CREATE UNIQUE INDEX plan_data_lookup_idx ON plan_data USING btree (lookup_key, dist_key) TABLESPACE pg_default`}
+	backend := &databaseRestoreBackend{
+		actionStore: actionStore,
+		waitForDatabaseFn: func(context.Context) error {
+			return nil
+		},
+		executor: newRestoreDispatchExecutor(
+			dbActionExecutor{db: database},
+			nil,
+			Environment{Product: ProductGaussDB, Supported: true},
+		),
+	}
+
+	if err := backend.ReconcileRestoredActions(
+		context.Background(),
+		[]Action{action},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.states[action.Sequence]; got != MutationRestored {
+		t.Fatalf("reconciled action state=%q want=%q", got, MutationRestored)
+	}
+	if len(database.executed) != 0 {
+		t.Fatalf("reconciliation executed inverse SQL: %v", database.executed)
 	}
 }
 

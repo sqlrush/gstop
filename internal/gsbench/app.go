@@ -2387,6 +2387,53 @@ func (b *databaseRestoreBackend) RestoreActionGroup(
 	return errors.Join(journalErr, b.actionStore.DrainErrors())
 }
 
+func (b *databaseRestoreBackend) ReconcileRestoredActions(
+	ctx context.Context,
+	actions []Action,
+) error {
+	if b.actionStore == nil || b.executor == nil {
+		return fmt.Errorf("restore action reconciliation was not initialized")
+	}
+	waitForDatabase := b.waitForDatabaseFn
+	if waitForDatabase == nil {
+		waitForDatabase = b.waitForDatabase
+	}
+	if err := waitForDatabase(ctx); err != nil {
+		return err
+	}
+	var errs []error
+	for _, action := range actions {
+		if action.State == MutationRestored ||
+			!actionSkipsPlannedInverseWhenRestored(action) {
+			continue
+		}
+		if err := b.executor.VerifyRestored(ctx, action); err != nil {
+			continue
+		}
+		if err := b.actionStore.SetActionState(
+			ctx,
+			action,
+			MutationRestored,
+			"",
+		); err != nil {
+			errs = append(errs, fmt.Errorf(
+				"mark reconciled action %s/%d restored: %w",
+				action.RunID,
+				action.Sequence,
+				err,
+			))
+			continue
+		}
+		if b.log != nil {
+			b.log.Info(
+				"restore reconcile target=%s status=RESTORED_AFTER_BASELINE",
+				action.Target,
+			)
+		}
+	}
+	return errors.Join(errors.Join(errs...), b.actionStore.DrainErrors())
+}
+
 func (b *databaseRestoreBackend) RepairBaseline(ctx context.Context) error {
 	if err := b.waitForDatabase(ctx); err != nil {
 		return err

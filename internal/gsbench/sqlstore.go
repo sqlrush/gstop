@@ -777,55 +777,103 @@ func canonicalDatasetDistribution(
 	return "hash", keys, true
 }
 
+type datasetIndexShape struct {
+	unique bool
+	name   string
+	target string
+	method string
+	body   string
+}
+
 func datasetIndexMatches(actual, expected string) bool {
-	canonical := func(definition string) (string, bool) {
-		value := strings.ToLower(datasetWhitespaceRE.ReplaceAllString(
-			strings.TrimSpace(strings.ReplaceAll(definition, `"`, "")),
-			" ",
-		))
-		value = strings.Replace(value,
-			"create unique index if not exists ",
-			"create unique index ", 1,
-		)
-		value = strings.Replace(value,
-			"create index if not exists ",
-			"create index ", 1,
-		)
-		if !strings.HasPrefix(value, "create index ") &&
-			!strings.HasPrefix(value, "create unique index ") {
-			return "", false
-		}
-		on := strings.Index(value, " on ")
-		if on < 0 {
-			return "", false
-		}
-		restStart := on + len(" on ")
-		rest := value[restStart:]
-		open := strings.Index(rest, "(")
-		if open < 0 || !strings.Contains(rest[open+1:], ")") {
-			return "", false
-		}
-		target := strings.TrimSpace(rest[:open])
-		method := "btree"
-		if using := strings.LastIndex(target, " using "); using >= 0 {
-			method = strings.TrimSpace(target[using+len(" using "):])
-			target = strings.TrimSpace(target[:using])
-		}
-		if target == "" || !identifierRE.MatchString(method) {
-			return "", false
-		}
-		value = value[:restStart] + target + " using " + method + " " +
-			strings.TrimSpace(rest[open:])
-		// CREATE INDEX without TABLESPACE follows the active default tablespace;
-		// pg_get_indexdef renders that resolved placement explicitly on Gauss.
-		// Placement is therefore ignored, while uniqueness, access method, keys,
-		// opclasses/options and predicates remain part of the comparison.
-		value = datasetIndexTablespaceRE.ReplaceAllString(value, "")
-		return normalizeDatasetSQL(value), true
+	actualShape, actualOK := parseDatasetIndexShape(actual)
+	expectedShape, expectedOK := parseDatasetIndexShape(expected)
+	return actualOK && expectedOK &&
+		actualShape.unique == expectedShape.unique &&
+		datasetIndexObjectMatches(actualShape.name, expectedShape.name) &&
+		datasetIndexObjectMatches(actualShape.target, expectedShape.target) &&
+		actualShape.method == expectedShape.method &&
+		actualShape.body == expectedShape.body
+}
+
+func parseDatasetIndexShape(definition string) (datasetIndexShape, bool) {
+	value := strings.ToLower(datasetWhitespaceRE.ReplaceAllString(
+		strings.TrimSpace(strings.ReplaceAll(definition, `"`, "")),
+		" ",
+	))
+	value = strings.Replace(value,
+		"create unique index if not exists ",
+		"create unique index ", 1,
+	)
+	value = strings.Replace(value,
+		"create index if not exists ",
+		"create index ", 1,
+	)
+
+	shape := datasetIndexShape{method: "btree"}
+	prefix := "create index "
+	if strings.HasPrefix(value, "create unique index ") {
+		shape.unique = true
+		prefix = "create unique index "
+	} else if !strings.HasPrefix(value, prefix) {
+		return datasetIndexShape{}, false
 	}
-	actualDefinition, actualOK := canonical(actual)
-	expectedDefinition, expectedOK := canonical(expected)
-	return actualOK && expectedOK && actualDefinition == expectedDefinition
+	remainder := strings.TrimPrefix(value, prefix)
+	on := strings.Index(remainder, " on ")
+	if on <= 0 {
+		return datasetIndexShape{}, false
+	}
+	shape.name = strings.TrimSpace(remainder[:on])
+	rest := strings.TrimSpace(remainder[on+len(" on "):])
+	open := strings.Index(rest, "(")
+	if open <= 0 || !strings.Contains(rest[open+1:], ")") {
+		return datasetIndexShape{}, false
+	}
+	shape.target = strings.TrimSpace(rest[:open])
+	if using := strings.LastIndex(shape.target, " using "); using >= 0 {
+		shape.method = strings.TrimSpace(
+			shape.target[using+len(" using "):],
+		)
+		shape.target = strings.TrimSpace(shape.target[:using])
+	}
+	if !datasetIndexObjectValid(shape.name) ||
+		!datasetIndexObjectValid(shape.target) ||
+		!identifierRE.MatchString(shape.method) {
+		return datasetIndexShape{}, false
+	}
+	// CREATE INDEX without TABLESPACE follows the active default tablespace;
+	// pg_get_indexdef renders that resolved placement explicitly on Gauss.
+	// Placement is therefore ignored, while uniqueness, access method, keys,
+	// opclasses/options and predicates remain part of the comparison.
+	body := datasetIndexTablespaceRE.ReplaceAllString(
+		" "+strings.TrimSpace(rest[open:]),
+		"",
+	)
+	shape.body = normalizeDatasetSQL(body)
+	return shape, true
+}
+
+func datasetIndexObjectValid(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) == 0 || len(parts) > 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !identifierRE.MatchString(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func datasetIndexObjectMatches(actual, expected string) bool {
+	actualParts := strings.Split(actual, ".")
+	expectedParts := strings.Split(expected, ".")
+	if len(actualParts) == 2 && len(expectedParts) == 2 {
+		return actual == expected
+	}
+	return actualParts[len(actualParts)-1] ==
+		expectedParts[len(expectedParts)-1]
 }
 
 func legacyJournalMigrationStatements(

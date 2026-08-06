@@ -175,6 +175,10 @@ type restoreFinalizationDeadlineBackend interface {
 	RestoreFinalizationTimeout() time.Duration
 }
 
+type restoreActionReconciliationBackend interface {
+	ReconcileRestoredActions(context.Context, []Action) error
+}
+
 const maximumRestoreFinalizationTimeout = 5 * time.Second
 
 type RestoreCoordinator struct {
@@ -285,6 +289,7 @@ func (r *RestoreCoordinator) Restore(
 	}
 
 	var errs []error
+	var actionErrs []error
 	for _, runID := range runs {
 		if err := r.backend.MarkRestoreRequested(ctx, runID); err != nil {
 			errs = append(errs, fmt.Errorf(
@@ -307,7 +312,7 @@ func (r *RestoreCoordinator) Restore(
 				continue
 			}
 			if err := r.backend.RestoreActionGroup(ctx, group); err != nil {
-				errs = append(errs, fmt.Errorf(
+				actionErrs = append(actionErrs, fmt.Errorf(
 					"restore run %s stage %s: %w",
 					runID, stage, err,
 				))
@@ -320,11 +325,28 @@ func (r *RestoreCoordinator) Restore(
 			errs = append(errs, fmt.Errorf("repair benchmark baseline: %w", err))
 		}
 	}
+	actionErrorsReconciled := false
+	if len(actionErrs) != 0 {
+		if reconciler, ok := r.backend.(restoreActionReconciliationBackend); ok {
+			if err := reconciler.ReconcileRestoredActions(ctx, actions); err != nil {
+				errs = append(errs, fmt.Errorf(
+					"reconcile restored actions: %w",
+					err,
+				))
+			} else {
+				actionErrorsReconciled = true
+			}
+		}
+	}
 	if err := r.backend.RedetectTopology(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("re-detect topology: %w", err))
 	}
-	if err := r.backend.VerifyRestore(ctx, runs, actions); err != nil {
-		errs = append(errs, fmt.Errorf("verify restored state: %w", err))
+	verifyErr := r.backend.VerifyRestore(ctx, runs, actions)
+	if verifyErr != nil {
+		errs = append(errs, actionErrs...)
+		errs = append(errs, fmt.Errorf("verify restored state: %w", verifyErr))
+	} else if !actionErrorsReconciled {
+		errs = append(errs, actionErrs...)
 	}
 
 	outcome := OutcomeSuccess
