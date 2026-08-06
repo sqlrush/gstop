@@ -20,7 +20,7 @@ func PlanBaselineRepairSteps(schema string) ([]string, error) {
 	}
 	table := quotedSchema + ".plan_data"
 	definitions := planIndexDefinitions()
-	steps := make([]string, 0, len(definitions)+7)
+	steps := make([]string, 0, len(definitions)+10)
 	for _, definition := range definitions {
 		statement, err := planIndexDDL(schema, definition, true)
 		if err != nil {
@@ -30,9 +30,11 @@ func PlanBaselineRepairSteps(schema string) ([]string, error) {
 	}
 	steps = append(steps,
 		"DROP INDEX IF EXISTS "+quotedSchema+".plan_index_shape_bad_idx",
+		"ALTER TABLE "+table+" ALTER COLUMN lookup_key RESET (n_distinct)",
 		"ALTER TABLE "+table+" ALTER COLUMN stats_target_key SET STATISTICS -1",
 		"ALTER TABLE "+table+" ALTER COLUMN stats_ndistinct_key RESET (n_distinct)",
 		"ALTER TABLE "+table+" ADD STATISTICS ((stats_corr_a,stats_corr_b))",
+		"ANALYZE "+table+"(lookup_key)",
 		"ANALYZE "+table+"(stats_target_key)",
 		"ANALYZE "+table+"(stats_ndistinct_key)",
 		"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
@@ -137,6 +139,22 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 		record("plan_index_shape_bad_idx", "ALREADY_OK")
 	}
 
+	var lookupNDistinctOK int
+	if err := db.Scan(ctx,
+		`SELECT count(*) FROM pg_attribute WHERE attrelid='`+table+
+			`'::regclass AND attname='lookup_key' AND `+
+			`COALESCE(array_to_string(attoptions,','),'') NOT LIKE '%n_distinct=%'`,
+		nil, &lookupNDistinctOK); err != nil {
+		errs = append(errs, err)
+		record("lookup_key n_distinct", "FAILED")
+	} else if lookupNDistinctOK == 0 {
+		exec("lookup_key n_distinct",
+			"ALTER TABLE "+table+
+				" ALTER COLUMN lookup_key RESET (n_distinct)")
+	} else {
+		record("lookup_key n_distinct", "ALREADY_OK")
+	}
+
 	var targetOK int
 	if err := db.Scan(ctx,
 		`SELECT count(*) FROM pg_attribute WHERE attrelid='`+table+
@@ -180,6 +198,7 @@ func RepairPlanBaseline(ctx context.Context, db *Database, schema string) ([]Bas
 		record("extended_statistics", "ALREADY_OK")
 	}
 
+	exec("analyze lookup_key", "ANALYZE "+table+"(lookup_key)")
 	exec("analyze stats_target_key", "ANALYZE "+table+"(stats_target_key)")
 	exec("analyze stats_ndistinct_key", "ANALYZE "+table+"(stats_ndistinct_key)")
 	if err := AnalyzeExtendedStatistics(ctx, db, table); err != nil {
@@ -270,6 +289,7 @@ func verifyPlanBaseline(
 		want  int
 	}{
 		{"bad shape index", `SELECT count(*) FROM pg_indexes WHERE schemaname='` + schema + `' AND indexname='plan_index_shape_bad_idx'`, 0},
+		{"lookup n_distinct option", `SELECT count(*) FROM pg_attribute WHERE attrelid='` + table + `'::regclass AND attname='lookup_key' AND COALESCE(array_to_string(attoptions,','),'') NOT LIKE '%n_distinct=%'`, 1},
 		{"statistics target", `SELECT count(*) FROM pg_attribute WHERE attrelid='` + table + `'::regclass AND attname='stats_target_key' AND attstattarget=-1`, 1},
 		{"n_distinct option", `SELECT count(*) FROM pg_attribute WHERE attrelid='` + table + `'::regclass AND attname='stats_ndistinct_key' AND COALESCE(array_to_string(attoptions,','),'') NOT LIKE '%n_distinct=%'`, 1},
 		{"n_distinct target", `SELECT count(*) FROM pg_attribute WHERE attrelid='` + table + `'::regclass AND attname='stats_ndistinct_key' AND attstattarget=-1`, 1},
@@ -343,6 +363,30 @@ func verifyPlanBaselinePlans(
 	}
 	var errs []error
 	for _, definition := range definitions {
+		if definition.Code == 602 {
+			for index, candidate := range definition.Candidates {
+				plan, err := explainer.Explain(ctx, candidate)
+				if err != nil {
+					errs = append(errs, fmt.Errorf(
+						"%s explain baseline candidate %d: %w",
+						definition.Name,
+						index+1,
+						err,
+					))
+					continue
+				}
+				if !strings.Contains(plan, definition.ExpectedBaselineToken) ||
+					strings.Contains(plan, "Seq Scan") {
+					errs = append(errs, fmt.Errorf(
+						"%s baseline candidate %d is missing %q or still uses Seq Scan",
+						definition.Name,
+						index+1,
+						definition.ExpectedBaselineToken,
+					))
+				}
+			}
+			continue
+		}
 		matched := false
 		for _, candidate := range definition.Candidates {
 			plan, err := explainer.Explain(ctx, candidate)
@@ -357,6 +401,38 @@ func verifyPlanBaselinePlans(
 		}
 		if !matched {
 			errs = append(errs, fmt.Errorf("%s baseline plan is missing %q", definition.Name, definition.ExpectedBaselineToken))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func verifyPlanFaultPlans(
+	ctx context.Context,
+	explainer planBaselineExplainer,
+	definition PlanScenarioDefinition,
+) error {
+	if explainer == nil {
+		return fmt.Errorf("fault plan explainer is unavailable")
+	}
+	var errs []error
+	for index, candidate := range definition.Candidates {
+		plan, err := explainer.Explain(ctx, candidate)
+		if err != nil {
+			errs = append(errs, fmt.Errorf(
+				"%s explain fault candidate %d: %w",
+				definition.Name,
+				index+1,
+				err,
+			))
+			continue
+		}
+		if !strings.Contains(plan, "Seq Scan") ||
+			strings.Contains(plan, definition.ExpectedBaselineToken) {
+			errs = append(errs, fmt.Errorf(
+				"%s fault candidate %d did not change to Seq Scan",
+				definition.Name,
+				index+1,
+			))
 		}
 	}
 	return errors.Join(errs...)

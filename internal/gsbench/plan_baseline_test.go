@@ -17,6 +17,15 @@ type fixedPlanExplainer struct{ plan string }
 
 func (e fixedPlanExplainer) Explain(context.Context, string) (string, error) { return e.plan, nil }
 
+type mappedPlanExplainer map[string]string
+
+func (e mappedPlanExplainer) Explain(
+	_ context.Context,
+	query string,
+) (string, error) {
+	return e[query], nil
+}
+
 func TestPlanBaselinePlanVerificationRequiresExpectedToken(t *testing.T) {
 	definitions, err := PlanScenarioDefinitions("gsbench")
 	if err != nil {
@@ -25,7 +34,7 @@ func TestPlanBaselinePlanVerificationRequiresExpectedToken(t *testing.T) {
 	if err := verifyPlanBaselinePlans(context.Background(), fixedPlanExplainer{plan: "Index Scan using plan_data_lookup_idx (cost=0.00..1.00)"}, definitions[:1]); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPlanBaselinePlans(context.Background(), fixedPlanExplainer{plan: "Seq Scan (cost=0.00..1.00)"}, definitions[1:2]); err == nil || !strings.Contains(err.Error(), "plan_index_unusable_idx") {
+	if err := verifyPlanBaselinePlans(context.Background(), fixedPlanExplainer{plan: "Seq Scan (cost=0.00..1.00)"}, definitions[1:2]); err == nil || !strings.Contains(err.Error(), "plan_data_lookup_idx") {
 		t.Fatalf("expected missing baseline index token, got %v", err)
 	}
 }
@@ -44,6 +53,62 @@ func TestSelectPlanBaselineDefinitionsScopesStrictVerification(t *testing.T) {
 	}
 }
 
+func Test602FaultVerificationRequiresEveryCandidateToUseSeqScan(t *testing.T) {
+	definitions, err := PlanScenarioDefinitions("gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := selectPlanBaselineDefinitions(
+		definitions,
+		[]ScenarioCode{602},
+	)[0]
+	plans := mappedPlanExplainer{}
+	for _, query := range definition.Candidates {
+		plans[query] = "Seq Scan on plan_data"
+	}
+	if err := verifyPlanFaultPlans(
+		context.Background(),
+		plans,
+		definition,
+	); err != nil {
+		t.Fatal(err)
+	}
+	plans[definition.Candidates[1]] =
+		"Index Scan using plan_data_lookup_idx"
+	if err := verifyPlanFaultPlans(
+		context.Background(),
+		plans,
+		definition,
+	); err == nil {
+		t.Fatal("mixed fault plans were accepted")
+	}
+}
+
+func Test602BaselineVerificationRequiresEveryCandidateToUseLookupIndex(
+	t *testing.T,
+) {
+	definitions, err := PlanScenarioDefinitions("gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := selectPlanBaselineDefinitions(
+		definitions,
+		[]ScenarioCode{602},
+	)[0]
+	plans := mappedPlanExplainer{}
+	for _, query := range definition.Candidates {
+		plans[query] = "Index Scan using plan_data_lookup_idx"
+	}
+	plans[definition.Candidates[2]] = "Seq Scan on plan_data"
+	if err := verifyPlanBaselinePlans(
+		context.Background(),
+		plans,
+		[]PlanScenarioDefinition{definition},
+	); err == nil {
+		t.Fatal("partial 602 baseline was accepted")
+	}
+}
+
 func TestPlanBaselineRepairSQLIsScopedAndComplete(t *testing.T) {
 	steps, err := PlanBaselineRepairSteps("gsbench")
 	if err != nil {
@@ -54,6 +119,8 @@ func TestPlanBaselineRepairSQLIsScopedAndComplete(t *testing.T) {
 		`"gsbench".plan_data`, "plan_index_unusable_idx", "plan_index_drop_idx",
 		"plan_index_shape_good_idx", "plan_index_shape_bad_idx",
 		"SET STATISTICS -1", "RESET (n_distinct)", "ADD STATISTICS",
+		"ALTER COLUMN lookup_key RESET (n_distinct)",
+		`ANALYZE "gsbench".plan_data(lookup_key)`,
 		`ANALYZE "gsbench".plan_data`,
 	} {
 		if !strings.Contains(joined, token) {
@@ -63,6 +130,17 @@ func TestPlanBaselineRepairSQLIsScopedAndComplete(t *testing.T) {
 	if strings.Contains(joined, "pg_catalog.pg_statistic SET") ||
 		strings.Contains(joined, "pg_index SET") {
 		t.Fatalf("repair directly updates catalogs: %s", joined)
+	}
+	resetAt := strings.Index(
+		joined,
+		"ALTER COLUMN lookup_key RESET (n_distinct)",
+	)
+	analyzeAt := strings.Index(
+		joined,
+		`ANALYZE "gsbench".plan_data(lookup_key)`,
+	)
+	if resetAt < 0 || analyzeAt <= resetAt {
+		t.Fatalf("lookup statistics repair order is unsafe: %v", steps)
 	}
 }
 
@@ -125,10 +203,11 @@ func TestPlanBaselineRepairStepsUseEveryCompleteCanonicalIndex(t *testing.T) {
 }
 
 type planBaselineCatalogState struct {
-	mu          sync.Mutex
-	definitions map[string]string
-	executed    []planBaselineExecutedSQL
-	nextConnID  int
+	mu                        sync.Mutex
+	definitions               map[string]string
+	lookupNDistinctOverridden bool
+	executed                  []planBaselineExecutedSQL
+	nextConnID                int
 }
 
 type planBaselineExecutedSQL struct {
@@ -187,6 +266,12 @@ func (c *planBaselineCatalogConn) ExecContext(
 	c.state.executed = append(c.state.executed, planBaselineExecutedSQL{
 		connID: c.id, statement: statement,
 	})
+	if strings.Contains(
+		statement,
+		"ALTER COLUMN lookup_key RESET (n_distinct)",
+	) {
+		c.state.lookupNDistinctOverridden = false
+	}
 	c.state.mu.Unlock()
 	return driver.RowsAffected(1), nil
 }
@@ -230,6 +315,14 @@ func (c *planBaselineCatalogConn) QueryContext(
 	case strings.Contains(query, "FROM pg_index"):
 		return row(int64(1)), nil
 	case strings.Contains(query, "FROM pg_attribute"):
+		if strings.Contains(query, "attname='lookup_key'") {
+			c.state.mu.Lock()
+			overridden := c.state.lookupNDistinctOverridden
+			c.state.mu.Unlock()
+			if overridden {
+				return row(int64(0)), nil
+			}
+		}
 		return row(int64(1)), nil
 	case strings.Contains(query, "FROM pg_statistic_ext"):
 		return row(int64(1)), nil
@@ -367,6 +460,45 @@ func TestRepairPlanBaselineRecreatesSameNameIndexWithWrongShape(t *testing.T) {
 		}
 	}
 	t.Fatalf("extended statistics analyze did not use one session: %v", executed)
+}
+
+func TestRepairPlanBaselineResetsLookupCardinalityBeforeAnalyze(t *testing.T) {
+	state := &planBaselineCatalogState{
+		definitions:               planBaselineDefinitionsForTest(),
+		lookupNDistinctOverridden: true,
+	}
+	db := newPlanBaselineCatalogDatabase(t, state)
+
+	if _, err := RepairPlanBaseline(
+		context.Background(),
+		db,
+		"gsbench",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	state.mu.Lock()
+	executed := append([]planBaselineExecutedSQL(nil), state.executed...)
+	overridden := state.lookupNDistinctOverridden
+	state.mu.Unlock()
+	if overridden {
+		t.Fatal("lookup_key n_distinct override was not cleared")
+	}
+	resetAt, analyzeAt := -1, -1
+	for index, event := range executed {
+		if strings.Contains(
+			event.statement,
+			"ALTER COLUMN lookup_key RESET (n_distinct)",
+		) {
+			resetAt = index
+		}
+		if event.statement == `ANALYZE "gsbench".plan_data(lookup_key)` {
+			analyzeAt = index
+		}
+	}
+	if resetAt < 0 || analyzeAt <= resetAt {
+		t.Fatalf("lookup statistics events=%v", executed)
+	}
 }
 
 func TestVerifyPlanBaselineRejectsSameNameIndexWithWrongShape(t *testing.T) {
