@@ -55,6 +55,12 @@ gsbench run 202 --workers 8 --work-mem 256MB --duration 1m
 # I/O、网络资源场景
 gsbench run -s 301,321 -d 2m
 
+# 连接池：从运行前基线补足到 90%，达标后保持到 5m 结束
+gsbench run 401 --percent 90 --duration 5m
+
+# 线程池：用真实 thread-pool 指标补足到 90%，达标后冻结 worker 数
+gsbench run 402 --percent 90 --duration 5m
+
 # 两个独立锁场景；或一个锁冲突矩阵场景
 gsbench run -s 501,504 -d 2m
 gsbench run -s 520 -d 2m
@@ -82,6 +88,12 @@ gsbench run -s 621,624 -d 2m
 
 201/202 会先用 `sort_data` 自动标定有界工作集，只接受实际 Sort/Hash 内存达到输入 `work_mem` 的 90%–97% 且不落盘的结果。随后每个 worker 建立一个服务端游标并完成首次 `FETCH`；所有 worker 就绪后才开始计算 `--duration`。第一次 Ctrl+C 会立即结束本地进程，数据库通过连接断开释放对应事务和游标；之后可执行 `gsbench restore --run-id RUN_ID` 收敛运行状态。
 
+401/402 的 `--percent N` 接受 1–100，并只覆盖本次选中的 401/402；同一命令选中两者时使用同一个值，其他场景忽略该参数。目标必须严格大于运行前基线：401 的分母是 `max_connections - sysadmin_reserved_connections`，例如当前 80%、目标 90% 时只新建补足差值所需的连接；402 的占用率是 `global_threadpool_status` 中 `(actual-idle)/actual`，active-backend fallback 不会被当作百分比成功证据。
+
+安全上限不足、真实指标缺失或 `--duration` 到期前仍未达标都会使对应场景失败，即使 `run.validation_enabled=false` 也不会降级。同一次运行中的其他场景继续自己的生命周期，最终命令聚合为非零退出码。达到目标后，401 不再补连接，402 连续 3 次确认后冻结 worker 数；已建立的本次连接/worker 保持到 duration 结束，丢失则失败。正常结束和场景失败都会自动关闭本次 tagged 会话；402 只关闭客户端会话和本地 worker，数据库自有 idle worker 的回收由数据库管理。
+
+第一次 Ctrl+C 仍由操作系统立即终止进程；客户端 socket 断开后数据库会结束对应会话并回滚未提交事务。下次运行仍会执行 stale recovery。只有旧 run 身份可完整证明为非空的 401/402-only、database/local recovery action 均为零且恢复锁已正常释放时，旧恢复失败才记录原始错误为 WARN 并允许新 run 使用新 ID 继续；发现失败、未知场景、任何 action（包括 402 自动启用线程池的实例参数 mutation）或其他场景仍会阻断。
+
 GaussDB 默认可能使用 `explain_perf_mode=pretty`，而 201/202 需要 normal 格式中的 Sort 方法、Hash Batches 和 Memory Usage 才能证明算子未落盘。gsbench 会读取原始模式，并只在每次标定事务中执行 `SET LOCAL explain_perf_mode=normal`；事务 `ROLLBACK` 后自动恢复，不修改用户、数据库或其他会话的配置。结果证据中的 `original_explain_perf_mode` 和 `explain_perf_mode` 分别记录原始与实际标定模式。pretty 输出的 `Peak Memory` 不会被当作完整的 Hash 溢写证据。
 
 ## 生命周期与恢复
@@ -104,7 +116,7 @@ Risk A 无额外开关。Risk B 还要求 `safety.allow_admin_mutation=true` 和
 
 配置只包含实际读取的键：`database.*`、`run.*`、`data.*`、`safety.*`、`fault_provider.*`，以及现有 CPU、连接池、线程池和 vacuum 场景的 `scenario.*` 参数。不要在配置中写密码；使用 `database.password_env=GSBENCH_PASSWORD`，或以 `database.password_config` 引用同发布目录的 gstop 配置。日志会脱敏 DSN 密码，但配置文件仍应限制权限。
 
-`run.validation_enabled=false` 只跳过模型预估、场景结果门槛、数据布局一致性和执行计划形态校验。容量检查、物理大小测量、未知数据库版本拒绝、真实 DDL/DML/负载错误，以及恢复锁、journal/ledger 持久化、逆操作、计划基线修复和其他恢复安全边界仍然强制执行；关闭验证不能把这些失败降级为成功。需要模型、结果、布局和计划形态的严格判定时设置：
+`run.validation_enabled=false` 只跳过模型预估、一般场景结果门槛、数据布局一致性和执行计划形态校验。容量检查、401/402 百分比目标、物理大小测量、未知数据库版本拒绝、真实 DDL/DML/负载错误，以及恢复锁、journal/ledger 持久化、逆操作、计划基线修复和其他恢复安全边界仍然强制执行；关闭验证不能把这些失败降级为成功。需要其他模型、结果、布局和计划形态的严格判定时设置：
 
 ```ini
 [run]

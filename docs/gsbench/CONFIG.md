@@ -1,4 +1,4 @@
-# gsbench v1.1.6 配置手册
+# gsbench v1.1.7 配置手册
 
 发布包的基准配置是 [`configs/gsbench.cfg`](../../configs/gsbench.cfg)。建议复制后修改并保持 `0600` 权限；不要新增程序未读取的“占位配置”。安装和命令流程见[安装手册](INSTALL.md)。
 
@@ -91,7 +91,7 @@ validation_enabled = false
 - 恢复锁、数据库 journal、本地 ledger、逆操作和 stale recovery；
 - schema 标识符、数据上限、风险授权等硬性配置边界。
 
-关闭验证不能把错误降级为成功。需要判定“是否达到 CPU/连接池/线程池目标”或执行全场景验收时必须设置 `validation_enabled=true`；详见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
+关闭验证不能把错误降级为成功。401/402 的容量、真实指标和百分比目标始终强制；`validation_enabled=true` 用于其他模型/结果门槛以及全场景验收，详见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
 
 601–606 共用计划基线，每次只能选择一个并串行运行。它们不再接受原来的单条 `run -s 601 -d 2m`；使用两个终端的三阶段命令，例如：
 
@@ -151,7 +151,7 @@ allow_database_restart = false
 restart_command =
 ```
 
-- `max_connections`、`max_workers`：连接与 worker 的全局硬上限，必须为正数。固定 worker 和 501–503 的 workload 会话在启动前累计检查；运行中绝不会动态调整请求的并发数。
+- `max_connections`、`max_workers`：连接与 worker 的全局硬上限，必须为正数。固定 worker 和 501–503 的 workload 会话在启动前累计检查；401/402 只在这些硬上限内逐步增加，达标后冻结。
 - `query_timeout`、`restore_timeout`：查询和恢复超时，必须大于 0。
 - `profile_cap_gb`：数据集硬上限，1–2048 GiB；必须不小于 `init --size`。
 - `restore_on_exit`：必须为 `true`；设为 `false` 会被拒绝。
@@ -195,10 +195,10 @@ type = none
 | `scenario.lock_table_exclusive` | `sessions` | 2 | 502 workload 会话总数，包含 1 个 holder 和其余 waiter |
 | `scenario.lock_ddl_wait` | `sessions` | 2 | 503 workload 会话总数，包含 1 个 holder 和其余 waiter |
 | `scenario.memory_total_pressure` | `workers` | 4 | 有界内存压力 worker 数，不代表主机内存百分比 |
-| `scenario.connection_pool` | `target_percent` | 95 | 401 连接池目标百分比 |
+| `scenario.connection_pool` | `target_percent` | 95 | 401 连接池目标百分比；CLI `--percent` 仅在选中 401 时覆盖 |
 |  | `idle_percent` | 60 | 目标连接中的 idle 比例 |
 |  | `idle_in_transaction_percent` | 20 | 目标连接中的 idle in transaction 比例 |
-| `scenario.thread_pool` | `target_percent` | 95 | 402 线程池目标百分比 |
+| `scenario.thread_pool` | `target_percent` | 95 | 402 线程池目标百分比；CLI `--percent` 仅在选中 402 时覆盖 |
 | `scenario.vacuum_pressure` | `mode` | `vacuum` | vacuum 模式 |
 |  | `allow_vacuum_full` | false | 是否允许高风险 `VACUUM FULL` |
 |  | `minimum_slowdown` | 1.5 | 严格验证时的最小变慢倍数 |
@@ -211,12 +211,20 @@ type = none
 gsbench run 101 --workers 16 --duration 60s
 gsbench run 102 --workers 4 --duration 60s
 gsbench run 103 --tp-workers 12 --ap-workers 2 --duration 60s
+gsbench run 401 --percent 90 --duration 5m
+gsbench run 402 --percent 90 --duration 5m
 gsbench run 501 --sessions 10 --chain-depth 3 --duration 1m
 gsbench run 502 --sessions 10 --duration 1m
 gsbench run 503 --sessions 10 --duration 1m
 ```
 
 CLI worker 参数覆盖上述场景配置。103 的总并发为 `tp_workers + ap_workers`；所有 worker 先建立独立 tagged session 并等待同一个启动屏障，加压计时开始后才统一执行。
+
+`--percent` 只允许 `run`，范围 1–100，且最终场景必须包含 401 或 402；同一值覆盖所有选中的池场景，其他场景不受影响。目标必须严格大于运行前基线。401 使用 `max_connections - sysadmin_reserved_connections` 为容量分母，只创建基线到目标之间的连接差值；402 使用 `global_threadpool_status` 的 `(actual-idle)/actual`，不接受 active-backend fallback。目标不可达、指标缺失或 duration 内未连续确认达标都会失败，关闭 `validation_enabled` 也不会绕过。
+
+达标后 401/402 停止增加并保持本次资源到 duration 结束；401 不因外部业务连接退出而补建，402 不补建冻结后丢失的 worker，本次资源丢失会使场景失败。正常结束、失败和 Runner 的取消路径会关闭本次创建的 tagged 会话；数据库自身 idle thread-pool worker 的销毁不由 gsbench 控制。第一次 Ctrl+C 仍立即退出，连接断开由数据库回收；后续运行会再次尝试 stale recovery。
+
+stale recovery 默认继续 fail-closed。仅当所有旧 run 的场景身份读取/解析成功、每个场景列表非空且只含 401/402、database journal 与 local ledger 均没有 action、恢复锁成功释放且新 run 启动回调尚未尝试时，恢复失败才输出含原始错误的 WARN 并用新 run ID 继续。未知/缺失身份、发现失败、任何其他场景或 action（包括 402 自动启用线程池的参数修改）仍阻断。
 
 201/202 的命令行覆盖一次只允许选择一个场景，例如 `gsbench run 201 --workers 8 --work-mem 256MB --duration 1m`。配置文件可以同时选择 201 和 202，并分别使用各自的 `workers/work_mem`；配置校验会累计两者 worker 数。固定 worker 场景不能与未纳入并发预算的场景混跑；501–503 已纳入连接预算，可以与固定 worker 场景组合，但所有 worker 和锁 workload 会话的总数必须不超过 `safety.max_connections`。
 
