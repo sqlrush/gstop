@@ -954,6 +954,28 @@ func TestRunnerCallsCoordinatorAfterRampFailure(t *testing.T) {
 	}
 }
 
+func TestRunnerTargetFailureDoesNotCancelOtherScenario(t *testing.T) {
+	failed := &fakeScenario{
+		name: "pool-target", failPhase: PhaseRamp, outcome: OutcomeSuccess,
+	}
+	other := &fakeScenario{name: "other", outcome: OutcomeSuccess}
+	summary := runTestScenarios(
+		t,
+		context.Background(),
+		&Runtime{RunID: "run-1"},
+		[]Scenario{failed, other},
+	)
+	if summary.Outcome != OutcomeFailed {
+		t.Fatalf("summary=%+v", summary)
+	}
+	want := []Phase{
+		PhasePrepare, PhaseRamp, PhaseHold, PhaseVerify, PhaseStop,
+	}
+	if !reflect.DeepEqual(other.phases, want) {
+		t.Fatalf("other phases=%v want=%v", other.phases, want)
+	}
+}
+
 func TestRunnerPassesDegradedOutcomeToCoordinator(t *testing.T) {
 	scenario := &fakeScenario{name: "one", outcome: OutcomeDegraded}
 	service := &runnerRestoreService{result: RestoreSummary{
