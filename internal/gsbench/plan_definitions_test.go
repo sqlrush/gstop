@@ -170,6 +170,36 @@ func TestPlanchangeStatsTargetDropsAndRecreatesCanonicalUniqueIndex(t *testing.T
 	}
 }
 
+func TestPlanchangeStatsLookupOverridesAndRestoresLookupCardinality(
+	t *testing.T,
+) {
+	mutations, err := PlanMutationSet(
+		"run-602",
+		"Bench",
+		"planchange_stats_lookup",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mutations) != 2 {
+		t.Fatalf("mutations=%+v", mutations)
+	}
+	wantForward := []string{
+		`ALTER TABLE "Bench".plan_data ALTER COLUMN lookup_key SET (n_distinct=1)`,
+		`ANALYZE "Bench".plan_data(lookup_key)`,
+	}
+	wantInverse := []string{
+		`ALTER TABLE "Bench".plan_data ALTER COLUMN lookup_key RESET (n_distinct)`,
+		`ANALYZE "Bench".plan_data(lookup_key)`,
+	}
+	for index := range mutations {
+		if mutations[index].ForwardSQL != wantForward[index] ||
+			mutations[index].InverseSQL != wantInverse[index] {
+			t.Fatalf("mutation[%d]=%+v", index, mutations[index])
+		}
+	}
+}
+
 func TestPlanchangeIndexDropRetainsCanonicalBaselineIndex(t *testing.T) {
 	definitions, err := PlanScenarioDefinitions("Bench")
 	if err != nil {
@@ -218,7 +248,7 @@ func TestPlanDefinitionsPreserveMixedCaseSchemaIdentifiers(t *testing.T) {
 
 func TestEveryPlanMutationHasInverseAndRestoreVerification(t *testing.T) {
 	for _, name := range []string{
-		"planchange_stats_target", "planchange_index_unusable", "planchange_stats_ndistinct",
+		"planchange_stats_target", "planchange_stats_lookup", "planchange_stats_ndistinct",
 		"planchange_stats_extended", "planchange_index_drop", "planchange_index_shape",
 	} {
 		mutations, err := PlanMutationSet("run-1", "gsbench", name)
@@ -244,10 +274,10 @@ func TestEveryPlanMutationHasInverseAndRestoreVerification(t *testing.T) {
 		!strings.Contains(shape[1].ForwardSQL, "index_shape_tail,index_shape_lead") {
 		t.Fatalf("shape mutations=%+v", shape)
 	}
-	unusable, _ := PlanMutationSet("run-1", "gsbench", "planchange_index_unusable")
-	if !strings.Contains(unusable[0].ForwardSQL, "UNUSABLE") ||
-		!strings.Contains(unusable[0].InverseSQL, "REBUILD") {
-		t.Fatalf("unusable mutation=%+v", unusable)
+	lookup, _ := PlanMutationSet("run-1", "gsbench", "planchange_stats_lookup")
+	if !strings.Contains(lookup[0].ForwardSQL, "lookup_key SET (n_distinct=1)") ||
+		!strings.Contains(lookup[0].InverseSQL, "lookup_key RESET (n_distinct)") {
+		t.Fatalf("lookup statistics mutation=%+v", lookup)
 	}
 }
 
@@ -368,6 +398,7 @@ func TestCombinedPlanStatisticsRestoreExecutesPrerequisitesBeforeAnalyze(
 	var actions []Action
 	var sequence int64
 	for _, scenario := range []string{
+		"planchange_stats_lookup",
 		"planchange_stats_ndistinct",
 		"planchange_stats_extended",
 	} {
@@ -404,8 +435,10 @@ func TestCombinedPlanStatisticsRestoreExecutesPrerequisitesBeforeAnalyze(
 		`ALTER TABLE "gsbench".plan_data ADD STATISTICS ((stats_corr_a,stats_corr_b))`,
 		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key RESET (n_distinct)`,
 		`ALTER TABLE "gsbench".plan_data ALTER COLUMN stats_ndistinct_key SET STATISTICS -1`,
+		`ALTER TABLE "gsbench".plan_data ALTER COLUMN lookup_key RESET (n_distinct)`,
 		`SESSION: SET default_statistics_target=-2 | ANALYZE "gsbench".plan_data ((stats_corr_a,stats_corr_b)) | RESET default_statistics_target`,
 		`ANALYZE "gsbench".plan_data(stats_ndistinct_key)`,
+		`ANALYZE "gsbench".plan_data(lookup_key)`,
 	}
 	if !reflect.DeepEqual(database.events, want) {
 		t.Fatalf("restore events=%q want=%q", database.events, want)
@@ -422,7 +455,11 @@ func compactPlanDDL(statement string) string {
 }
 
 func TestPlanChangeMutationsAreIndependentlyRestorable(t *testing.T) {
-	for _, scenario := range []string{"planchange_stats_ndistinct", "planchange_stats_extended"} {
+	for _, scenario := range []string{
+		"planchange_stats_lookup",
+		"planchange_stats_ndistinct",
+		"planchange_stats_extended",
+	} {
 		mutations, err := PlanMutationSet("run-1", "gsbench", scenario)
 		if err != nil {
 			t.Fatal(err)
@@ -440,7 +477,11 @@ func TestPlanChangeMutationsAreIndependentlyRestorable(t *testing.T) {
 }
 
 func TestEveryPlanMutationRestoresAfterAnInterruptedAction(t *testing.T) {
-	for _, scenario := range []string{"planchange_stats_ndistinct", "planchange_stats_extended"} {
+	for _, scenario := range []string{
+		"planchange_stats_lookup",
+		"planchange_stats_ndistinct",
+		"planchange_stats_extended",
+	} {
 		mutations, err := PlanMutationSet("run-1", "gsbench", scenario)
 		if err != nil {
 			t.Fatal(err)

@@ -124,15 +124,30 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 		)
 		mutation.SkipInverseWhenRestored = true
 		return []Mutation{mutation}, nil
-	case "planchange_index_unusable":
-		index := quotedSchema + ".plan_index_unusable_idx"
-		return []Mutation{base(
-			"index_unusable", index,
-			"ALTER INDEX "+index+" UNUSABLE",
-			"ALTER INDEX "+index+" REBUILD",
-			`SELECT count(*) FROM pg_index WHERE indexrelid='`+index+`'::regclass AND indisusable AND indisready AND indisvalid`,
-			"1",
-		)}, nil
+	case "planchange_stats_lookup", "planchange_index_unusable":
+		verifyNDistinct := `SELECT count(*) FROM pg_attribute WHERE attrelid='` +
+			table + `'::regclass AND attname='lookup_key' AND ` +
+			`COALESCE(array_to_string(attoptions,','),'') NOT LIKE '%n_distinct=%'`
+		return []Mutation{
+			base(
+				"statistics_lookup_ndistinct",
+				table+".lookup_key",
+				"ALTER TABLE "+table+
+					" ALTER COLUMN lookup_key SET (n_distinct=1)",
+				"ALTER TABLE "+table+
+					" ALTER COLUMN lookup_key RESET (n_distinct)",
+				verifyNDistinct,
+				"1",
+			),
+			base(
+				"statistics_lookup_analyze",
+				table+".lookup_key analyze",
+				"ANALYZE "+table+"(lookup_key)",
+				"ANALYZE "+table+"(lookup_key)",
+				"SELECT 1",
+				"1",
+			),
+		}, nil
 	case "planchange_stats_ndistinct":
 		verifyNDistinct := `SELECT count(*) FROM pg_attribute WHERE attrelid='` + table + `'::regclass AND attname='stats_ndistinct_key' AND (attoptions IS NULL OR NOT attoptions::text LIKE '%n_distinct=%')`
 		verifyTarget := `SELECT attstattarget FROM pg_attribute WHERE attrelid='` + table + `'::regclass AND attname='stats_ndistinct_key'`
@@ -254,7 +269,8 @@ func planChangeCodeForName(name string) (ScenarioCode, bool) {
 		code ScenarioCode
 		name string
 	}{
-		{601, "planchange_stats_target"}, {602, "planchange_index_unusable"},
+		{601, "planchange_stats_target"}, {602, "planchange_stats_lookup"},
+		{602, "planchange_index_unusable"},
 		{603, "planchange_stats_ndistinct"}, {604, "planchange_stats_extended"},
 		{605, "planchange_index_drop"}, {606, "planchange_index_shape"},
 	} {
