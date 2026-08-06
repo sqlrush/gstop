@@ -377,15 +377,16 @@ git commit -m "feat(gsbench): reject unverified 602 faults"
 - Test: `internal/gsbench/sqlstore_test.go`
 
 **Interfaces:**
-- Consumes: `preparePlanRunBaseline`, `databaseRestoreBackend.verifyPlanBaselineForActions`, and `legacyJournalScenarioCodes`.
-- Produces: `planBaselineVerificationRequired(bool, []ScenarioCode) bool` and `restorePlanVerificationRequired(bool, []Action) bool`.
+- Consumes: `runPlanInit`, `VerifyPlanBaselineScenarios`, `databaseRestoreBackend.verifyPlanBaselineForActions`, and `legacyJournalScenarioCodes`.
+- Produces: `strictPlanInitVerificationRequired(bool, ScenarioCode) bool` and `restorePlanVerificationRequired(bool, []Action) bool`.
 
 - [ ] **Step 1: Write failing policy and compatibility tests**
 
 ```go
-func TestPlanBaselineVerificationIsMandatoryFor602(t *testing.T) {
-	if !planBaselineVerificationRequired(false, []ScenarioCode{602}) { t.Fatal("602 init skipped verification") }
-	if planBaselineVerificationRequired(false, []ScenarioCode{601}) { t.Fatal("601 behavior changed") }
+func TestStrictPlanInitVerificationIsMandatoryOnlyFor602(t *testing.T) {
+	if !strictPlanInitVerificationRequired(false, 602) { t.Fatal("602 init skipped verification") }
+	if strictPlanInitVerificationRequired(false, 601) { t.Fatal("601 behavior changed") }
+	if strictPlanInitVerificationRequired(true, 602) { t.Fatal("602 duplicated general verification") }
 }
 
 func TestRestorePlanVerificationIsMandatoryFor602(t *testing.T) {
@@ -404,12 +405,14 @@ func TestLegacyJournalScenarioCodesPreserveOld602Name(t *testing.T) {
 - [ ] **Step 2: Verify RED**
 
 ```bash
-go test ./internal/gsbench -run 'TestPlanBaselineVerificationIsMandatoryFor602|TestRestorePlanVerificationIsMandatoryFor602|TestLegacyJournalScenarioCodesPreserveOld602Name' -count=1
+go test ./internal/gsbench -run 'TestStrictPlanInitVerificationIsMandatoryOnlyFor602|TestRestorePlanVerificationIsMandatoryFor602|TestLegacyJournalScenarioCodesPreserveOld602Name' -count=1
 ```
 
 - [ ] **Step 3: Implement mandatory verification policies**
 
-`planBaselineVerificationRequired` returns true when ordinary validation is enabled or codes contain 602. Use it in `preparePlanRunBaseline`. `restorePlanVerificationRequired` applies the same rule to plan-change actions; use it in `verifyPlanBaselineForActions`. The existing `VerifyRestore` pending-action check remains the journal-empty postcondition.
+`strictPlanInitVerificationRequired` returns true only when general validation is disabled and the selected code is 602. After the existing `preparePlanRunBaseline` succeeds, `runPlanInit` uses this policy to call `VerifyPlanBaselineScenarios(ctx, db, schema, []ScenarioCode{602})`. This preserves the validation setting for 601 and 603–606 and avoids validating their optimizer choices as a side effect of running 602.
+
+`restorePlanVerificationRequired` returns true when general validation is enabled or the plan-change actions contain code 602; use it in `verifyPlanBaselineForActions`. That method already derives selected codes and calls `VerifyPlanBaselineScenarios`, so recovery remains scoped to 602. The existing `VerifyRestore` pending-action check remains the journal-empty postcondition.
 
 - [ ] **Step 4: Preserve legacy migration names**
 
@@ -418,7 +421,7 @@ Keep `plan_index_unusable -> 602`, explicitly add `planchange_index_unusable -> 
 - [ ] **Step 5: Verify GREEN**
 
 ```bash
-go test ./internal/gsbench -run 'TestPlanBaselineVerificationIsMandatoryFor602|TestRestorePlanVerificationIsMandatoryFor602|TestLegacyJournalScenarioCodesPreserveOld602Name|TestVerifyRestorePlanBaseline' -count=1
+go test ./internal/gsbench -run 'TestStrictPlanInitVerificationIsMandatoryOnlyFor602|TestRestorePlanVerificationIsMandatoryFor602|TestLegacyJournalScenarioCodesPreserveOld602Name|TestVerifyRestorePlanBaseline' -count=1
 ```
 
 - [ ] **Step 6: Commit**
