@@ -25,6 +25,7 @@ type Overrides struct {
 	TPWorkers     int
 	APWorkers     int
 	WorkMemKB     int64
+	PoolPercent   int
 	Sessions      int
 	ChainDepth    int
 	Profile       string
@@ -66,6 +67,11 @@ type MemoryWorkloadConfig struct {
 	SortWorkMemKB int64
 	HashWorkers   int
 	HashWorkMemKB int64
+}
+
+type PoolTargetConfig struct {
+	ConnectionPercent int
+	ThreadPercent     int
 }
 
 type LockWorkloadConfig struct {
@@ -130,6 +136,7 @@ type BenchConfig struct {
 	FixedWorkers    FixedWorkerConfig
 	MemoryWorkloads MemoryWorkloadConfig
 	LockWorkloads   LockWorkloadConfig
+	PoolTargets     PoolTargetConfig
 	Data            DataConfig
 	Safety          SafetyConfig
 	FaultProvider   FaultProviderConfig
@@ -265,6 +272,14 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 				"scenario.lock_ddl_wait.sessions", 2,
 			),
 		},
+		PoolTargets: PoolTargetConfig{
+			ConnectionPercent: raw.GetInt(
+				"scenario.connection_pool.target_percent", 95,
+			),
+			ThreadPercent: raw.GetInt(
+				"scenario.thread_pool.target_percent", 95,
+			),
+		},
 		Data: DataConfig{
 			Schema:             raw.GetString("data.schema", "gsbench"),
 			MaxSizeGB:          raw.GetInt("data.max_size_gb", 5),
@@ -303,6 +318,9 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 			overrides.ScenarioCodes...,
 		)
 	}
+	if err := applyPoolTargetOverride(&cfg, overrides); err != nil {
+		return BenchConfig{}, err
+	}
 	if err := applyFixedWorkerOverrides(&cfg, overrides); err != nil {
 		return BenchConfig{}, err
 	}
@@ -333,6 +351,33 @@ func LoadConfig(path string, overrides Overrides) (BenchConfig, error) {
 		return BenchConfig{}, err
 	}
 	return cfg, nil
+}
+
+func applyPoolTargetOverride(
+	cfg *BenchConfig,
+	overrides Overrides,
+) error {
+	if overrides.PoolPercent == 0 {
+		return nil
+	}
+	if cfg == nil {
+		return fmt.Errorf("benchmark configuration is required")
+	}
+	if err := validatePoolPercentOverride(
+		cfg.Run.ScenarioCodes,
+		overrides.PoolPercent,
+	); err != nil {
+		return err
+	}
+	for _, code := range cfg.Run.ScenarioCodes {
+		switch code {
+		case 401:
+			cfg.PoolTargets.ConnectionPercent = overrides.PoolPercent
+		case 402:
+			cfg.PoolTargets.ThreadPercent = overrides.PoolPercent
+		}
+	}
+	return nil
 }
 
 func loadDatabasePassword(raw *baseconfig.Config, configPath, passwordEnv string) (string, error) {
@@ -554,6 +599,12 @@ func (c BenchConfig) Validate() error {
 	}
 	if c.Run.Profile != "quick" && c.Run.Profile != "stress" {
 		return fmt.Errorf("run.profile must be quick or stress")
+	}
+	if c.PoolTargets.ConnectionPercent < 1 ||
+		c.PoolTargets.ConnectionPercent > 100 ||
+		c.PoolTargets.ThreadPercent < 1 ||
+		c.PoolTargets.ThreadPercent > 100 {
+		return fmt.Errorf("pool target percentages must be between 1 and 100")
 	}
 	if len(c.Run.ScenarioCodes) == 0 {
 		return fmt.Errorf("at least one scenario is required")

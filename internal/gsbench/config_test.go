@@ -192,6 +192,93 @@ func TestConfigLoadsDefaultsAndDurations(t *testing.T) {
 	}
 }
 
+func TestConfigLoadsAndOverridesPoolTargets(t *testing.T) {
+	body := minimalConfig() + `
+[scenario.connection_pool]
+target_percent = 81
+[scenario.thread_pool]
+target_percent = 82
+`
+	path := writeTestConfig(t, body)
+	cfg, err := LoadConfig(path, Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 81 ||
+		cfg.PoolTargets.ThreadPercent != 82 {
+		t.Fatalf("pool targets=%+v", cfg.PoolTargets)
+	}
+
+	cfg, err = LoadConfig(path, Overrides{
+		ScenarioCodes: []ScenarioCode{301, 401, 402},
+		PoolPercent:   90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 90 ||
+		cfg.PoolTargets.ThreadPercent != 90 {
+		t.Fatalf("overridden pool targets=%+v", cfg.PoolTargets)
+	}
+}
+
+func TestConfigPoolOverrideLeavesUnselectedPoolUntouched(t *testing.T) {
+	body := minimalConfig() + `
+[scenario.connection_pool]
+target_percent = 81
+[scenario.thread_pool]
+target_percent = 82
+`
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{
+		ScenarioCodes: []ScenarioCode{301, 401},
+		PoolPercent:   90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 90 ||
+		cfg.PoolTargets.ThreadPercent != 82 {
+		t.Fatalf("pool targets=%+v", cfg.PoolTargets)
+	}
+}
+
+func TestConfigPoolOverrideUsesConfiguredScenarios(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(), "scenarios = tp_cpu", "scenarios = connection_pool", 1,
+	)
+	cfg, err := LoadConfig(
+		writeTestConfig(t, body), Overrides{PoolPercent: 90},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 90 ||
+		cfg.PoolTargets.ThreadPercent != 95 {
+		t.Fatalf("pool targets=%+v", cfg.PoolTargets)
+	}
+}
+
+func TestConfigRejectsPoolOverrideWithoutPoolScenario(t *testing.T) {
+	if _, err := LoadConfig(
+		writeTestConfig(t, minimalConfig()), Overrides{PoolPercent: 90},
+	); err == nil {
+		t.Fatal("pool override without 401/402 was accepted")
+	}
+}
+
+func TestConfigRejectsOutOfRangePoolTargets(t *testing.T) {
+	for _, section := range []string{
+		"[scenario.connection_pool]\ntarget_percent = 0\n",
+		"[scenario.thread_pool]\ntarget_percent = 101\n",
+	} {
+		if _, err := LoadConfig(
+			writeTestConfig(t, minimalConfig()+"\n"+section), Overrides{},
+		); err == nil {
+			t.Fatalf("accepted invalid pool target %q", section)
+		}
+	}
+}
+
 func TestConfigLoadsFixedWorkerScenarioSettings(t *testing.T) {
 	body := minimalConfig() + `
 [scenario.tp_cpu]

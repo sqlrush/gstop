@@ -52,6 +52,7 @@ type CLIOptions struct {
 	TPWorkers     int
 	APWorkers     int
 	WorkMemKB     int64
+	PoolPercent   int
 	Sessions      int
 	ChainDepth    int
 	Profile       string
@@ -138,6 +139,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	flags.IntVar(&options.TPWorkers, "tp-workers", 0, "fixed TP workers for scenario 103")
 	flags.IntVar(&options.APWorkers, "ap-workers", 0, "fixed AP workers for scenario 103")
 	flags.StringVar(&workMemText, "work-mem", "", "work_mem for scenarios 201/202 (kB, MB, or GB)")
+	flags.IntVar(&options.PoolPercent, "percent", 0, "target percent for scenarios 401/402 (1-100)")
 	flags.IntVar(&options.Sessions, "sessions", 0, "total holder plus waiter sessions for scenarios 501-503")
 	flags.IntVar(&options.ChainDepth, "chain-depth", 0, "row wait chain depth for scenario 501 (1-5)")
 	flags.StringVar(&options.Profile, "profile", "", "data profile")
@@ -168,6 +170,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	tpWorkersSet := false
 	apWorkersSet := false
 	workMemSet := false
+	percentSet := false
 	sessionsSet := false
 	chainDepthSet := false
 	flags.Visit(func(value *flag.Flag) {
@@ -188,6 +191,8 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 			apWorkersSet = true
 		case "work-mem":
 			workMemSet = true
+		case "percent":
+			percentSet = true
 		case "sessions":
 			sessionsSet = true
 		case "chain-depth":
@@ -196,6 +201,13 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	})
 	workerOverrideSet := workersSet || tpWorkersSet || apWorkersSet
 	lockOverrideSet := sessionsSet || chainDepthSet
+	if percentSet && command != "run" {
+		return CLIOptions{}, fmt.Errorf("--percent is only valid with run")
+	}
+	if percentSet &&
+		(options.PoolPercent < 1 || options.PoolPercent > 100) {
+		return CLIOptions{}, fmt.Errorf("--percent must be between 1 and 100")
+	}
 	if (workerOverrideSet || planWorkersSet || workMemSet || lockOverrideSet) && command != "run" {
 		return CLIOptions{}, fmt.Errorf("workload overrides are only valid with run")
 	}
@@ -305,6 +317,14 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	for i, definition := range definitions {
 		options.ScenarioCodes[i] = definition.Code
 	}
+	if percentSet && len(options.ScenarioCodes) > 0 {
+		if err := validatePoolPercentOverride(
+			options.ScenarioCodes,
+			options.PoolPercent,
+		); err != nil {
+			return CLIOptions{}, err
+		}
+	}
 	if err := applyPlanRunCLI(
 		&options,
 		planWorkers,
@@ -339,6 +359,21 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 		}
 	}
 	return options, nil
+}
+
+func validatePoolPercentOverride(
+	codes []ScenarioCode,
+	percent int,
+) error {
+	if percent < 1 || percent > 100 {
+		return fmt.Errorf("pool target percent must be between 1 and 100")
+	}
+	for _, code := range codes {
+		if code == 401 || code == 402 {
+			return nil
+		}
+	}
+	return fmt.Errorf("--percent requires scenario 401 or 402")
 }
 
 func isPlanChangeCode(code ScenarioCode) bool {
@@ -563,6 +598,8 @@ func printUsage(w io.Writer) {
   gsbench run 103 --tp-workers N --ap-workers N --duration DURATION
   gsbench run 201 --workers N --work-mem VALUE --duration DURATION
   gsbench run 202 --workers N --work-mem VALUE --duration DURATION
+  gsbench run 401 --percent N --duration DURATION
+  gsbench run 402 --percent N --duration DURATION
   gsbench run 501 --sessions N --chain-depth N --duration DURATION
   gsbench run 502 --sessions N --duration DURATION
   gsbench run 503 --sessions N --duration DURATION
@@ -582,6 +619,7 @@ Options:
       --tp-workers N     fixed TP workers for scenario 103 (use with --ap-workers)
       --ap-workers N     fixed AP workers for scenario 103 (use with --tp-workers)
       --work-mem VALUE   work_mem for scenarios 201/202: integer kB, MB, or GB (minimum 64kB)
+      --percent N        target percentage for selected scenarios 401/402 (1-100)
       --sessions N       total holder plus waiter sessions for scenarios 501-503
       --chain-depth N    row wait chain depth for scenario 501 (1-5, default 1)
       --profile VALUE    data profile: quick or stress

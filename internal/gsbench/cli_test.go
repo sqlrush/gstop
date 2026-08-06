@@ -253,6 +253,62 @@ func TestParseCLIArgsSupportsScenarioDurationAndDryRun(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsSupportsPoolTargetPercent(t *testing.T) {
+	for _, test := range []struct {
+		args  []string
+		codes []ScenarioCode
+		want  int
+	}{
+		{[]string{"run", "401", "--percent", "90"}, []ScenarioCode{401}, 90},
+		{[]string{"run", "402", "--percent=100"}, []ScenarioCode{402}, 100},
+		{[]string{"run", "301,401,402", "--percent", "1"}, []ScenarioCode{301, 401, 402}, 1},
+		{[]string{"run", "--percent", "90"}, nil, 90},
+	} {
+		options, err := ParseCLIArgs(test.args)
+		if err != nil {
+			t.Fatalf("ParseCLIArgs(%v): %v", test.args, err)
+		}
+		if options.PoolPercent != test.want ||
+			len(options.ScenarioCodes) != len(test.codes) ||
+			(len(test.codes) > 0 &&
+				!reflect.DeepEqual(options.ScenarioCodes, test.codes)) {
+			t.Fatalf("ParseCLIArgs(%v)=%+v", test.args, options)
+		}
+	}
+}
+
+func TestParseCLIArgsRejectsInvalidPoolTargetPercent(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "401", "--percent", "0"},
+		{"run", "401", "--percent", "-1"},
+		{"run", "402", "--percent", "101"},
+		{"run", "401", "--percent", "1.5"},
+		{"run", "301", "--percent", "90"},
+		{"doctor", "--scenario", "401", "--percent", "90"},
+	} {
+		if _, err := ParseCLIArgs(args); err == nil {
+			t.Fatalf("ParseCLIArgs(%v) accepted invalid pool target", args)
+		}
+	}
+}
+
+func TestCLIHelpDocumentsPoolTargetPercent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := RunCLI(
+		context.Background(), []string{"help"}, &stdout, &stderr,
+	); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	for _, token := range []string{
+		"--percent N", "gsbench run 401 --percent",
+		"gsbench run 402 --percent",
+	} {
+		if !strings.Contains(stdout.String(), token) {
+			t.Errorf("help missing %q:\n%s", token, stdout.String())
+		}
+	}
+}
+
 func TestParseCLIArgsSupportsFixedWorkerOverrides(t *testing.T) {
 	for _, test := range []struct {
 		name      string
