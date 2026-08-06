@@ -49,7 +49,7 @@ func TestPlanDefinitionsCoverSixScenariosWithLiteralSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]bool{
-		"planchange_stats_target": false, "planchange_index_unusable": false,
+		"planchange_stats_target": false, "planchange_stats_lookup": false,
 		"planchange_stats_ndistinct": false, "planchange_stats_extended": false,
 		"planchange_index_drop": false, "planchange_index_shape": false,
 	}
@@ -77,7 +77,7 @@ func TestPlanDefinitionsCoverSixScenariosWithLiteralSQL(t *testing.T) {
 
 func TestPlanchangeDefinitionsUseApprovedIdentities(t *testing.T) {
 	want := map[ScenarioCode]string{
-		601: "planchange_stats_target", 602: "planchange_index_unusable",
+		601: "planchange_stats_target", 602: "planchange_stats_lookup",
 		603: "planchange_stats_ndistinct", 604: "planchange_stats_extended",
 		605: "planchange_index_drop", 606: "planchange_index_shape",
 	}
@@ -89,6 +89,27 @@ func TestPlanchangeDefinitionsUseApprovedIdentities(t *testing.T) {
 		if got := want[def.Code]; got != def.Name {
 			t.Fatalf("definition=%+v want name=%q", def, got)
 		}
+	}
+}
+
+func TestPlanchangeStatsLookupReuses601PointTraffic(t *testing.T) {
+	definitions, err := PlanScenarioDefinitions("Bench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var one, two PlanScenarioDefinition
+	for _, definition := range definitions {
+		switch definition.Code {
+		case 601:
+			one = definition
+		case 602:
+			two = definition
+		}
+	}
+	if two.Name != "planchange_stats_lookup" ||
+		!reflect.DeepEqual(two.Candidates, one.Candidates) ||
+		two.ExpectedBaselineToken != "plan_data_lookup_idx" {
+		t.Fatalf("601=%+v 602=%+v", one, two)
 	}
 }
 

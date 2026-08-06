@@ -21,6 +21,11 @@ func PlanScenarioDefinitions(schema string) ([]PlanScenarioDefinition, error) {
 			table, key,
 		)
 	}
+	pointLookups := []string{
+		pointLookup(1),
+		pointLookup(500_000),
+		pointLookup(1_000_000),
+	}
 	rangeQueries := func(column string, widths ...int) []string {
 		out := make([]string, 0, len(widths))
 		for _, width := range widths {
@@ -34,17 +39,13 @@ func PlanScenarioDefinitions(schema string) ([]PlanScenarioDefinition, error) {
 	return []PlanScenarioDefinition{
 		{
 			Code: 601, Name: "planchange_stats_target",
-			Candidates: []string{
-				pointLookup(1),
-				pointLookup(500_000),
-				pointLookup(1_000_000),
-			},
+			Candidates:            append([]string(nil), pointLookups...),
 			ExpectedBaselineToken: "plan_data_lookup_idx",
 		},
 		{
-			Code: 602, Name: "planchange_index_unusable",
-			Candidates:            rangeQueries("index_unusable_key", 10_000, 50_000, 200_000),
-			ExpectedBaselineToken: "plan_index_unusable_idx",
+			Code: 602, Name: "planchange_stats_lookup",
+			Candidates:            append([]string(nil), pointLookups...),
+			ExpectedBaselineToken: "plan_data_lookup_idx",
 		},
 		{
 			Code: 603, Name: "planchange_stats_ndistinct",

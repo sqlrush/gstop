@@ -53,3 +53,18 @@ func TestCapabilitiesAcceptDistributedTopology(t *testing.T) {
 		t.Fatalf("distributed instance rejected: %+v", c)
 	}
 }
+
+func TestPlanchangeStatsLookupRequiresNDistinctCapability(t *testing.T) {
+	if err := validatePlanCapability(
+		"planchange_stats_lookup",
+		Capabilities{PlanNDistinct: true},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePlanCapability(
+		"planchange_stats_lookup",
+		Capabilities{PlanIndexUnusable: true},
+	); err == nil {
+		t.Fatal("accepted obsolete index-unusable capability")
+	}
+}

@@ -18,16 +18,18 @@ type ScenarioDefinition struct {
 }
 
 type ScenarioCatalog struct {
-	byCode map[ScenarioCode]ScenarioDefinition
-	byName map[string]ScenarioDefinition
-	codes  []ScenarioCode
+	byCode  map[ScenarioCode]ScenarioDefinition
+	byName  map[string]ScenarioDefinition
+	aliases map[string]ScenarioDefinition
+	codes   []ScenarioCode
 }
 
 func NewScenarioCatalog(definitions []ScenarioDefinition) (*ScenarioCatalog, error) {
 	catalog := &ScenarioCatalog{
-		byCode: make(map[ScenarioCode]ScenarioDefinition, len(definitions)),
-		byName: make(map[string]ScenarioDefinition, len(definitions)),
-		codes:  make([]ScenarioCode, 0, len(definitions)),
+		byCode:  make(map[ScenarioCode]ScenarioDefinition, len(definitions)),
+		byName:  make(map[string]ScenarioDefinition, len(definitions)),
+		aliases: make(map[string]ScenarioDefinition),
+		codes:   make([]ScenarioCode, 0, len(definitions)),
 	}
 	for _, definition := range definitions {
 		if definition.Code < 100 || definition.Code > 999 {
@@ -84,6 +86,9 @@ func (c *ScenarioCatalog) Resolve(input string) (ScenarioDefinition, error) {
 	if definition, ok := c.byName[input]; ok {
 		return cloneScenarioDefinition(definition), nil
 	}
+	if definition, ok := c.aliases[input]; ok {
+		return cloneScenarioDefinition(definition), nil
+	}
 	return ScenarioDefinition{}, fmt.Errorf("unknown scenario %q", input)
 }
 
@@ -122,6 +127,7 @@ func DefaultScenarioCatalog() *ScenarioCatalog {
 	if err != nil {
 		panic(err)
 	}
+	catalog.aliases["planchange_index_unusable"] = catalog.byCode[602]
 	return catalog
 }
 
@@ -156,7 +162,7 @@ func defaultScenarioDefinitions() []ScenarioDefinition {
 		{505, "lock_ddl_blocks_dml"}, {506, "lock_select_blocks_ddl"}, {507, "lock_vacuum_blocks_ddl"},
 		{508, "lock_ddl_blocks_vacuum"}, {509, "lock_createindex_blocks_dml"}, {510, "lock_dml_blocks_createindex"},
 		{511, "lock_distributed_ddl_global"}, {512, "lock_distributed_txn_chain"},
-		{601, "planchange_stats_target"}, {602, "planchange_index_unusable"}, {603, "planchange_stats_ndistinct"},
+		{601, "planchange_stats_target"}, {602, "planchange_stats_lookup"}, {603, "planchange_stats_ndistinct"},
 		{604, "planchange_stats_extended"}, {605, "planchange_index_drop"}, {606, "planchange_index_shape"},
 		{621, "hardparse_literal_flood"}, {622, "hardparse_unprepared"}, {623, "hardparse_force_custom"},
 		{624, "hardparse_session_churn"}, {625, "hardparse_ddl_invalidation"}, {626, "hardparse_gpc_bypass"},

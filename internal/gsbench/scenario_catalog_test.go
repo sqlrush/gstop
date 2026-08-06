@@ -30,6 +30,18 @@ func TestCatalogResolvesCodeAndCanonicalName(t *testing.T) {
 	}
 }
 
+func TestDefaultScenarioCatalogResolvesLegacy602Alias(t *testing.T) {
+	definition, err := DefaultScenarioCatalog().Resolve(
+		"planchange_index_unusable",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Code != 602 || definition.Name != "planchange_stats_lookup" {
+		t.Fatalf("definition=%+v", definition)
+	}
+}
+
 func TestCatalogRejectsLegacyNumericAlias(t *testing.T) {
 	if _, err := DefaultScenarioCatalog().Resolve("1"); err == nil {
 		t.Fatal("legacy numeric alias accepted")

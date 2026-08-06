@@ -73,7 +73,8 @@ func capabilitiesFor(env Environment) Capabilities {
 func validatePlanCapability(name string, capabilities Capabilities) error {
 	supported := map[string]bool{
 		"planchange_stats_target":    capabilities.PlanColumnStats,
-		"planchange_index_unusable":  capabilities.PlanIndexUnusable,
+		"planchange_stats_lookup":    capabilities.PlanNDistinct,
+		"planchange_index_unusable":  capabilities.PlanNDistinct,
 		"planchange_stats_ndistinct": capabilities.PlanNDistinct,
 		"planchange_stats_extended":  capabilities.PlanExtendedStats,
 		"planchange_index_drop":      true,
