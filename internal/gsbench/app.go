@@ -1624,8 +1624,8 @@ func (l *databaseRestoreLock) DatasetVersion(
 	err := l.session.Scan(
 		ctx,
 		"SELECT value FROM "+quotedSchema+
-			".meta_dataset WHERE key=$1",
-		[]any{"dataset_version"},
+			".meta_dataset WHERE key='dataset_version'",
+		nil,
 		&version,
 	)
 	if errors.Is(err, sql.ErrNoRows) {

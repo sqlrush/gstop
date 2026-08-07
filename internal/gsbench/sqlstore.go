@@ -401,8 +401,9 @@ func (e dbDatasetExecutor) DatasetVersion(ctx context.Context, schema string) (s
 	var version string
 	err := e.db.Scan(
 		ctx,
-		"SELECT value FROM "+quotedSchema+".meta_dataset WHERE key=$1",
-		[]any{"dataset_version"},
+		"SELECT value FROM "+quotedSchema+
+			".meta_dataset WHERE key='dataset_version'",
+		nil,
 		&version,
 	)
 	if err == sql.ErrNoRows {

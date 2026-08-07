@@ -31,8 +31,9 @@ type advisoryLockTestConnector struct {
 }
 
 type ownershipRetryTestState struct {
-	attempts int
-	errors   []error
+	attempts      int
+	errors        []error
+	argumentCount []int
 }
 
 type ownershipRetryTestConnector struct {
@@ -68,15 +69,22 @@ func (*ownershipRetryTestConn) Begin() (driver.Tx, error) {
 }
 
 func (c *ownershipRetryTestConn) QueryContext(
-	context.Context,
-	string,
-	[]driver.NamedValue,
+	_ context.Context,
+	_ string,
+	args []driver.NamedValue,
 ) (driver.Rows, error) {
 	c.state.attempts++
+	c.state.argumentCount = append(c.state.argumentCount, len(args))
 	if len(c.state.errors) != 0 {
 		err := c.state.errors[0]
 		c.state.errors = c.state.errors[1:]
 		return nil, err
+	}
+	if len(args) != 0 {
+		return nil, fmt.Errorf(
+			"got %d parameters but the statement requires 3",
+			len(args),
+		)
 	}
 	return &ownershipRetryTestRows{}, nil
 }
@@ -226,11 +234,12 @@ func (l *retryRestoreTestLock) Release() error {
 }
 
 type retryAdvisoryLockSession struct {
-	tryErr     error
-	tryCount   int
-	unlockKeys []string
-	closed     int
-	discarded  int
+	tryErr            error
+	tryCount          int
+	unlockKeys        []string
+	scanArgumentCount []int
+	closed            int
+	discarded         int
 }
 
 func (s *retryAdvisoryLockSession) TryLock(
@@ -252,12 +261,27 @@ func (s *retryAdvisoryLockSession) Unlock(
 	return true, nil
 }
 
-func (*retryAdvisoryLockSession) Scan(
-	context.Context,
-	string,
-	[]any,
-	...any,
+func (s *retryAdvisoryLockSession) Scan(
+	_ context.Context,
+	_ string,
+	args []any,
+	dest ...any,
 ) error {
+	s.scanArgumentCount = append(s.scanArgumentCount, len(args))
+	if len(args) != 0 {
+		return fmt.Errorf(
+			"got %d parameters but the statement requires 3",
+			len(args),
+		)
+	}
+	if len(dest) != 1 {
+		return fmt.Errorf("scan destinations=%d want=1", len(dest))
+	}
+	value, ok := dest[0].(*string)
+	if !ok {
+		return fmt.Errorf("scan destination type %T", dest[0])
+	}
+	*value = datasetVersion
 	return nil
 }
 
@@ -987,6 +1011,30 @@ func TestDatabaseRestoreOwnershipRetriesTemporaryResourceFailure(t *testing.T) {
 	}
 	if state.attempts != 2 {
 		t.Fatalf("ownership attempts=%d want=2", state.attempts)
+	}
+	if !reflect.DeepEqual(state.argumentCount, []int{0, 0}) {
+		t.Fatalf(
+			"ownership argument counts=%v want=[0 0]",
+			state.argumentCount,
+		)
+	}
+}
+
+func TestDatabaseRestoreLockDatasetVersionUsesZeroArgumentQuery(t *testing.T) {
+	session := &retryAdvisoryLockSession{}
+	lock := &databaseRestoreLock{session: session}
+	version, err := lock.DatasetVersion(context.Background(), "Bench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != datasetVersion {
+		t.Fatalf("dataset version=%q want=%q", version, datasetVersion)
+	}
+	if !reflect.DeepEqual(session.scanArgumentCount, []int{0}) {
+		t.Fatalf(
+			"dataset version argument counts=%v want=[0]",
+			session.scanArgumentCount,
+		)
 	}
 }
 
