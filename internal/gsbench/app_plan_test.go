@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,6 +22,7 @@ type advisoryLockTestState struct {
 	unlockResult  map[string]bool
 	unlockErrors  map[string]error
 	events        []string
+	argumentCount []int
 	physicalClose int
 }
 
@@ -64,7 +66,16 @@ func (c *advisoryLockTestConn) QueryContext(
 	query string,
 	args []driver.NamedValue,
 ) (driver.Rows, error) {
-	key, _ := args[0].Value.(string)
+	c.state.argumentCount = append(c.state.argumentCount, len(args))
+	key := ""
+	if len(args) != 0 {
+		key, _ = args[0].Value.(string)
+	} else {
+		key = advisoryLockTestQueryKey(query)
+	}
+	if key == "" {
+		return nil, fmt.Errorf("advisory-lock key is unavailable: %s", query)
+	}
 	var result bool
 	switch {
 	case strings.Contains(query, "pg_try_advisory_lock"):
@@ -88,6 +99,22 @@ func (c *advisoryLockTestConn) QueryContext(
 		return nil, errors.New("unexpected advisory-lock query")
 	}
 	return &advisoryLockBoolRows{value: result}, nil
+}
+
+func advisoryLockTestQueryKey(query string) string {
+	const marker = "hashtext("
+	start := strings.Index(query, marker)
+	if start < 0 {
+		return ""
+	}
+	literal := strings.TrimSpace(query[start+len(marker):])
+	literal = strings.TrimSuffix(literal, "))")
+	literal = strings.TrimSpace(literal)
+	literal = strings.TrimPrefix(literal, "E")
+	if len(literal) < 2 || literal[0] != '\'' || literal[len(literal)-1] != '\'' {
+		return ""
+	}
+	return strings.ReplaceAll(literal[1:len(literal)-1], "''", "'")
 }
 
 type advisoryLockBoolRows struct {
@@ -121,6 +148,69 @@ type protectedCleanupTestLock struct {
 type initializationReleaseTestLock struct {
 	events *[]string
 	err    error
+}
+
+type retryRestoreTestLock struct {
+	releases int
+}
+
+func (l *retryRestoreTestLock) Release() error {
+	l.releases++
+	return nil
+}
+
+type retryAdvisoryLockSession struct {
+	tryErr     error
+	tryCount   int
+	unlockKeys []string
+	closed     int
+	discarded  int
+}
+
+func (s *retryAdvisoryLockSession) TryLock(
+	context.Context,
+	string,
+) (bool, error) {
+	s.tryCount++
+	if s.tryErr != nil {
+		return false, s.tryErr
+	}
+	return true, nil
+}
+
+func (s *retryAdvisoryLockSession) Unlock(
+	_ context.Context,
+	key string,
+) (bool, error) {
+	s.unlockKeys = append(s.unlockKeys, key)
+	return true, nil
+}
+
+func (*retryAdvisoryLockSession) Scan(
+	context.Context,
+	string,
+	[]any,
+	...any,
+) error {
+	return nil
+}
+
+func (*retryAdvisoryLockSession) Exec(
+	context.Context,
+	string,
+	...any,
+) error {
+	return nil
+}
+
+func (s *retryAdvisoryLockSession) Close() error {
+	s.closed++
+	return nil
+}
+
+func (s *retryAdvisoryLockSession) Discard() error {
+	s.discarded++
+	return nil
 }
 
 func (l *initializationReleaseTestLock) Release() error {
@@ -212,9 +302,27 @@ func newAdvisoryLockTestBackend(
 		Safety:   SafetyConfig{QueryTimeout: time.Second},
 	}
 	db := &Database{cfg: cfg, ctx: context.Background(), pool: pool}
-	return &databaseRestoreBackend{
+	backend := &databaseRestoreBackend{
 		db: db, cfg: cfg, requirePlanLock: true,
 	}
+	var sessionPools []*sql.DB
+	testOpenAdvisorySession := func(
+		ctx context.Context,
+		db *Database,
+		_ string,
+	) (advisoryLockSession, error) {
+		sessionPool := sql.OpenDB(advisoryLockTestConnector{state: state})
+		sessionPools = append(sessionPools, sessionPool)
+		return newSQLAdvisoryLockSession(ctx, db, sessionPool)
+	}
+	db.openAdvisorySession = testOpenAdvisorySession
+	backend.openAdvisorySession = testOpenAdvisorySession
+	t.Cleanup(func() {
+		for _, sessionPool := range sessionPools {
+			_ = sessionPool.Close()
+		}
+	})
+	return backend
 }
 
 func TestExitCodeForOutcome(t *testing.T) {
@@ -749,6 +857,144 @@ func TestInitializationRestoreReleaseFailureReturnsExitOne(t *testing.T) {
 	}
 }
 
+func TestAcquireDatabaseRestoreLockUsesSimpleDedicatedSession(t *testing.T) {
+	planKey := "gsbench:plan:postgres:Bench"
+	restoreKey := "gsbench/restore/postgres/Bench"
+	state := &advisoryLockTestState{
+		tryResults: map[string]bool{
+			planKey: true, restoreKey: true,
+		},
+		tryErrors: map[string]error{},
+		unlockResult: map[string]bool{
+			planKey: true, restoreKey: true,
+		},
+		unlockErrors: map[string]error{},
+	}
+	backend := newAdvisoryLockTestBackend(t, state)
+	lock, err := backend.acquireDatabaseLock(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	for index, count := range state.argumentCount {
+		if count != 0 {
+			t.Fatalf(
+				"advisory query %d used %d bind arguments; counts=%v",
+				index+1,
+				count,
+				state.argumentCount,
+			)
+		}
+	}
+	want := []string{
+		"try " + planKey,
+		"try " + restoreKey,
+		"unlock " + restoreKey,
+		"unlock " + planKey,
+	}
+	if !reflect.DeepEqual(state.events, want) {
+		t.Fatalf("events=%v want=%v", state.events, want)
+	}
+}
+
+func newRetryRestoreLockTestBackend(
+	t *testing.T,
+	firstErr error,
+) (*databaseRestoreBackend, []*retryAdvisoryLockSession, *retryRestoreTestLock, *int) {
+	t.Helper()
+	backend := newAdvisoryLockTestBackend(t, &advisoryLockTestState{})
+	backend.requirePlanLock = false
+	backend.cfg.FaultProvider.LedgerPath = filepath.Join(
+		t.TempDir(),
+		"recovery.json",
+	)
+	backend.ledger = NewFileRecoveryLedger(backend.cfg.FaultProvider.LedgerPath)
+	backend.executor = &restoreDispatchExecutor{}
+	local := &retryRestoreTestLock{}
+	backend.acquireLocalRestoreLock = func(
+		context.Context,
+		string,
+	) (RestoreLock, error) {
+		return local, nil
+	}
+	sessions := []*retryAdvisoryLockSession{
+		{tryErr: firstErr},
+		{},
+	}
+	openIndex := 0
+	backend.openAdvisorySession = func(
+		context.Context,
+		*Database,
+		string,
+	) (advisoryLockSession, error) {
+		if openIndex >= len(sessions) {
+			t.Fatalf("unexpected advisory session open %d", openIndex+1)
+		}
+		session := sessions[openIndex]
+		openIndex++
+		return session, nil
+	}
+	waits := 0
+	backend.waitForDatabaseFn = func(context.Context) error {
+		waits++
+		return nil
+	}
+	return backend, sessions, local, &waits
+}
+
+func TestRestoreLockRetriesResourceExhaustionWithFreshSession(t *testing.T) {
+	backend, sessions, local, waits := newRetryRestoreLockTestBackend(
+		t,
+		advisoryLockSQLStateError{state: "53200"},
+	)
+	lock, err := backend.AcquireRestoreLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessions[0].discarded != 1 || sessions[0].closed != 0 ||
+		sessions[1].tryCount != 1 || *waits != 1 {
+		t.Fatalf(
+			"first=%+v second=%+v waits=%d",
+			sessions[0],
+			sessions[1],
+			*waits,
+		)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if sessions[1].closed != 1 || local.releases != 1 {
+		t.Fatalf(
+			"second close=%d local releases=%d",
+			sessions[1].closed,
+			local.releases,
+		)
+	}
+}
+
+func TestRestoreLockDoesNotRetryPermissionFailure(t *testing.T) {
+	backend, sessions, local, waits := newRetryRestoreLockTestBackend(
+		t,
+		advisoryLockSQLStateError{state: "42501"},
+	)
+	lock, err := backend.AcquireRestoreLock(context.Background())
+	if err == nil || lock != nil {
+		t.Fatalf("lock=%v error=%v want permission failure", lock, err)
+	}
+	if sessions[0].discarded != 1 || sessions[1].tryCount != 0 ||
+		*waits != 0 || local.releases != 1 {
+		t.Fatalf(
+			"first=%+v second=%+v waits=%d local releases=%d",
+			sessions[0],
+			sessions[1],
+			*waits,
+			local.releases,
+		)
+	}
+}
+
 func TestAcquireDatabaseRestoreLockReleasesPartialPlanLockOnFailure(
 	t *testing.T,
 ) {
@@ -760,7 +1006,7 @@ func TestAcquireDatabaseRestoreLockReleasesPartialPlanLockOnFailure(
 		restoreErr        error
 		wantPhysicalClose int
 	}{
-		{name: "busy", restoreTry: false},
+		{name: "busy", restoreTry: false, wantPhysicalClose: 1},
 		{
 			name:              "query error",
 			restoreErr:        errors.New("restore lock query failed"),
@@ -785,6 +1031,9 @@ func TestAcquireDatabaseRestoreLockReleasesPartialPlanLockOnFailure(
 			)
 			if err == nil || lock != nil {
 				t.Fatalf("lock=%v error=%v want failed acquisition", lock, err)
+			}
+			if strings.Contains(err.Error(), "connection is already closed") {
+				t.Fatalf("error contains duplicate-close noise: %v", err)
 			}
 			want := []string{
 				"try " + planKey,

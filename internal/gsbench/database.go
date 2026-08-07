@@ -30,10 +30,11 @@ const (
 var tagComponentRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 type Database struct {
-	cfg    BenchConfig
-	ctx    context.Context
-	cancel context.CancelFunc
-	pool   *sql.DB
+	cfg                 BenchConfig
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	pool                *sql.DB
+	openAdvisorySession advisoryLockSessionOpener
 
 	mu     sync.Mutex
 	tagged map[*TaggedConn]struct{}
@@ -88,7 +89,11 @@ func openDatabase(
 	}
 	pool.SetMaxOpenConns(4)
 	pool.SetMaxIdleConns(4)
-	db := &Database{cfg: cfg, ctx: ctx, cancel: cancel, pool: pool, tagged: map[*TaggedConn]struct{}{}}
+	db := &Database{
+		cfg: cfg, ctx: ctx, cancel: cancel, pool: pool,
+		openAdvisorySession: openAdvisoryLockSession,
+		tagged:              map[*TaggedConn]struct{}{},
+	}
 	if !verifyReachability {
 		return db, nil
 	}

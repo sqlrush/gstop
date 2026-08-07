@@ -3,7 +3,6 @@ package gsbench
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -1224,6 +1223,7 @@ type databaseRestoreBackend struct {
 	requestPlanLockOwnerStop func(context.Context) error
 	acquirePlanRunLock       databaseRunLockAcquirer
 	acquireLocalRestoreLock  func(context.Context, string) (RestoreLock, error)
+	openAdvisorySession      advisoryLockSessionOpener
 
 	databaseActions []Action
 	localActions    []Action
@@ -1570,6 +1570,7 @@ func newDatabaseRestoreBackend(
 		terminateTagged:     db.TerminateTagged,
 		taggedSessionState:  db.TaggedSessionState,
 		restorePollInterval: 200 * time.Millisecond,
+		openAdvisorySession: db.openAdvisorySession,
 		waitForDatabaseFn: func(ctx context.Context) error {
 			return waitForRestoreDatabase(
 				ctx,
@@ -1583,34 +1584,32 @@ func newDatabaseRestoreBackend(
 }
 
 type databaseRestoreLock struct {
-	once  sync.Once
-	db    *Database
-	conn  *sql.Conn
-	keys  []string
-	local RestoreLock
-	err   error
+	once    sync.Once
+	session advisoryLockSession
+	keys    []string
+	local   RestoreLock
+	err     error
 }
 
 func (l *databaseRestoreLock) DatasetVersion(
 	ctx context.Context,
 	schema string,
 ) (string, error) {
-	if l == nil || l.db == nil || l.conn == nil {
+	if l == nil || l.session == nil {
 		return "", fmt.Errorf("protected restore database session is unavailable")
 	}
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {
 		return "", fmt.Errorf("unsafe dataset schema %q", schema)
 	}
-	opCtx, cancel := l.db.operationContext(ctx)
-	defer cancel()
 	var version string
-	err := l.conn.QueryRowContext(
-		opCtx,
+	err := l.session.Scan(
+		ctx,
 		"SELECT value FROM "+quotedSchema+
 			".meta_dataset WHERE key=$1",
-		"dataset_version",
-	).Scan(&version)
+		[]any{"dataset_version"},
+		&version,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -1622,13 +1621,10 @@ func (l *databaseRestoreLock) Exec(
 	query string,
 	args ...any,
 ) error {
-	if l == nil || l.db == nil || l.conn == nil {
+	if l == nil || l.session == nil {
 		return fmt.Errorf("protected restore database session is unavailable")
 	}
-	opCtx, cancel := l.db.operationContext(ctx)
-	defer cancel()
-	_, err := l.conn.ExecContext(opCtx, query, args...)
-	return err
+	return l.session.Exec(ctx, query, args...)
 }
 
 func (l *databaseRestoreLock) Release() error {
@@ -1637,17 +1633,21 @@ func (l *databaseRestoreLock) Release() error {
 	}
 	l.once.Do(func() {
 		var errs []error
-		if l.conn != nil {
-			errs = append(
-				errs,
-				releaseDatabaseAdvisoryKeys(l.db, l.conn, l.keys),
-			)
-			if err := l.conn.Close(); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"close restore lock connection: %w", err,
+		if l.session != nil {
+			releaseErr := releaseDatabaseAdvisoryKeys(l.session, l.keys)
+			errs = append(errs, releaseErr)
+			if releaseErr != nil {
+				errs = append(errs, wrapRestoreError(
+					"discard uncertain database advisory-lock session",
+					l.session.Discard(),
+				))
+			} else {
+				errs = append(errs, wrapRestoreError(
+					"close database restore lock session",
+					l.session.Close(),
 				))
 			}
-			l.conn = nil
+			l.session = nil
 		}
 		if l.local != nil {
 			if err := l.local.Release(); err != nil {
@@ -1661,55 +1661,27 @@ func (l *databaseRestoreLock) Release() error {
 }
 
 func releaseDatabaseAdvisoryKeys(
-	db *Database,
-	conn *sql.Conn,
+	session advisoryLockSession,
 	keys []string,
 ) error {
 	var errs []error
-	discard := false
 	for index := len(keys) - 1; index >= 0; index-- {
 		key := keys[index]
-		ctx, cancel := db.operationContext(context.Background())
-		var unlocked bool
-		err := conn.QueryRowContext(
-			ctx,
-			"SELECT pg_advisory_unlock(hashtext($1))",
-			key,
-		).Scan(&unlocked)
-		cancel()
+		unlocked, err := session.Unlock(context.Background(), key)
 		if err != nil {
-			discard = true
 			errs = append(errs, fmt.Errorf(
 				"release database advisory lock %q: %w",
 				key,
 				err,
 			))
 		} else if !unlocked {
-			discard = true
 			errs = append(errs, fmt.Errorf(
 				"database advisory lock %q was not held",
 				key,
 			))
 		}
 	}
-	if discard {
-		if err := discardDatabaseAdvisoryConnection(conn); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	return errors.Join(errs...)
-}
-
-func discardDatabaseAdvisoryConnection(conn *sql.Conn) error {
-	if conn == nil {
-		return fmt.Errorf("discard advisory-lock connection: connection is unavailable")
-	}
-	err := conn.Raw(func(any) error { return driver.ErrBadConn })
-	if err == nil || errors.Is(err, driver.ErrBadConn) ||
-		errors.Is(err, sql.ErrConnDone) {
-		return nil
-	}
-	return fmt.Errorf("discard advisory-lock connection: %w", err)
 }
 
 func (b *databaseRestoreBackend) AcquireRestoreLock(
@@ -1865,9 +1837,15 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 			return nil, requestErr
 		}
 	}
-	openCtx, cancelOpen := b.db.operationContext(ctx)
-	conn, err := b.db.pool.Conn(openCtx)
-	cancelOpen()
+	openSession := b.openAdvisorySession
+	if openSession == nil {
+		openSession = openAdvisoryLockSession
+	}
+	session, err := openSession(
+		ctx,
+		b.db,
+		b.cfg.Database.ApplicationName+"/restore-lock",
+	)
 	if err != nil {
 		sessionErr := fmt.Errorf(
 			"open database restore lock session: %w",
@@ -1876,47 +1854,53 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 		if ctx.Err() != nil {
 			return nil, sessionErr
 		}
-		return nil, newRestoreDatabaseConnectivityError(sessionErr)
+		if isRetryableAdvisoryLockError(err) {
+			return nil, newRestoreDatabaseConnectivityError(sessionErr)
+		}
+		return nil, sessionErr
 	}
 	keys := restoreDatabaseAdvisoryKeys(b.cfg, requirePlanLock)
 	acquiredKeys := make([]string, 0, len(keys))
+	cleanupSession := func(discard bool) error {
+		releaseErr := releaseDatabaseAdvisoryKeys(session, acquiredKeys)
+		if releaseErr != nil {
+			discard = true
+		}
+		var finishErr error
+		if discard {
+			finishErr = session.Discard()
+		} else {
+			finishErr = session.Close()
+		}
+		return errors.Join(
+			wrapRestoreError(
+				"release partially acquired database advisory locks",
+				releaseErr,
+			),
+			wrapRestoreError(
+				"finish database restore lock session",
+				finishErr,
+			),
+		)
+	}
 	for _, key := range keys {
 		for {
-			queryCtx, cancelQuery := b.db.operationContext(ctx)
 			var acquired bool
-			err = conn.QueryRowContext(
-				queryCtx,
-				"SELECT pg_try_advisory_lock(hashtext($1))",
-				key,
-			).Scan(&acquired)
-			cancelQuery()
+			acquired, err = session.TryLock(ctx, key)
 			if err != nil {
 				acquireErr := fmt.Errorf(
 					"acquire database advisory lock %q: %w",
 					key,
 					err,
 				)
-				releaseErr := releaseDatabaseAdvisoryKeys(
-					b.db,
-					conn,
-					acquiredKeys,
-				)
-				discardErr := discardDatabaseAdvisoryConnection(conn)
-				return nil, errors.Join(
+				resultErr := errors.Join(
 					acquireErr,
-					wrapRestoreError(
-						"release partially acquired database advisory locks",
-						releaseErr,
-					),
-					wrapRestoreError(
-						"discard uncertain database advisory-lock session",
-						discardErr,
-					),
-					wrapRestoreError(
-						"close database restore lock session",
-						conn.Close(),
-					),
+					cleanupSession(true),
 				)
+				if isRetryableAdvisoryLockError(err) {
+					return nil, newRestoreDatabaseConnectivityError(resultErr)
+				}
+				return nil, resultErr
 			}
 			if acquired {
 				break
@@ -1932,18 +1916,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 			if !requirePlanLock || key != planDatabaseLockIdentity(b.cfg) {
 				return nil, errors.Join(
 					busyErr,
-					wrapRestoreError(
-						"release partially acquired database advisory locks",
-						releaseDatabaseAdvisoryKeys(
-							b.db,
-							conn,
-							acquiredKeys,
-						),
-					),
-					wrapRestoreError(
-						"close database restore lock session",
-						conn.Close(),
-					),
+					cleanupSession(false),
 				)
 			}
 			// The plan owner can insert meta_runs after the initial stop request
@@ -1956,18 +1929,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 							"repeat stop request while plan lock is busy: %w",
 							requestErr,
 						),
-						wrapRestoreError(
-							"release partially acquired database advisory locks",
-							releaseDatabaseAdvisoryKeys(
-								b.db,
-								conn,
-								acquiredKeys,
-							),
-						),
-						wrapRestoreError(
-							"close database restore lock session",
-							conn.Close(),
-						),
+						cleanupSession(false),
 					)
 				}
 			}
@@ -1984,18 +1946,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 				return nil, errors.Join(
 					busyErr,
 					ctx.Err(),
-					wrapRestoreError(
-						"release partially acquired database advisory locks",
-						releaseDatabaseAdvisoryKeys(
-							b.db,
-							conn,
-							acquiredKeys,
-						),
-					),
-					wrapRestoreError(
-						"close database restore lock session",
-						conn.Close(),
-					),
+					cleanupSession(false),
 				)
 			case <-timer.C:
 			}
@@ -2003,7 +1954,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 		acquiredKeys = append(acquiredKeys, key)
 	}
 	return &databaseRestoreLock{
-		db: b.db, conn: conn, keys: keys, local: local,
+		session: session, keys: acquiredKeys, local: local,
 	}, nil
 }
 

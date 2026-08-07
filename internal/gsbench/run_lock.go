@@ -25,11 +25,15 @@ func AcquireDatabaseRunLock(
 	if db == nil || db.pool == nil {
 		return nil, fmt.Errorf("database advisory lock connection is unavailable")
 	}
+	openSession := db.openAdvisorySession
+	if openSession == nil {
+		openSession = openAdvisoryLockSession
+	}
 	return acquireDatabaseRunLock(
 		ctx,
 		identity,
 		func(openCtx context.Context) (runLockSession, error) {
-			return openAdvisoryLockSession(
+			return openSession(
 				openCtx,
 				db,
 				db.cfg.Database.ApplicationName+"/advisory-lock",
@@ -46,11 +50,15 @@ func DatabaseRunLockHeld(
 	if db == nil || db.pool == nil {
 		return false, fmt.Errorf("database advisory lock connection is unavailable")
 	}
+	openSession := db.openAdvisorySession
+	if openSession == nil {
+		openSession = openAdvisoryLockSession
+	}
 	return probeDatabaseRunLock(
 		ctx,
 		identity,
 		func(openCtx context.Context) (runLockSession, error) {
-			return openAdvisoryLockSession(
+			return openSession(
 				openCtx,
 				db,
 				db.cfg.Database.ApplicationName+"/advisory-lock",
