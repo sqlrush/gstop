@@ -17,6 +17,56 @@ type runLockSession interface {
 	Discard() error
 }
 
+func runExecutionLockIdentity(
+	cfg BenchConfig,
+	runID string,
+) (string, error) {
+	runID = strings.TrimSpace(runID)
+	if err := validateTagComponent("run ID", runID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(
+		"gsbench:run:%s:%s:%s",
+		cfg.Database.Database,
+		cfg.Data.Schema,
+		runID,
+	), nil
+}
+
+func withRunExecutionDatabaseLock(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	runID string,
+	acquire databaseRunLockAcquirer,
+	work func() int,
+) (exitCode int, err error) {
+	if work == nil {
+		return 1, fmt.Errorf("run callback is unavailable")
+	}
+	if acquire == nil {
+		return 1, fmt.Errorf("run execution lock acquirer is unavailable")
+	}
+	identity, err := runExecutionLockIdentity(cfg, runID)
+	if err != nil {
+		return 1, err
+	}
+	release, err := acquire(ctx, db, identity)
+	if err != nil {
+		return 1, fmt.Errorf("acquire run execution lock: %w", err)
+	}
+	if release == nil {
+		return 1, fmt.Errorf("run execution lock release is unavailable")
+	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil {
+			exitCode = 1
+			err = fmt.Errorf("release run execution lock: %w", releaseErr)
+		}
+	}()
+	return work(), nil
+}
+
 func AcquireDatabaseRunLock(
 	ctx context.Context,
 	db *Database,

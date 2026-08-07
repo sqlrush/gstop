@@ -654,27 +654,43 @@ func commandRun(
 		log.Info("run SUCCESS (dry run, no database mutations)")
 		return 0
 	}
-	exitCode, lockErr := withPlanScenarioDatabaseLock(
+	var planLockErr error
+	exitCode, runLockErr := withRunExecutionDatabaseLock(
 		parent,
 		db,
 		cfg,
+		runID,
 		AcquireDatabaseRunLock,
 		func() int {
-			return commandRunCore(
+			var code int
+			code, planLockErr = withPlanScenarioDatabaseLock(
 				parent,
 				db,
 				cfg,
-				environment,
-				caps,
-				allowRisk,
-				log,
-				runID,
-				quotedSchema,
+				AcquireDatabaseRunLock,
+				func() int {
+					return commandRunCore(
+						parent,
+						db,
+						cfg,
+						environment,
+						caps,
+						allowRisk,
+						log,
+						runID,
+						quotedSchema,
+					)
+				},
 			)
+			return code
 		},
 	)
-	if lockErr != nil {
-		log.Error("plan-change session lock: %v", lockErr)
+	if runLockErr != nil {
+		log.Error("run execution session lock: %v", runLockErr)
+		return 1
+	}
+	if planLockErr != nil {
+		log.Error("plan-change session lock: %v", planLockErr)
 		return 1
 	}
 	return exitCode
@@ -782,6 +798,7 @@ func commandRunCore(
 	// Run preparation always executes under the outer plan/schema lock.
 	// The restore backend must not try to reacquire that session lock.
 	backend.requirePlanLock = false
+	backend.skipLiveExecutionRuns = true
 	startPreparedRun := func(ctx context.Context) error {
 		if scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes) {
 			activeRunID, err := findActivePlanRun(
@@ -1234,6 +1251,8 @@ type databaseRestoreBackend struct {
 	acquirePlanRunLock       databaseRunLockAcquirer
 	acquireLocalRestoreLock  func(context.Context, string) (RestoreLock, error)
 	openAdvisorySession      advisoryLockSessionOpener
+	runExecutionLeaseHeld    func(context.Context, string) (bool, error)
+	skipLiveExecutionRuns    bool
 
 	databaseActions []Action
 	localActions    []Action
@@ -2182,18 +2201,6 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 			actions...,
 		)
 	}
-	if b.mutating && !readOnly {
-		var err error
-		discovery.DatabaseActions, err = b.syncRestoredLocalMirrors(
-			ctx,
-			discovery.DatabaseActions,
-			allLocal,
-		)
-		if err != nil {
-			return discovery, err
-		}
-	}
-
 	runs, err := b.discoverMetaRuns(ctx, requested)
 	if err != nil {
 		return discovery, err
@@ -2210,6 +2217,39 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 		return discovery, err
 	}
 	discovery.Runs = runs
+	if requested == "" && b.skipLiveExecutionRuns {
+		probeDiscovery := discovery
+		probeDiscovery.LocalActions = allLocal
+		probeDiscovery, err = b.excludeLiveExecutionRuns(
+			ctx,
+			probeDiscovery,
+		)
+		if err != nil {
+			return discovery, err
+		}
+		allLocal = probeDiscovery.LocalActions
+		discovery.Runs = probeDiscovery.Runs
+		discovery.DatabaseActions = probeDiscovery.DatabaseActions
+		discovery.LocalActions = discovery.LocalActions[:0]
+		for _, action := range allLocal {
+			if action.State != MutationRestored {
+				discovery.LocalActions = append(
+					discovery.LocalActions,
+					action,
+				)
+			}
+		}
+	}
+	if b.mutating && !readOnly {
+		discovery.DatabaseActions, err = b.syncRestoredLocalMirrors(
+			ctx,
+			discovery.DatabaseActions,
+			allLocal,
+		)
+		if err != nil {
+			return discovery, err
+		}
+	}
 	environment := DetectEnvironment(ctx, b.db)
 	b.environment = environment
 	b.executor.environment = environment
@@ -2228,6 +2268,78 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 		b.cfg.Run.ValidationEnabled,
 	)
 	return discovery, nil
+}
+
+func (b *databaseRestoreBackend) excludeLiveExecutionRuns(
+	ctx context.Context,
+	discovery RestoreDiscovery,
+) (RestoreDiscovery, error) {
+	runIDs := make([]string, 0, len(discovery.Runs))
+	seen := make(map[string]bool)
+	addRunID := func(runID string) {
+		runID = strings.TrimSpace(runID)
+		if runID == "" || seen[runID] {
+			return
+		}
+		seen[runID] = true
+		runIDs = append(runIDs, runID)
+	}
+	for _, run := range discovery.Runs {
+		addRunID(run.RunID)
+	}
+	for _, action := range discovery.DatabaseActions {
+		addRunID(action.RunID)
+	}
+	for _, action := range discovery.LocalActions {
+		addRunID(action.RunID)
+	}
+
+	live := make(map[string]bool)
+	leaseHeld := b.runExecutionLeaseHeld
+	if leaseHeld == nil {
+		leaseHeld = func(
+			probeCtx context.Context,
+			runID string,
+		) (bool, error) {
+			identity, err := runExecutionLockIdentity(b.cfg, runID)
+			if err != nil {
+				return false, err
+			}
+			return DatabaseRunLockHeld(probeCtx, b.db, identity)
+		}
+	}
+	for _, runID := range runIDs {
+		held, err := leaseHeld(ctx, runID)
+		if err != nil {
+			return discovery, fmt.Errorf(
+				"check run %s execution lease: %w",
+				runID,
+				err,
+			)
+		}
+		live[runID] = held
+	}
+
+	filtered := RestoreDiscovery{}
+	for _, run := range discovery.Runs {
+		if !live[run.RunID] {
+			filtered.Runs = append(filtered.Runs, run)
+		}
+	}
+	for _, action := range discovery.DatabaseActions {
+		if !live[action.RunID] {
+			filtered.DatabaseActions = append(
+				filtered.DatabaseActions,
+				action,
+			)
+		}
+	}
+	for _, action := range discovery.LocalActions {
+		if !live[action.RunID] {
+			filtered.LocalActions = append(filtered.LocalActions, action)
+		}
+	}
+	return filtered, nil
 }
 
 type recoveryLedgerSnapshotter interface {
