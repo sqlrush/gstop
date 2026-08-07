@@ -515,6 +515,41 @@ func TestVerifyPlanBaselineRejectsSameNameIndexWithWrongShape(t *testing.T) {
 	}
 }
 
+func TestInspectPlanBaselineFindsWrongShapeWithoutExecuting(t *testing.T) {
+	definitions := planBaselineDefinitionsForTest()
+	definitions["plan_data_lookup_idx"] =
+		"CREATE UNIQUE INDEX plan_data_lookup_idx ON gsbench.plan_data USING ubtree (lookup_key,dist_key)"
+	definitions["plan_index_drop_idx"] =
+		"CREATE INDEX plan_index_drop_idx ON gsbench.plan_data (index_drop_key)"
+	state := &planBaselineCatalogState{definitions: definitions}
+	db := newPlanBaselineCatalogDatabase(t, state)
+
+	findings, err := InspectPlanBaseline(context.Background(), db, "gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wrongFound, ubtreeFound bool
+	for _, finding := range findings {
+		if finding.Target == "plan_index_drop_idx" {
+			wrongFound = strings.Contains(
+				strings.Join(finding.Statements, "\n"),
+				"CREATE INDEX plan_index_drop_idx",
+			)
+		}
+		if finding.Target == "plan_data_lookup_idx" {
+			ubtreeFound = true
+		}
+	}
+	if !wrongFound || ubtreeFound {
+		t.Fatalf("findings=%+v", findings)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.executed) != 0 {
+		t.Fatalf("inspection executed SQL: %+v", state.executed)
+	}
+}
+
 func TestPlanBaselineRepairRejectsUnsafeSchema(t *testing.T) {
 	if _, err := PlanBaselineRepairSteps("gsbench;drop schema public"); err == nil {
 		t.Fatal("expected unsafe schema error")
