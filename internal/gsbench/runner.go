@@ -21,6 +21,7 @@ type Runtime struct {
 	Log              *RunLog
 	RunID            string
 	ReportPhase      func(context.Context, string, Phase)
+	ReportWarning    func(PrecheckWarning)
 	PlanPreflight    func(context.Context, string, []string) error
 	RiskPreflight    func(context.Context, ScenarioDefinition) error
 	RestorePreflight func(
@@ -183,16 +184,6 @@ func (r *Runner) Run(ctx context.Context, codes []ScenarioCode) RunSummary {
 				"",
 				OutcomeFailed,
 				err.Error(),
-			)
-			continue
-		}
-		if !r.runtime.Environment.Applicable(definition) {
-			results[i] = catalogTerminalResult(
-				definition,
-				r.runtime.Environment,
-				OutcomeNotApplicable,
-				"scenario does not apply to the detected environment",
-				"not_applicable",
 			)
 			continue
 		}
@@ -411,7 +402,28 @@ func (r *Runner) runOne(
 		Outcome:      OutcomeSuccess,
 		StartedAt:    startedAt,
 	}
+	var warnings []PrecheckWarning
+	warn := func(check, object, actual, expected, impact string) {
+		warning := PrecheckWarning{
+			ScenarioCode: definition.Code,
+			Scenario:     definition.Name,
+			Check:        check,
+			Object:       object,
+			Actual:       actual,
+			Expected:     expected,
+			Impact:       impact,
+		}
+		warnings = append(warnings, warning)
+		if r.runtime.ReportWarning != nil {
+			r.runtime.ReportWarning(warning)
+		}
+		if r.runtime.Log != nil {
+			r.runtime.Log.Warn("%s", warning.LogLine())
+		}
+	}
+	executionFailed := false
 	fail := func(phase Phase, err error) {
+		executionFailed = true
 		result.Outcome = OutcomeFailed
 		result.Message = fmt.Sprintf("%s: %v", phase, err)
 	}
@@ -423,12 +435,24 @@ func (r *Runner) runOne(
 	report(PhasePreflight)
 	var prepareErr error
 	failurePhase := PhasePreflight
+	if !r.runtime.Environment.Applicable(definition) {
+		warn(
+			"environment_applicability",
+			"detected_environment",
+			fmt.Sprintf("%s/%s", r.runtime.Environment.Product, r.runtime.Environment.Topology),
+			fmt.Sprint(definition.AppliesTo),
+			"scenario_will_run_outside_catalog_applicability",
+		)
+	}
 	missing := r.runtime.Environment.Missing(definition.Requires)
 	if len(missing) != 0 &&
 		!definitionHasFallback(definition, missing) {
-		prepareErr = fmt.Errorf(
-			"missing requirements: %s",
+		warn(
+			"requirements",
+			"scenario_capabilities",
 			joinRequirements(missing),
+			"available",
+			"scenario_may_fail_or_produce_unrepresentative_results",
 		)
 	}
 	if prepareErr == nil {
@@ -444,13 +468,7 @@ func (r *Runner) runOne(
 		}
 	}
 	if prepareErr == nil {
-		if r.runtime.RestorePreflight != nil {
-			prepareErr = r.runtime.RestorePreflight(ctx, definition)
-		} else if restoreServiceIsNil(r.runtime.RestoreService) {
-			prepareErr = fmt.Errorf(
-				"restore coordinator is unavailable",
-			)
-		} else if definition.Risk == RiskC &&
+		if definition.Risk == RiskC &&
 			(faultProviderIsNil(r.runtime.Provider) ||
 				r.runtime.Ledger == nil) {
 			prepareErr = fmt.Errorf(
@@ -484,18 +502,31 @@ func (r *Runner) runOne(
 			)
 		}
 	}
-	if prepareErr == nil && r.runtime.Config.Run.ValidationEnabled &&
-		r.runtime.PlanPreflight != nil {
+	if prepareErr == nil && r.runtime.PlanPreflight != nil {
 		var statements []string
-		statements, prepareErr = ScenarioWorkloadStatements(
+		statements, err := ScenarioWorkloadStatements(
 			r.runtime,
 			definition.Name,
 		)
-		if prepareErr == nil {
-			prepareErr = r.runtime.PlanPreflight(
-				ctx,
+		if err != nil {
+			warn(
+				"workload_plan",
 				definition.Name,
-				statements,
+				err.Error(),
+				"inspectable_workload_statements",
+				"plan_shape_could_not_be_inspected",
+			)
+		} else if err = r.runtime.PlanPreflight(
+			ctx,
+			definition.Name,
+			statements,
+		); err != nil {
+			warn(
+				"workload_plan",
+				definition.Name,
+				err.Error(),
+				"expected_plan_shape",
+				"scenario_will_run_without_confirmed_plan_shape",
 			)
 		}
 	}
@@ -534,18 +565,30 @@ func (r *Runner) runOne(
 				verify = true
 			}
 		}
-		if verify && r.runtime.Config.Run.ValidationEnabled {
+		if verify {
 			report(PhaseVerify)
 			verified, err := scenario.Verify(ctx, r.runtime)
 			if err != nil {
-				fail(PhaseVerify, err)
+				warn(
+					"runtime_verification",
+					definition.Name,
+					err.Error(),
+					"verification_completed",
+					"runtime_result_could_not_be_confirmed",
+				)
 			} else {
 				result = verified
 				result.StartedAt = startedAt
+				if result.Outcome != OutcomeSuccess {
+					warn(
+						"runtime_verification",
+						definition.Name,
+						fmt.Sprintf("%s:%s", result.Outcome, result.Message),
+						string(OutcomeSuccess),
+						"runtime_target_was_not_confirmed",
+					)
+				}
 			}
-		} else if verify {
-			result.Outcome = OutcomeUnverified
-			result.Message = "runtime model validation skipped"
 		}
 	}
 	cleanupTimeout := r.runtime.Config.Safety.QueryTimeout
@@ -584,11 +627,14 @@ func (r *Runner) runOne(
 				)
 			}
 		}
-		if result.Outcome == OutcomeUnverified {
-			result.Evidence = append(result.Evidence, Evidence{
-				Metric: "runtime_validation", Available: false,
-				Details: map[string]any{"skipped": true},
-			})
+	}
+	for _, warning := range warnings {
+		result.Evidence = append(result.Evidence, warning.Evidence())
+	}
+	if len(warnings) != 0 && !executionFailed {
+		result.Outcome = OutcomeCompletedWithWarnings
+		if result.Message == "" {
+			result.Message = "completed with advisory warnings"
 		}
 	}
 	strategy := "catalog_preflight"

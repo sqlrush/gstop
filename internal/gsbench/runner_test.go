@@ -530,11 +530,10 @@ func TestRunnerUsesExactLifecycleOrder(t *testing.T) {
 	}
 }
 
-func TestRunnerSkipsPlanAndScenarioVerificationWhenValidationDisabled(t *testing.T) {
+func TestRunnerTreatsLegacyValidationFlagAsAdvisory(t *testing.T) {
 	scenario := &fakeScenario{
-		name:      "one",
-		outcome:   OutcomeFailed,
-		failPhase: PhaseVerify,
+		name:    "one",
+		outcome: OutcomeSuccess,
 	}
 	runtime := &Runtime{
 		RunID: "run-1",
@@ -545,13 +544,36 @@ func TestRunnerSkipsPlanAndScenarioVerificationWhenValidationDisabled(t *testing
 	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
 	runner.runtime.Config.Run.ValidationEnabled = false
 	summary := runner.Run(context.Background(), codes)
-	if summary.Outcome != OutcomeUnverified {
+	if summary.Outcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("summary=%+v", summary)
 	}
-	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseStop}
+	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseVerify, PhaseStop}
 	if !reflect.DeepEqual(scenario.phases, want) {
 		t.Fatalf("phases=%v want=%v", scenario.phases, want)
 	}
+	assertPrecheckWarning(t, summary.Results[0], "workload_plan")
+}
+
+func TestRunnerVerificationFailureWarnsAndCompletes(t *testing.T) {
+	scenario := &fakeScenario{
+		name:      "one",
+		outcome:   OutcomeFailed,
+		failPhase: PhaseVerify,
+	}
+	summary := runTestScenarios(
+		t,
+		context.Background(),
+		&Runtime{RunID: "run-1"},
+		[]Scenario{scenario},
+	)
+	if summary.Outcome != OutcomeCompletedWithWarnings {
+		t.Fatalf("summary=%+v", summary)
+	}
+	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseVerify, PhaseStop}
+	if !reflect.DeepEqual(scenario.phases, want) {
+		t.Fatalf("phases=%v want=%v", scenario.phases, want)
+	}
+	assertPrecheckWarning(t, summary.Results[0], "runtime_verification")
 }
 
 func TestRunnerFailsOnExecutionErrorsWhenValidationDisabled(t *testing.T) {
@@ -580,7 +602,7 @@ func TestRunnerFailsOnExecutionErrorsWhenValidationDisabled(t *testing.T) {
 	}
 }
 
-func TestRunnerMarksCleanExecutionUnverifiedWhenModelValidationDisabled(t *testing.T) {
+func TestRunnerVerifiesCleanExecutionWhenLegacyValidationFlagIsDisabled(t *testing.T) {
 	scenario := &executionReportingScenario{
 		fakeScenario: fakeScenario{name: "one", outcome: OutcomeSuccess},
 		snapshot:     WorkerSnapshot{Operations: 7},
@@ -589,16 +611,13 @@ func TestRunnerMarksCleanExecutionUnverifiedWhenModelValidationDisabled(t *testi
 	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
 	runner.runtime.Config.Run.ValidationEnabled = false
 	summary := runner.Run(context.Background(), codes)
-	if summary.Outcome != OutcomeUnverified {
+	if summary.Outcome != OutcomeSuccess {
 		t.Fatalf("summary=%+v", summary)
 	}
 	result := summary.Results[0]
-	if result.Message != "runtime model validation skipped" {
-		t.Fatalf("result=%+v", result)
-	}
-	if len(result.Evidence) != 3 || result.Evidence[2].Metric != "runtime_validation" ||
-		result.Evidence[2].Available {
-		t.Fatalf("validation evidence=%+v", result.Evidence)
+	if len(result.Evidence) != 2 || result.Evidence[0].Metric != "operations" ||
+		result.Evidence[1].Metric != "errors" {
+		t.Fatalf("execution evidence=%+v", result.Evidence)
 	}
 }
 
@@ -613,7 +632,7 @@ func TestRunnerKeepsRuntimeMeasurementsWhenModelValidationDisabled(t *testing.T)
 	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
 	runner.runtime.Config.Run.ValidationEnabled = false
 	summary := runner.Run(context.Background(), codes)
-	if summary.Outcome != OutcomeUnverified {
+	if summary.Outcome != OutcomeSuccess {
 		t.Fatalf("summary=%+v", summary)
 	}
 	var found bool
@@ -976,7 +995,7 @@ func TestRunnerTargetFailureDoesNotCancelOtherScenario(t *testing.T) {
 	}
 }
 
-func TestRunnerPassesDegradedOutcomeToCoordinator(t *testing.T) {
+func TestRunnerPassesAdvisoryVerificationOutcomeToCoordinator(t *testing.T) {
 	scenario := &fakeScenario{name: "one", outcome: OutcomeDegraded}
 	service := &runnerRestoreService{result: RestoreSummary{
 		Outcome: OutcomeSuccess,
@@ -989,11 +1008,11 @@ func TestRunnerPassesDegradedOutcomeToCoordinator(t *testing.T) {
 		[]Scenario{scenario},
 	)
 
-	if summary.Outcome != OutcomeDegraded {
+	if summary.Outcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("summary=%+v", summary)
 	}
 	if len(service.requests) != 1 ||
-		service.requests[0].completedOutcome != OutcomeDegraded {
+		service.requests[0].completedOutcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("restore requests=%+v", service.requests)
 	}
 }
@@ -1009,20 +1028,20 @@ func TestRunnerAggregatesWorstOutcome(t *testing.T) {
 		&Runtime{},
 		scenarios,
 	)
-	if summary.Outcome != OutcomeDegraded {
+	if summary.Outcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("summary=%+v", summary)
 	}
 }
 
-func TestRunnerAggregatesNewOutcomeStates(t *testing.T) {
+func TestRunnerTreatsVerificationOutcomeStatesAsAdvisory(t *testing.T) {
 	tests := []struct {
 		name     string
 		outcomes []Outcome
 		want     Outcome
 	}{
-		{"not applicable does not fail a run", []Outcome{OutcomeSuccess, OutcomeNotApplicable}, OutcomeSuccess},
-		{"not implemented is returned", []Outcome{OutcomeNotApplicable, OutcomeNotImplemented}, OutcomeNotImplemented},
-		{"restore failure is worst", []Outcome{OutcomeFailed, OutcomeRestoreFailed}, OutcomeRestoreFailed},
+		{"not applicable becomes advisory", []Outcome{OutcomeSuccess, OutcomeNotApplicable}, OutcomeCompletedWithWarnings},
+		{"not implemented becomes advisory", []Outcome{OutcomeNotApplicable, OutcomeNotImplemented}, OutcomeCompletedWithWarnings},
+		{"reported restore failure becomes advisory", []Outcome{OutcomeFailed, OutcomeRestoreFailed}, OutcomeCompletedWithWarnings},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1190,7 +1209,7 @@ func TestRunnerPreflightsPlansBeforePrepare(t *testing.T) {
 	}
 }
 
-func TestRunnerPlanPreflightFailureSkipsPrepareButCallsCoordinator(t *testing.T) {
+func TestRunnerPlanPreflightFailureWarnsAndContinues(t *testing.T) {
 	scenario := &fakeScenario{name: "tp_cpu", outcome: OutcomeSuccess}
 	service := &runnerRestoreService{result: RestoreSummary{
 		Outcome: OutcomeSuccess,
@@ -1212,12 +1231,14 @@ func TestRunnerPlanPreflightFailureSkipsPrepareButCallsCoordinator(t *testing.T)
 		runtime,
 		[]Scenario{scenario},
 	)
-	if summary.Outcome != OutcomeFailed || !strings.Contains(summary.Results[0].Message, "plan unavailable") {
+	if summary.Outcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("summary=%+v", summary)
 	}
-	if !reflect.DeepEqual(scenario.phases, []Phase{PhaseStop}) {
+	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseVerify, PhaseStop}
+	if !reflect.DeepEqual(scenario.phases, want) {
 		t.Fatalf("phases=%v", scenario.phases)
 	}
+	assertPrecheckWarning(t, summary.Results[0], "workload_plan")
 	if len(service.requests) != 1 {
 		t.Fatalf("coordinator calls=%d want=1", len(service.requests))
 	}
@@ -1246,7 +1267,7 @@ func TestRunnerDeadlineStillStopsAndRestoresPlanWorkload(t *testing.T) {
 	}
 }
 
-func TestRunnerReturnsNotApplicableBeforeFactory(t *testing.T) {
+func TestRunnerInapplicableEnvironmentWarnsAndContinues(t *testing.T) {
 	catalog, err := NewScenarioCatalog([]ScenarioDefinition{{
 		Code:      721,
 		Name:      "cluster_data_skew",
@@ -1258,10 +1279,11 @@ func TestRunnerReturnsNotApplicableBeforeFactory(t *testing.T) {
 		t.Fatal(err)
 	}
 	factoryCalled := false
+	scenario := &fakeScenario{name: "cluster_data_skew", outcome: OutcomeSuccess}
 	factories := map[ScenarioCode]ScenarioFactory{
 		721: func(ScenarioDefinition, Environment) (Scenario, error) {
 			factoryCalled = true
-			return nil, errors.New("factory must not be called")
+			return testCodeScenario{Scenario: scenario, code: 721}, nil
 		},
 	}
 	runner := NewRunner(
@@ -1276,12 +1298,17 @@ func TestRunnerReturnsNotApplicableBeforeFactory(t *testing.T) {
 
 	got := runner.Run(context.Background(), []ScenarioCode{721})
 
-	if got.Results[0].Outcome != OutcomeNotApplicable {
+	if got.Results[0].Outcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("result=%+v", got.Results[0])
 	}
-	if factoryCalled {
-		t.Fatal("factory was called for an inapplicable environment")
+	if !factoryCalled {
+		t.Fatal("factory was not called for an inapplicable environment")
 	}
+	want := []Phase{PhasePrepare, PhaseRamp, PhaseHold, PhaseVerify, PhaseStop}
+	if !reflect.DeepEqual(scenario.phases, want) {
+		t.Fatalf("phases=%v want=%v", scenario.phases, want)
+	}
+	assertPrecheckWarning(t, got.Results[0], "environment_applicability")
 }
 
 func TestRunnerReturnsNotImplementedWithCatalogIdentityForMissingFactory(
@@ -1522,7 +1549,7 @@ func TestRunnerPreflightOrderBeforePrepare(t *testing.T) {
 	if got.Outcome != OutcomeSuccess {
 		t.Fatalf("summary=%+v", got)
 	}
-	want := []string{"risk", "restore", "factory", "plan", "prepare"}
+	want := []string{"risk", "factory", "plan", "prepare"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events=%v want=%v", events, want)
 	}
@@ -1531,7 +1558,7 @@ func TestRunnerPreflightOrderBeforePrepare(t *testing.T) {
 	}
 }
 
-func TestRunnerMissingRequirementsStopsBeforeRiskAndFactory(t *testing.T) {
+func TestRunnerMissingRequirementsWarnsAndContinues(t *testing.T) {
 	catalog, err := NewScenarioCatalog([]ScenarioDefinition{{
 		Code:      402,
 		Name:      "thread_pool",
@@ -1545,6 +1572,7 @@ func TestRunnerMissingRequirementsStopsBeforeRiskAndFactory(t *testing.T) {
 	}
 	riskCalled := false
 	factoryCalled := false
+	scenario := &fakeScenario{name: "thread_pool", outcome: OutcomeSuccess}
 	got := NewRunner(
 		&Runtime{
 			Environment: Environment{
@@ -1566,25 +1594,35 @@ func TestRunnerMissingRequirementsStopsBeforeRiskAndFactory(t *testing.T) {
 				Environment,
 			) (Scenario, error) {
 				factoryCalled = true
-				return nil, errors.New("must not run")
+				return testCodeScenario{Scenario: scenario, code: 402}, nil
 			},
 		},
 	).Run(context.Background(), []ScenarioCode{402})
 
-	if got.Results[0].Outcome != OutcomeFailed ||
-		!strings.Contains(
-			got.Results[0].Message,
-			string(RequirementThreadPool),
-		) {
+	if got.Results[0].Outcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("result=%+v", got.Results[0])
 	}
-	if riskCalled || factoryCalled {
+	if !riskCalled || !factoryCalled {
 		t.Fatalf(
 			"risk_called=%v factory_called=%v",
 			riskCalled,
 			factoryCalled,
 		)
 	}
+	assertPrecheckWarning(t, got.Results[0], "requirements")
+}
+
+func assertPrecheckWarning(t *testing.T, result Result, check string) {
+	t.Helper()
+	for _, evidence := range result.Evidence {
+		if evidence.Metric != "precheck_warning" {
+			continue
+		}
+		if actual, ok := evidence.Details["check"].(string); ok && actual == check {
+			return
+		}
+	}
+	t.Fatalf("missing precheck warning %q in %+v", check, result.Evidence)
 }
 
 func TestRunnerPopulatesCatalogEnvironmentAndRestoreEvidence(t *testing.T) {
@@ -1642,7 +1680,7 @@ func TestRunnerPopulatesCatalogEnvironmentAndRestoreEvidence(t *testing.T) {
 	).Run(context.Background(), []ScenarioCode{101})
 
 	result := got.Results[0]
-	if got.Outcome != OutcomeDegraded ||
+	if got.Outcome != OutcomeCompletedWithWarnings ||
 		result.ScenarioCode != 101 ||
 		result.Scenario != "tp_cpu" ||
 		result.Category != CategoryCPU ||

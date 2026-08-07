@@ -916,14 +916,12 @@ func commandRunCore(
 		restoreBackend,
 		cfg.Run.ValidationEnabled,
 	)
-	if cfg.Run.ValidationEnabled {
-		runtime.PlanPreflight = func(
-			preflightCtx context.Context,
-			scenario string,
-			statements []string,
-		) error {
-			return EnsureWorkloadPlans(preflightCtx, runtime, scenario, statements)
-		}
+	runtime.PlanPreflight = func(
+		preflightCtx context.Context,
+		scenario string,
+		statements []string,
+	) error {
+		return InspectWorkloadPlans(preflightCtx, runtime, scenario, statements)
 	}
 	runtime.ReportPhase = func(phaseCtx context.Context, scenario string, phase Phase) {
 		_, _ = db.Exec(phaseCtx, "UPDATE "+quotedSchema+".meta_runs SET phase=$1,detail=$2,updated_at=current_timestamp WHERE run_id=$3", string(phase), scenario+":"+string(phase), runID)
