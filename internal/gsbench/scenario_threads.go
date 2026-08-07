@@ -73,6 +73,18 @@ func threadSessionCapacity(instanceMax, reserved, existing, maxWorkers, maxConne
 	return max(0, min(instanceMax-reserved-existing, maxWorkers, maxConnections))
 }
 
+func physicalSessionHeadroom(instanceMax, reserved, existing int) int {
+	return max(0, instanceMax-reserved-existing)
+}
+
+func threadPressureCapacity(facts connectionCapacityFacts) int {
+	return physicalSessionHeadroom(
+		facts.InstanceMax,
+		facts.Reserved,
+		facts.Existing,
+	)
+}
+
 func threadPoolPercent(status ThreadPoolStatus) float64 {
 	if status.Actual <= 0 {
 		return 0
@@ -206,12 +218,9 @@ func (s *ThreadScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if err != nil {
 		return err
 	}
-	s.maxWorkers = threadSessionCapacity(
-		facts.InstanceMax, facts.Reserved, facts.Existing,
-		rt.Config.Safety.MaxWorkers, rt.Config.Safety.MaxConnections,
-	)
+	s.maxWorkers = threadPressureCapacity(facts)
 	if s.maxWorkers < 1 {
-		return fmt.Errorf("thread pool target is unreachable: no safe workload session capacity")
+		return fmt.Errorf("thread pool target is unreachable: no physical workload session capacity")
 	}
 	if err := validateThreadTarget(
 		status,

@@ -146,6 +146,25 @@ func TestThreadCapacityUsesWorkerTopologyAndSessionHeadroom(t *testing.T) {
 	}
 }
 
+func TestThreadPressurePhysicalHeadroomIgnoresConfiguredCaps(t *testing.T) {
+	if got := physicalSessionHeadroom(1000, 10, 100); got != 890 {
+		t.Fatalf("physical headroom=%d want=890", got)
+	}
+	if got := physicalSessionHeadroom(500, 10, 490); got != 0 {
+		t.Fatalf("exhausted headroom=%d want=0", got)
+	}
+}
+
+func TestThreadPressureCapacityLeavesCapAwareCapacityForOtherScenarios(t *testing.T) {
+	facts := connectionCapacityFacts{InstanceMax: 1000, Reserved: 10, Existing: 100}
+	if got := threadPressureCapacity(facts); got != 890 {
+		t.Fatalf("402 capacity=%d want=890", got)
+	}
+	if got := threadSessionCapacity(1000, 10, 100, 1, 1); got != 1 {
+		t.Fatalf("cap-aware capacity=%d want=1", got)
+	}
+}
+
 func TestThreadPoolPercentAndCeilingIncludeExistingBusyWorkers(t *testing.T) {
 	status := ThreadPoolStatus{Actual: 100, Idle: 20}
 	if got := threadPoolPercent(status); got != 80 {
