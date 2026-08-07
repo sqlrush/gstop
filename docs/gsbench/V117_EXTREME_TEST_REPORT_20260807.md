@@ -2,121 +2,137 @@
 
 ## Result
 
-- Automated extreme, race, package, and build verification: **PASS**.
-- Live `og5` verification from this agent sandbox: **BLOCKED BY ENVIRONMENT**.
-- The live result is not reported as PASS: the sandbox denied every TCP
-  `connect()` to `127.0.0.1:5433` with `operation not permitted` before a
-  database session was created. No database state was changed and no run ID
-  was allocated.
+- Automated, race, live database, recovery, interrupt, and downstream smoke
+  verification: **PASS**.
+- Runtime source tested: `973a37c8c41370410a4fa70e3e1d8922770dd23d`.
+- Test-harness-only follow-up: `b9467fc1c9af133de831e59fa09ef82c639915a8`.
+- Version/toolchain: `gsbench v1.1.7`, Go `1.26.5`.
+- Live target: openGauss-lite 5.0.3 standalone `og5`, endpoint
+  `127.0.0.1:5433`, dataset `gsbench_e2e_20260801_100g`.
 
-## Source and candidates
-
-- Tested source commit: `343fc494c09e973de88065e869a9a362350f09cd`.
-- Version: `gsbench v1.1.7`.
-- Toolchain: `go1.26.5`.
-- Host candidate: `/private/tmp/gsbench-v1.1.7-darwin-arm64`, Mach-O ARM64.
-- Release candidate: `/private/tmp/gsbench-v1.1.7-linux-arm64`, static Linux
-  ELF ARM64.
-- Both binaries recorded the tested revision with `vcs.modified=false`.
+The high-percentage 401/402 cases intentionally reached the database's real
+resource boundary. Their workload outcome is `FAILED` because openGauss
+returned `memory is temporarily unavailable`; gsbench did not silently lower
+the requested percentage. The acceptance condition for those cases was a
+truthful failure plus automatic `restore SUCCESS` and zero residual recovery
+state, which passed.
 
 ## Automated verification
 
 | Area | Verification | Result |
 |---|---|---|
-| 401 physical target | Baseline delta, fractional target, artificial cap removal, and 100% physical headroom | PASS |
-| 402 physical target | Physical session headroom ignores configured caps while the cap-aware helper used by other scenarios remains capped | PASS |
-| 401/402 lifecycle | Ramp target, frozen hold, lost-session/worker failure, duration timeout, cleanup, and action-free stale continuation | PASS |
-| 602 statistics fault | Baseline lookup-index plans, all three fault Seq Scan plans, verified recovery, prerequisite ordering, and single-session ANALYZE | PASS |
-| Recovery locks | Safe literal query, zero bind arguments, one physical session, reverse unlock order, partial cleanup, and idempotent close/discard | PASS |
-| Recovery retry boundary | SQLSTATE `53200` opens a fresh session and retries; `42501`, syntax, and unknown errors remain fail-closed | PASS |
-| gstop `m` dashboard | Default five-second memory refresh and former dynamic-memory gate exemption | PASS |
+| 401 target model | Baseline delta, target validation, 100% physical target, and no `safety.max_connections` clamp | PASS |
+| 402 target model | Physical worker/session target and no `safety.max_workers` or connection clamp | PASS |
+| 401/402 lifecycle | Hold, target failure, database rejection, duration cleanup, Ctrl+C cleanup, and action-free stale recovery | PASS |
+| Recovery control plane | Dedicated advisory session, zero-argument ownership query, fresh ownership retries, isolated run recovery pool, and idempotent release | PASS |
+| 602 statistics fault | Baseline unique index scan, fault full-table scan, statistics recovery, restored unique index scan, and repeated recover | PASS |
+| gstop `m` | Five-second default memory-dashboard refresh without the old dynamic-memory health gate | PASS |
+| Regression | All repository packages, vet, focused repeat tests, and race detector | PASS |
 
-Commands executed:
-
-```sh
-go test ./internal/gsbench -run 'Test(Connection|Thread|SessionAdvisory|DatabaseRunLock|ProbeDatabaseRunLock|AcquireDatabaseRestoreLock|RestoreLock|Stale|Plan.*602|Statistics)' -count=1
-go test ./internal/monitor -run 'TestMemoryMonitorRefresh' -count=1
-go test ./internal/gsbench -count=1
-go list ./... | rg -v '^gstop/cmd/gsbench$' | xargs go test -count=1
-go test ./cmd/gsbench -run TestCommandContextLeavesInterruptsToOperatingSystem -count=1
-go test ./internal/gsbench -run 'Test(ConnectionBudget|ThreadPressure|602|PoolOnlyRecovery|ContinueAfterPoolOnly|AcquireDatabaseRestoreLock|RestoreLock|SessionAdvisory|SQLAdvisory|RetryableAdvisory)' -count=50
-go test -race ./internal/gsbench -run 'Test(ConnectionBudget|ThreadPressure|602|PoolOnlyRecovery|ContinueAfterPoolOnly|AcquireDatabaseRestoreLock|RestoreLock|SessionAdvisory|SQLAdvisory|RetryableAdvisory)' -count=1
-go vet ./internal/gsbench
-```
-
-All commands above passed. A raw `go test ./...` baseline also passed every
-package except `TestGSBenchProcessExitsOnFirstInterrupt`; that test needs
-`net.Listen("127.0.0.1:0")`, which the same sandbox denies. Its non-listening
-command-context test passed as shown above.
-
-## Candidate build verification
+Final commands included:
 
 ```sh
-go build -mod=readonly -trimpath -buildvcs=true -o /private/tmp/gsbench-v1.1.7-darwin-arm64 ./cmd/gsbench
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=true -ldflags='-s -w' -o /private/tmp/gsbench-v1.1.7-linux-arm64 ./cmd/gsbench
-/private/tmp/gsbench-v1.1.7-darwin-arm64 version
-file /private/tmp/gsbench-v1.1.7-darwin-arm64 /private/tmp/gsbench-v1.1.7-linux-arm64
-go version -m /private/tmp/gsbench-v1.1.7-darwin-arm64
-go version -m /private/tmp/gsbench-v1.1.7-linux-arm64
+go test ./... -count=1
+go vet ./...
+go test ./cmd/gsbench -run '^(TestCommandContextCancelsOnFirstInterrupt|TestGSBenchSecondInterruptTerminatesBlockedDriver)$' -count=10
+go test ./internal/monitor -run '^(TestMemoryMonitorDefaultsToFiveSecondInterval|TestMemoryMonitorRefreshIgnoresDynamicMemoryHealthGate)$' -count=10
+go test -race ./internal/gsbench ./cmd/gsbench ./internal/monitor -count=1
 ```
 
-The host candidate reported v1.1.7; `file` and Go build metadata confirmed the
-requested architectures, static Linux linking, exact revision, and clean VCS
-state.
+All commands passed. Unlike the earlier restricted run, the full process test
+could bind its local listener and is now included in `go test ./...`.
 
-## Live `og5` attempt and exact limitation
+## Live configuration
 
-A temporary config copied from the deployed local config used:
+A temporary copy of the local configuration used:
 
-- endpoint `127.0.0.1:5433`;
-- schema `gsbench_e2e_20260801_100g`;
 - `safety.max_connections=1` and `safety.max_workers=1`;
-- the existing `GSBENCH_PASSWORD` environment variable; no password value was
-  printed or copied into this report.
+- runtime validation enabled;
+- existing `GSBENCH_PASSWORD` environment lookup (no password copied here);
+- normal `2s` ramp for 401, then `100ms` for bounded 402 extreme tests.
 
-The configured `database.password_config` fallback was not usable because its
-`main.db_password` value is empty, so the temporary config retained the already
-configured `password_env` mechanism.
+The cap-of-one values deliberately prove that only scenarios 401/402 ignore
+their artificial safety clamps. Scenario 602 still enforced `max_workers=1`:
+`--worker 5` was rejected, while `--worker 1` ran successfully.
 
-These baseline commands were attempted:
+## 401 connection-pool evidence
+
+| Test | Run ID | Observed result | Recovery |
+|---|---|---|---|
+| 10%, cap-of-one | `20260807T103401-1yq0s` | target 75, actual 75, 10.03%, zero errors | SUCCESS |
+| 90%, final code | `20260807T110807-1ggpo` | physical memory rejection after 614 operations | SUCCESS |
+| 100%, final code | `20260807T110820-9o30q` | physical memory rejection after 661 operations | SUCCESS |
+| target below baseline | `20260807T111207-8yahq` | rejected: target 1.0% below baseline 2.5% | SUCCESS |
+| Ctrl+C before duration | `20260807T112118-14zme` | `hold: context canceled`, 900 operations, zero workload errors | SUCCESS |
+
+Both 90% and 100% were followed by `restore --dry-run` with `runs=0 actions=0`.
+The target was never reduced to an artificial “reachable” percentage.
+
+## 402 thread-pool evidence
+
+| Test | Run ID | Observed result | Recovery |
+|---|---|---|---|
+| 10%, cap-of-one | `20260807T110952-5qvjf` | reached 10.0%; 1,106 operations; zero errors | SUCCESS |
+| 90%, final code | `20260807T111037-5iovq` | physical memory rejection; 60 recorded errors | SUCCESS |
+| 100%, final code | `20260807T111129-22uks` | physical memory rejection; 40 recorded errors | SUCCESS |
+| Ctrl+C before duration | `20260807T112957-3lvvx` | `hold: context canceled`; 5,145 operations; zero workload errors | SUCCESS |
+
+The successful 10% run reported 800 actual thread-pool workers and therefore
+could not have been clamped by the configured `safety.max_workers=1`. Each high
+pressure or interrupt case was followed by zero residual recovery state.
+
+## 602 statistics plan-change evidence
+
+Two-terminal sequence:
 
 ```sh
-/private/tmp/gsbench-v1.1.7-darwin-arm64 doctor --config /private/tmp/gsbench-v117-extreme.cfg
-/private/tmp/gsbench-v1.1.7-darwin-arm64 restore --dry-run --config /private/tmp/gsbench-v117-extreme.cfg
-/private/tmp/gsbench-v1.1.7-darwin-arm64 status --config /private/tmp/gsbench-v117-extreme.cfg
+gsbench run 602 init --worker 1 --duration 2m
+gsbench run 602 fault
+gsbench run 602 recover
+gsbench run 602 recover
 ```
 
-Each failed at TCP dial with:
+- Workload run `20260807T112612-7tynx` started with three verified
+  `plan_data_lookup_idx` index-scan candidates and completed 274,690 operations.
+- Fault run `20260807T112726-2918d` returned `plan fault SUCCESS`; its fault
+  verifier confirmed the lookup statements had changed to sequential scans.
+- Recovery restored the statistics and ANALYZE baseline, then returned
+  `plan recover SUCCESS`; its verifier confirmed the unique index scans again.
+- A second recover returned `ALREADY_RECOVERED` with exit status 0.
+
+## Bugs found during live pressure and permanent fixes
+
+The extreme run found issues that unit-only testing had not exposed:
+
+1. Recovery advisory locks previously shared a stressed pool and could lose
+   ownership. Locks now use one dedicated physical session.
+2. The openGauss v1.0.8 driver misparsed recovery prepared parameters under
+   pressure. Advisory and ownership queries now use safe literals/zero bind
+   arguments.
+3. Retrying ownership on a protocol-uncertain connection produced parameter
+   count and simple-query response errors. Failed ownership sessions are now
+   discarded and retried on fresh dedicated sessions.
+4. Later discovery still reused the workload control pool. Each run now owns a
+   separate, initially unconnected recovery control pool for the complete
+   recovery path.
+5. SIGINT previously terminated the process before Runner cleanup. The first
+   interrupt now cancels gracefully so Stop/Restore runs; signal defaults are
+   restored immediately so a second interrupt can terminate a stuck driver.
+
+Final 90%/100% and Ctrl+C reruns prove the corrected paths return
+`restore.state=restored`, `restore.outcome=SUCCESS`, and leave no pending run or
+action. Explicit restore remains available for a process killed by SIGKILL or a
+second interrupt.
+
+## Downstream and final state
+
+After all high-pressure and plan-change tests, scenario 101 run
+`20260807T113651-1r7rm` completed 3,444 operations in 10 seconds with zero
+errors and `restore SUCCESS`. The final command was:
 
 ```text
-dial tcp 127.0.0.1:5433: connect: operation not permitted
+restore SUCCESS (dry run) runs=0 actions=0
 ```
 
-No `.s.PGSQL.5433` or `.s.PGSQL.5432` Unix socket was available under `/tmp`,
-`/private/tmp`, `/var/run`, or the workspace, so there was no permitted local
-transport fallback. Consequently, live 401 cap-of-one/60/90/100, live 402,
-live 602 `init/fault/recover`, final restore/status, and downstream 101 were
-not executed from this sandbox and are deliberately not marked successful.
-
-## Required live follow-up outside the sandbox
-
-Run the dated candidate or final deployed binary from a normal terminal using
-the same temporary cap-of-one config. The required sequence remains:
-
-```sh
-gsbench doctor --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench restore --dry-run --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench run 401 --percent 10 --duration 10s --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench run 401 --percent 60 --duration 15s --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench run 401 --percent 90 --duration 15s --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench run 401 --percent 100 --duration 15s --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench restore --dry-run --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench status --config /private/tmp/gsbench-v117-extreme.cfg
-gsbench run 101 --workers 1 --duration 10s --config /private/tmp/gsbench-v117-extreme.cfg
-```
-
-Run 402 only when `doctor` confirms real `global_threadpool_status` evidence.
-Run 602 `init`, `fault`, and two `recover` calls in the documented two-terminal
-sequence. A physical resource rejection is an acceptable 401/402 fault result;
-leftover tagged sessions, recovery parameter-count errors, duplicate-close
-noise, a non-empty recovery journal, or inability to start scenario 101 are not.
+This verifies that failed pressure scenarios do not block subsequent scenarios
+and that the test database ended without pending gsbench recovery work.
