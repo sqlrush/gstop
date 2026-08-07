@@ -1257,17 +1257,43 @@ func (b *databaseRestoreBackend) ValidateRestoreOwnership(
 		// constructing a SQL pool. Production backends always carry b.db.
 		return nil
 	}
+	openSession := b.openAdvisorySession
+	if openSession == nil {
+		openSession = openAdvisoryLockSession
+	}
 	interval := b.restorePollInterval
 	if interval <= 0 {
 		interval = 200 * time.Millisecond
 	}
 	for {
-		err := validateDatasetOwnership(
+		session, err := openSession(
 			ctx,
-			dbDatasetExecutor{db: b.db, schema: b.cfg.Data.Schema},
-			b.cfg.Data.Schema,
+			b.db,
+			b.cfg.Database.ApplicationName+"/restore-ownership",
 		)
-		if err == nil || !isRetryableAdvisoryLockError(err) {
+		if err != nil {
+			err = fmt.Errorf("open restore ownership session: %w", err)
+		} else {
+			err = validateDatasetOwnership(
+				ctx,
+				&databaseRestoreLock{session: session},
+				b.cfg.Data.Schema,
+			)
+			if err == nil {
+				return wrapRestoreError(
+					"close restore ownership session",
+					session.Close(),
+				)
+			}
+			err = errors.Join(
+				err,
+				wrapRestoreError(
+					"discard failed restore ownership session",
+					session.Discard(),
+				),
+			)
+		}
+		if !isRetryableAdvisoryLockError(err) {
 			return err
 		}
 		timer := time.NewTimer(interval)

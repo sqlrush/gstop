@@ -235,6 +235,7 @@ func (l *retryRestoreTestLock) Release() error {
 
 type retryAdvisoryLockSession struct {
 	tryErr            error
+	scanErr           error
 	tryCount          int
 	unlockKeys        []string
 	scanArgumentCount []int
@@ -268,6 +269,9 @@ func (s *retryAdvisoryLockSession) Scan(
 	dest ...any,
 ) error {
 	s.scanArgumentCount = append(s.scanArgumentCount, len(args))
+	if s.scanErr != nil {
+		return s.scanErr
+	}
 	if len(args) != 0 {
 		return fmt.Errorf(
 			"got %d parameters but the statement requires 3",
@@ -989,9 +993,11 @@ func TestAcquireDatabaseRestoreLockUsesSimpleDedicatedSession(t *testing.T) {
 	}
 }
 
-func TestDatabaseRestoreOwnershipRetriesTemporaryResourceFailure(t *testing.T) {
+func TestDatabaseRestoreOwnershipUsesFreshDedicatedSessionAfterPressure(
+	t *testing.T,
+) {
 	state := &ownershipRetryTestState{
-		errors: []error{advisoryLockSQLStateError{state: "53200"}},
+		errors: []error{errors.New("stressed main pool must not be used")},
 	}
 	pool := sql.OpenDB(ownershipRetryTestConnector{state: state})
 	t.Cleanup(func() { _ = pool.Close() })
@@ -1006,16 +1012,45 @@ func TestDatabaseRestoreOwnershipRetriesTemporaryResourceFailure(t *testing.T) {
 		cfg:                 cfg,
 		restorePollInterval: time.Nanosecond,
 	}
+	sessions := []*retryAdvisoryLockSession{
+		{scanErr: advisoryLockSQLStateError{state: "53200"}},
+		{},
+	}
+	opened := 0
+	backend.openAdvisorySession = func(
+		context.Context,
+		*Database,
+		string,
+	) (advisoryLockSession, error) {
+		if opened >= len(sessions) {
+			t.Fatalf("unexpected ownership session open %d", opened+1)
+		}
+		session := sessions[opened]
+		opened++
+		return session, nil
+	}
 	if err := backend.ValidateRestoreOwnership(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if state.attempts != 2 {
-		t.Fatalf("ownership attempts=%d want=2", state.attempts)
+	if state.attempts != 0 {
+		t.Fatalf("main-pool ownership attempts=%d want=0", state.attempts)
 	}
-	if !reflect.DeepEqual(state.argumentCount, []int{0, 0}) {
+	if opened != 2 || sessions[0].discarded != 1 ||
+		sessions[0].closed != 0 || sessions[1].closed != 1 ||
+		sessions[1].discarded != 0 {
 		t.Fatalf(
-			"ownership argument counts=%v want=[0 0]",
-			state.argumentCount,
+			"opened=%d first=%+v second=%+v",
+			opened,
+			sessions[0],
+			sessions[1],
+		)
+	}
+	if !reflect.DeepEqual(sessions[0].scanArgumentCount, []int{0}) ||
+		!reflect.DeepEqual(sessions[1].scanArgumentCount, []int{0}) {
+		t.Fatalf(
+			"ownership argument counts first=%v second=%v want=[0],[0]",
+			sessions[0].scanArgumentCount,
+			sessions[1].scanArgumentCount,
 		)
 	}
 }
