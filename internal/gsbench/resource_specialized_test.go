@@ -69,13 +69,13 @@ func TestConnectionChurnReportsCloseFailure(t *testing.T) {
 	}
 }
 
-func TestPressureTargetsExceedConfiguredCapacityWithinSafetyCap(t *testing.T) {
+func TestPressureTargetsIgnoreLegacySafetyCap(t *testing.T) {
 	target, err := resourcePressureTarget(404, 4, 8)
 	if err != nil || target != 5 {
 		t.Fatalf("thread target=%d err=%v", target, err)
 	}
-	if _, err := resourcePressureTarget(404, 4, 4); err == nil || !strings.Contains(err.Error(), "unreachable") {
-		t.Fatalf("thread queue capacity error=%v", err)
+	if target, err := resourcePressureTarget(404, 4, 4); err != nil || target != 5 {
+		t.Fatalf("thread queue target=%d error=%v", target, err)
 	}
 	if _, err := resourcePressureTarget(405, 2, 6); err == nil {
 		t.Fatal("deferred pooler scenario still has a reachable pressure target")

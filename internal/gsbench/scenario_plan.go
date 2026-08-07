@@ -126,7 +126,12 @@ func minimumPlanDataRows(string) int64 {
 
 func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if err := validatePlanCapability(s.Name(), rt.Capabilities); err != nil {
-		return err
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capability", Object: "plan_scenario",
+			Actual: err.Error(), Expected: "catalog_capability_available",
+			Impact: "scenario_will_attempt_execution",
+		})
 	}
 	s.minimum = runtimeFloat(rt, "scenario."+s.Name()+".minimum_slowdown",
 		runtimeFloat(rt, "scenario.plan_change.minimum_slowdown",
@@ -138,10 +143,6 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if s.workers < 1 {
 		s.workers = 1
 	}
-	if maximum := rt.Config.Safety.MaxWorkers; maximum > 0 && s.workers > maximum {
-		s.workers = maximum
-	}
-
 	minimumRows := minimumPlanDataRows(rt.Config.Run.Profile)
 	quotedSchema, ok := quoteDatasetSchema(rt.Config.Data.Schema)
 	if !ok {
@@ -155,10 +156,13 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		return fmt.Errorf("read plan_data high-water: %w", err)
 	}
 	if rows < minimumRows {
-		return fmt.Errorf(
-			"plan_data has %d rows; need at least %d for profile %s; run gsbench init",
-			rows, minimumRows, rt.Config.Run.Profile,
-		)
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "data_volume", Object: "plan_data",
+			Actual:   fmt.Sprintf("rows=%d", rows),
+			Expected: fmt.Sprintf("rows>=%d", minimumRows),
+			Impact:   "plan_change_may_be_less_visible",
+		})
 	}
 
 	if len(s.def.Candidates) == 0 {

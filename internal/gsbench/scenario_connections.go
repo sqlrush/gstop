@@ -43,17 +43,11 @@ func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent in
 	if existing < 0 {
 		return ConnectionBudget{}, fmt.Errorf("existing connections must not be negative")
 	}
-	if targetPercent < 1 || targetPercent > 100 {
-		return ConnectionBudget{}, fmt.Errorf("connection target percent must be between 1 and 100")
+	if targetPercent < 1 {
+		return ConnectionBudget{}, fmt.Errorf("connection target percent must be positive")
 	}
 	usable := instanceMax - reserved
 	baselinePercent := float64(existing) / float64(usable) * 100
-	if float64(targetPercent) <= baselinePercent {
-		return ConnectionBudget{}, fmt.Errorf(
-			"connection target %.1f%% must be above baseline %.1f%%",
-			float64(targetPercent), baselinePercent,
-		)
-	}
 	desired := int(math.Ceil(float64(usable) * float64(targetPercent) / 100))
 	needed := max(0, desired-existing)
 	headroom := max(0, usable-existing)
@@ -67,18 +61,6 @@ func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent in
 		BaselinePercent: baselinePercent,
 		CeilingPercent:  ceilingPercent, Limited: reachable < desired,
 	}, nil
-}
-
-func validateConnectionBudget(budget ConnectionBudget) error {
-	if budget.Limited || budget.ReachableTotal < budget.DesiredTotal {
-		return fmt.Errorf(
-			"connection target is unreachable: target=%d reachable=%d ceiling=%.1f%%",
-			budget.DesiredTotal,
-			budget.ReachableTotal,
-			budget.CeilingPercent,
-		)
-	}
-	return nil
 }
 
 type connectionCapacityFacts struct {
@@ -169,8 +151,23 @@ func (s *ConnectionScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if err != nil {
 		return err
 	}
-	if err := validateConnectionBudget(s.budget); err != nil {
-		return err
+	if float64(s.targetPercent) <= s.budget.BaselinePercent {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_pool_target",
+			Actual:   fmt.Sprintf("baseline=%.1f%% target=%d%%", s.budget.BaselinePercent, s.targetPercent),
+			Expected: "target_above_baseline",
+			Impact:   "no_additional_sessions_requested",
+		})
+	}
+	if s.budget.Limited {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_pool_target",
+			Actual:   fmt.Sprintf("reachable=%.1f%% target=%d%%", s.budget.CeilingPercent, s.targetPercent),
+			Expected: fmt.Sprintf("%d%%", s.targetPercent),
+			Impact:   "target_may_not_be_reached",
+		})
 	}
 	s.idlePercent = runtimeInt(rt, "scenario.connection_pool.idle_percent", 60)
 	s.idleTxnPercent = runtimeInt(rt, "scenario.connection_pool.idle_in_transaction_percent", 20)
@@ -244,14 +241,7 @@ func (s *ConnectionScenario) acceptRampSample(total, tagged int) error {
 	if err := s.acceptFrozenSample(total, tagged); err != nil {
 		return err
 	}
-	if total < s.budget.DesiredTotal {
-		return fmt.Errorf(
-			"connection_pool target was not reached: actual=%d target=%d",
-			total,
-			s.budget.DesiredTotal,
-		)
-	}
-	s.targetReached = true
+	s.targetReached = total >= s.budget.DesiredTotal
 	return nil
 }
 

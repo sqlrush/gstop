@@ -428,7 +428,7 @@ func TestTotalMemoryScenarioUsesBoundedWorkerStrategy(t *testing.T) {
 	}
 }
 
-func TestTotalMemoryScenarioUsesConfiguredWorkerBudgetAndRejectsUnsafeTarget(t *testing.T) {
+func TestTotalMemoryScenarioUsesConfiguredWorkerBudgetWithoutLegacyCap(t *testing.T) {
 	defaults, err := LoadConfig(writeTestConfig(t, minimalConfig()), Overrides{})
 	if err != nil {
 		t.Fatal(err)
@@ -475,8 +475,15 @@ max_workers = 2
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := newTotalMemoryScenario("memory_total_pressure").Prepare(context.Background(), &Runtime{Config: unsafe, Database: &Database{}}); err == nil {
-		t.Fatal("memory worker target exceeding the safety maximum was accepted")
+	uncapped := newTotalMemoryScenario("memory_total_pressure")
+	if err := uncapped.Prepare(context.Background(), &Runtime{Config: unsafe, Database: &Database{}}); err != nil {
+		t.Fatalf("legacy safety maximum blocked target: %v", err)
+	}
+	if uncapped.target != 3 {
+		t.Fatalf("uncapped memory workers=%d want=3", uncapped.target)
+	}
+	if err := uncapped.Stop(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -17,6 +17,7 @@ type MemoryScenario struct {
 	control  ControlResult
 	target   float64
 	real     bool
+	workers  int
 }
 
 func NewMemoryScenario() *MemoryScenario { return &MemoryScenario{} }
@@ -27,8 +28,13 @@ func (s *MemoryScenario) Name() string { return "dynamic_memory" }
 func (s *MemoryScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	s.target = float64(runtimeInt(rt, "scenario.dynamic_memory.target_percent", 90))
 	s.real = rt.Capabilities.DynamicMemoryView
+	s.workers = runtimeInt(
+		rt,
+		"scenario.dynamic_memory.workers",
+		max(1, rt.Config.FixedWorkers.APWorkers),
+	)
 	statements := DynamicMemoryStatements(rt.Config.Data.Schema)
-	s.workload = newSQLWorkload(ctx, rt, s.Name(), rt.Config.Safety.MaxWorkers, func(ctx context.Context, conn *sql.Conn, workerID int) error {
+	s.workload = newSQLWorkload(ctx, rt, s.Name(), s.workers, func(ctx context.Context, conn *sql.Conn, workerID int) error {
 		if _, err := conn.ExecContext(ctx, "SET work_mem='256MB'"); err != nil {
 			return err
 		}
@@ -70,7 +76,7 @@ func (s *MemoryScenario) sample(ctx context.Context, rt *Runtime) Sample {
 	return Sample{Available: true, Value: used / maximum * 100, Errors: s.workload.Snapshot().Errors}
 }
 func (s *MemoryScenario) Ramp(ctx context.Context, rt *Runtime) error {
-	c := Controller{Config: ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: rt.Config.Safety.MaxWorkers, Step: 1, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval}, Actuator: s.workload, Sample: func(ctx context.Context) Sample { return s.sample(ctx, rt) }}
+	c := Controller{Config: ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: s.workers, Step: 1, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval}, Actuator: s.workload, Sample: func(ctx context.Context) Sample { return s.sample(ctx, rt) }}
 	s.control = c.Run(ctx)
 	return s.control.Err
 }

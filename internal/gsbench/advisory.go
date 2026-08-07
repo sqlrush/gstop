@@ -103,6 +103,18 @@ func logDeprecatedConfigWarnings(cfg BenchConfig, log *RunLog) {
 	}
 }
 
+func runtimeWarn(runtime *Runtime, warning PrecheckWarning) {
+	if runtime == nil {
+		return
+	}
+	if runtime.ReportWarning != nil {
+		runtime.ReportWarning(warning)
+	}
+	if runtime.Log != nil {
+		runtime.Log.Warn("%s", warning.LogLine())
+	}
+}
+
 func (c *AdvisoryCollector) Report(warning PrecheckWarning) {
 	if c == nil {
 		return

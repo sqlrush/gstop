@@ -105,39 +105,6 @@ func threadUtilizationCeilingFromBaseline(
 		float64(status.Actual) * 100
 }
 
-func validateThreadTarget(
-	status ThreadPoolStatus,
-	target int,
-	newSessions int,
-) error {
-	baseline := threadPoolPercent(status)
-	if float64(target) <= baseline {
-		return fmt.Errorf(
-			"thread_pool target %.1f%% must be above baseline %.1f%%",
-			float64(target),
-			baseline,
-		)
-	}
-	ceiling := threadUtilizationCeilingFromBaseline(status, newSessions)
-	if ceiling < float64(target) {
-		return fmt.Errorf(
-			"thread_pool target %.1f%% is unreachable; ceiling %.1f%%",
-			float64(target),
-			ceiling,
-		)
-	}
-	return nil
-}
-
-func requireRealThreadPoolEvidence(real bool) error {
-	if !real {
-		return fmt.Errorf(
-			"thread pool percentage target requires global_threadpool_status",
-		)
-	}
-	return nil
-}
-
 func sampleThreadPoolStatus(ctx context.Context, rt *Runtime) (ThreadPoolStatus, error) {
 	rows, err := rt.Database.Query(ctx, "SELECT worker_info FROM dbe_perf.global_threadpool_status")
 	if err != nil {
@@ -172,6 +139,7 @@ type ThreadScenario struct {
 	frozenWorkers   int
 	capacityCeiling float64
 	lastStatus      ThreadPoolStatus
+	noAdditional    bool
 }
 
 func NewThreadScenario() *ThreadScenario { return &ThreadScenario{} }
@@ -205,29 +173,74 @@ func (s *ThreadScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		}
 		s.real = true
 	}
-	if err := requireRealThreadPoolEvidence(s.real); err != nil {
-		return err
+	if !s.real {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "thread_pool_metric", Object: "global_threadpool_status",
+			Actual: "unavailable", Expected: "available",
+			Impact: "active_backend_fallback_will_be_used",
+		})
 	}
-	status, err := sampleThreadPoolStatus(ctx, rt)
-	if err != nil {
-		return err
+	status := ThreadPoolStatus{}
+	if s.real {
+		var err error
+		status, err = sampleThreadPoolStatus(ctx, rt)
+		if err != nil {
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "thread_pool_metric", Object: "global_threadpool_status",
+				Actual: err.Error(), Expected: "readable_worker_status",
+				Impact: "active_backend_fallback_will_be_used",
+			})
+			s.real = false
+			s.strategy = "active_backend_fallback"
+		}
 	}
 	s.lastStatus = status
 	s.target = float64(rt.Config.PoolTargets.ThreadPercent)
 	facts, err := probeConnectionCapacity(ctx, rt)
 	if err != nil {
-		return err
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_headroom",
+			Actual: err.Error(), Expected: "readable_capacity",
+			Impact: "requested_percent_will_be_used_as_session_budget",
+		})
+		s.maxWorkers = max(1, int(s.target))
+	} else {
+		s.maxWorkers = threadPressureCapacity(facts)
 	}
-	s.maxWorkers = threadPressureCapacity(facts)
 	if s.maxWorkers < 1 {
-		return fmt.Errorf("thread pool target is unreachable: no physical workload session capacity")
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_headroom",
+			Actual: "0", Expected: ">=1",
+			Impact: "one_session_will_be_attempted",
+		})
+		s.maxWorkers = 1
 	}
-	if err := validateThreadTarget(
-		status,
-		int(s.target),
-		s.maxWorkers,
-	); err != nil {
-		return err
+	if s.real {
+		baseline := threadPoolPercent(status)
+		s.noAdditional = s.target <= baseline
+		if s.noAdditional {
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "capacity", Object: "thread_pool_target",
+				Actual:   fmt.Sprintf("baseline=%.1f%% target=%.1f%%", baseline, s.target),
+				Expected: "target_above_baseline",
+				Impact:   "no_additional_sessions_requested",
+			})
+		}
+		ceiling := threadUtilizationCeilingFromBaseline(status, s.maxWorkers)
+		if ceiling < s.target {
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "capacity", Object: "thread_pool_target",
+				Actual:   fmt.Sprintf("ceiling=%.1f%% target=%.1f%%", ceiling, s.target),
+				Expected: fmt.Sprintf("%.1f%%", s.target),
+				Impact:   "target_may_not_be_reached",
+			})
+		}
 	}
 	s.capacityCeiling = threadUtilizationCeilingFromBaseline(
 		status,
@@ -255,10 +268,38 @@ func (s *ThreadScenario) sample(ctx context.Context, rt *Runtime) Sample {
 	return Sample{Available: true, Value: threadPoolPercent(status)}
 }
 func (s *ThreadScenario) Ramp(ctx context.Context, rt *Runtime) error {
+	if s.noAdditional {
+		s.control = ControlResult{
+			Actual: threadPoolPercent(s.lastStatus), Reached: true,
+		}
+		s.frozenWorkers = 0
+		return nil
+	}
+	if !s.real {
+		requested := max(1, int(float64(s.maxWorkers)*min(s.target, 100)/100))
+		if err := s.workload.SetTarget(requested); err != nil {
+			return err
+		}
+		s.frozenWorkers = requested
+		s.control = ControlResult{
+			Workers: requested,
+			Actual:  float64(requested),
+			Ceiling: s.target > 100,
+		}
+		return nil
+	}
 	c := Controller{Config: ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: s.maxWorkers, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval}, Actuator: s.workload, Sample: func(ctx context.Context) Sample { return s.sample(ctx, rt) }}
 	s.control = c.RunToMinimum(ctx)
-	if err := threadTargetControlError(s.control, s.target); err != nil {
+	if err := workerSnapshotError(s.workload.Snapshot()); err != nil {
 		return err
+	}
+	if s.control.Err != nil {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "runtime_target", Object: "thread_pool_target",
+			Actual: s.control.Err.Error(), Expected: fmt.Sprintf("%.1f%%", s.target),
+			Impact: "workers_frozen_at_reached_level",
+		})
 	}
 	s.frozenWorkers = s.control.Workers
 	return nil

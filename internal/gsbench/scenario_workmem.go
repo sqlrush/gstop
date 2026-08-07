@@ -90,11 +90,8 @@ func (s *workMemScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		return sql.ErrConnDone
 	}
 	s.workers, s.targetKB = s.configuredPressure(rt.Config)
-	if s.workers <= 0 || s.workers > rt.Config.Safety.MaxWorkers {
-		return fmt.Errorf(
-			"%s workers %d exceed safety range 1..%d",
-			s.Name(), s.workers, rt.Config.Safety.MaxWorkers,
-		)
+	if s.workers <= 0 {
+		return fmt.Errorf("%s workers must be positive", s.Name())
 	}
 	if s.targetKB < minWorkMemKB {
 		return fmt.Errorf("%s work_mem must be at least %dkB", s.Name(), minWorkMemKB)

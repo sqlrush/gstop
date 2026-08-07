@@ -76,9 +76,10 @@ type RunSummary struct {
 }
 
 type Runner struct {
-	runtime   *Runtime
-	catalog   *ScenarioCatalog
-	factories map[ScenarioCode]ScenarioFactory
+	runtime    *Runtime
+	catalog    *ScenarioCatalog
+	factories  map[ScenarioCode]ScenarioFactory
+	advisories *AdvisoryCollector
 }
 
 type workloadBarrier struct {
@@ -95,12 +96,21 @@ func NewRunner(
 		runtime = &Runtime{}
 	}
 	runtime.Catalog = catalog
+	advisories := &AdvisoryCollector{}
+	externalWarningReporter := runtime.ReportWarning
+	runtime.ReportWarning = func(warning PrecheckWarning) {
+		advisories.Report(warning)
+		if externalWarningReporter != nil {
+			externalWarningReporter(warning)
+		}
+	}
 	registered := make(map[ScenarioCode]ScenarioFactory, len(factories))
 	for code, factory := range factories {
 		registered[code] = factory
 	}
 	return &Runner{
 		runtime: runtime, catalog: catalog, factories: registered,
+		advisories: advisories,
 	}
 }
 
@@ -344,7 +354,6 @@ func (r *Runner) runOne(
 		Outcome:      OutcomeSuccess,
 		StartedAt:    startedAt,
 	}
-	var warnings []PrecheckWarning
 	warn := func(check, object, actual, expected, impact string) {
 		warning := PrecheckWarning{
 			ScenarioCode: definition.Code,
@@ -355,13 +364,7 @@ func (r *Runner) runOne(
 			Expected:     expected,
 			Impact:       impact,
 		}
-		warnings = append(warnings, warning)
-		if r.runtime.ReportWarning != nil {
-			r.runtime.ReportWarning(warning)
-		}
-		if r.runtime.Log != nil {
-			r.runtime.Log.Warn("%s", warning.LogLine())
-		}
+		runtimeWarn(r.runtime, warning)
 	}
 	executionFailed := false
 	fail := func(phase Phase, err error) {
@@ -570,6 +573,7 @@ func (r *Runner) runOne(
 			}
 		}
 	}
+	warnings := r.advisories.Scenario(definition.Code)
 	for _, warning := range warnings {
 		result.Evidence = append(result.Evidence, warning.Evidence())
 	}

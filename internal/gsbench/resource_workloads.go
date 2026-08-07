@@ -142,6 +142,7 @@ type resourceScenario struct {
 	memoryMu          sync.Mutex
 	memoryObjects     map[int][]string
 	memoryObjectCount int
+	workerCapacity    int
 }
 
 func newResourceScenario(code ScenarioCode, name string) *resourceScenario {
@@ -183,7 +184,8 @@ func (s *resourceScenario) Prepare(ctx context.Context, rt *Runtime) error {
 			return err
 		}
 	}
-	s.workers = newSQLWorkloadWithCleanup(ctx, rt, s.name, rt.Config.Safety.MaxWorkers, s.operation(rt), func(ctx context.Context, conn *sql.Conn, _ int) error {
+	workerCapacity := max(1, s.workerCapacity)
+	s.workers = newSQLWorkloadWithCleanup(ctx, rt, s.name, workerCapacity, s.operation(rt), func(ctx context.Context, conn *sql.Conn, _ int) error {
 		var cleanupErrors []error
 		for _, statement := range strings.Split(s.workload.Cleanup, ";") {
 			if statement = strings.TrimSpace(statement); statement != "" {
@@ -520,8 +522,8 @@ func (s *connectionChurnScenario) Prepare(ctx context.Context, rt *Runtime) erro
 	}
 	s.workSQL = workload
 	s.target = runtimeInt(rt, "scenario.connection_churn.workers", 1)
-	if s.target < 1 || s.target > rt.Config.Safety.MaxWorkers {
-		return fmt.Errorf("connection churn workers %d exceed safety maximum %d", s.target, rt.Config.Safety.MaxWorkers)
+	if s.target < 1 {
+		return fmt.Errorf("connection churn workers must be positive")
 	}
 	s.op = newConnectionChurnOperation(workload.Statement, func(opCtx context.Context, sequence int64) (churnConnection, error) {
 		conn, err := rt.Database.OpenTagged(opCtx, rt.RunID, s.name, "churn-"+strconv.FormatInt(sequence, 10))
@@ -530,7 +532,7 @@ func (s *connectionChurnScenario) Prepare(ctx context.Context, rt *Runtime) erro
 		}
 		return taggedChurnConnection{tagged: conn}, nil
 	})
-	s.group = NewWorkerGroup(ctx, rt.Config.Safety.MaxWorkers, s.op.Run)
+	s.group = NewWorkerGroup(ctx, s.target, s.op.Run)
 	return nil
 }
 
@@ -572,14 +574,10 @@ func resourcePressureTarget(code ScenarioCode, capacity, safetyMaximum int) (int
 	if code != 404 {
 		return 0, fmt.Errorf("scenario %d has no multi-session pressure target", code)
 	}
-	if capacity < 1 || safetyMaximum < 1 {
-		return 0, fmt.Errorf("resource pressure capacity and safety maximum must be positive")
+	if capacity < 1 {
+		return 0, fmt.Errorf("resource pressure capacity must be positive")
 	}
-	target := capacity + 1
-	if target > safetyMaximum {
-		return 0, fmt.Errorf("thread queue target is unreachable: actual workers=%d require=%d session ceiling=%d", capacity, target, safetyMaximum)
-	}
-	return target, nil
+	return capacity + 1, nil
 }
 
 type resourcePressureScenario struct {
@@ -589,6 +587,7 @@ type resourcePressureScenario struct {
 	sessionCeiling int
 	established    int
 	peakPending    int
+	metricWarned   bool
 }
 
 func newResourcePressureScenario(code ScenarioCode, name string) *resourcePressureScenario {
@@ -605,17 +604,43 @@ func (s *resourcePressureScenario) Prepare(ctx context.Context, rt *Runtime) err
 	}
 	status, err := sampleThreadPoolStatus(ctx, rt)
 	if err != nil {
-		return fmt.Errorf("thread queue actual worker status is unavailable: %w", err)
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "thread_pool_metric", Object: "global_threadpool_status",
+			Actual: err.Error(), Expected: "readable_worker_status",
+			Impact: "one_worker_plus_one_session_will_be_attempted",
+		})
+		s.metricWarned = true
+		status = ThreadPoolStatus{Actual: 1}
 	}
 	facts, err := probeConnectionCapacity(ctx, rt)
 	if err != nil {
-		return err
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_headroom",
+			Actual: err.Error(), Expected: "readable_capacity",
+			Impact: "requested_sessions_will_still_be_attempted",
+		})
 	}
-	sessionCeiling := threadSessionCapacity(facts.InstanceMax, facts.Reserved, facts.Existing, rt.Config.Safety.MaxWorkers, rt.Config.Safety.MaxConnections)
+	sessionCeiling := physicalSessionHeadroom(
+		facts.InstanceMax,
+		facts.Reserved,
+		facts.Existing,
+	)
 	target, err := resourcePressureTarget(s.code, status.Actual, sessionCeiling)
 	if err != nil {
 		return err
 	}
+	if sessionCeiling < target {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "thread_queue_sessions",
+			Actual:   fmt.Sprintf("ceiling=%d target=%d", sessionCeiling, target),
+			Expected: fmt.Sprintf(">=%d", target),
+			Impact:   "target_may_not_be_reached",
+		})
+	}
+	s.resourceScenario.workerCapacity = target
 	if err := s.resourceScenario.Prepare(ctx, rt); err != nil {
 		return err
 	}
@@ -659,7 +684,15 @@ func (s *resourcePressureScenario) waitForSessions(ctx context.Context, rt *Runt
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fmt.Errorf("thread queue target is unreachable: established sessions=%d require=%d actual workers=%d session ceiling=%d", established, s.target, s.status.Actual, s.sessionCeiling)
+			s.established = established
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "runtime_target", Object: "thread_queue_sessions",
+				Actual:   fmt.Sprintf("established=%d target=%d", established, s.target),
+				Expected: fmt.Sprintf("%d", s.target),
+				Impact:   "established_sessions_will_be_held",
+			})
+			return nil
 		case <-ticker.C:
 		}
 	}
@@ -689,11 +722,20 @@ func (s *resourcePressureScenario) Hold(ctx context.Context, rt *Runtime) error 
 		}
 		status, err := sampleThreadPoolStatus(ctx, rt)
 		if err != nil {
-			return err
-		}
-		s.status = status
-		if status.Pending > s.peakPending {
-			s.peakPending = status.Pending
+			if !s.metricWarned {
+				runtimeWarn(rt, PrecheckWarning{
+					ScenarioCode: s.Code(), Scenario: s.Name(),
+					Check: "thread_pool_metric", Object: "global_threadpool_status",
+					Actual: err.Error(), Expected: "readable_worker_status",
+					Impact: "session_workload_continues_without_pending_metric",
+				})
+				s.metricWarned = true
+			}
+		} else {
+			s.status = status
+			if status.Pending > s.peakPending {
+				s.peakPending = status.Pending
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -818,8 +860,8 @@ func (s *totalMemoryScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		return sql.ErrConnDone
 	}
 	target := runtimeInt(rt, "scenario.memory_total_pressure.workers", 4)
-	if target < 1 || target > rt.Config.Safety.MaxWorkers {
-		return fmt.Errorf("memory pressure workers %d exceed safety maximum %d", target, rt.Config.Safety.MaxWorkers)
+	if target < 1 {
+		return fmt.Errorf("memory pressure workers must be positive")
 	}
 	plan, err := memoryLifecycleFor(s.Code())
 	if err != nil {
@@ -828,6 +870,7 @@ func (s *totalMemoryScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	for _, code := range plan.AllocationCodes {
 		definition := DefaultScenarioCatalog().MustCode(code)
 		child := newResourceScenario(code, s.name+"_"+definition.Name)
+		child.workerCapacity = target
 		if err := child.Prepare(ctx, rt); err != nil {
 			return err
 		}

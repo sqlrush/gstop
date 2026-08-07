@@ -463,8 +463,15 @@ func commandPlanRunAction(
 		return 1
 	}
 	if err := validatePlanCapability(definition.Name, caps); err != nil {
-		log.Error("plan scenario capability: %v", err)
-		return 1
+		log.Warn("%s", (PrecheckWarning{
+			ScenarioCode: definition.Code,
+			Scenario:     definition.Name,
+			Check:        "capability",
+			Object:       "plan_scenario",
+			Actual:       err.Error(),
+			Expected:     "catalog_capability_available",
+			Impact:       "plan_action_will_attempt_execution",
+		}).LogLine())
 	}
 	backend, err := newDatabasePlanActionBackend(db, cfg, log)
 	if err != nil {
@@ -530,18 +537,6 @@ func runPlanInit(
 ) int {
 	if workers <= 0 {
 		log.Error("plan init workers must be positive")
-		return 1
-	}
-	if maximum := cfg.Safety.MaxWorkers; maximum > 0 && workers > maximum {
-		log.Error("plan init workers=%d exceed safety.max_workers=%d", workers, maximum)
-		return 1
-	}
-	if maximum := cfg.Safety.MaxConnections; maximum > 0 && workers > maximum {
-		log.Error(
-			"plan init workers=%d exceed safety.max_connections=%d",
-			workers,
-			maximum,
-		)
 		return 1
 	}
 	if cfg.Run.Duration <= 0 {

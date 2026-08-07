@@ -154,17 +154,17 @@ func TestConnectionFrozenSampleFailsWhenInjectedSessionIsLost(t *testing.T) {
 	}
 }
 
-func TestConnectionRampSampleMustReachTargetOnce(t *testing.T) {
+func TestConnectionRampSampleKeepsUnreachedTargetAdvisory(t *testing.T) {
 	scenario := &ConnectionScenario{budget: ConnectionBudget{
 		UsableCapacity: 100,
 		DesiredTotal:   90,
 		WorkloadTarget: 10,
 	}}
-	if err := scenario.acceptRampSample(90, 10); err != nil {
-		t.Fatal(err)
+	if err := scenario.acceptRampSample(89, 10); err != nil {
+		t.Fatalf("unreached target blocked ramp: %v", err)
 	}
-	if err := scenario.acceptRampSample(89, 10); err == nil {
-		t.Fatal("ramp accepted an unreached total target")
+	if scenario.targetReached {
+		t.Fatal("unreached target was recorded as reached")
 	}
 }
 

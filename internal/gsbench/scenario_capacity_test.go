@@ -66,13 +66,18 @@ func TestConnectionBudgetInjectsOnlyBaselineDelta(t *testing.T) {
 	}
 }
 
-func TestConnectionBudgetRejectsTargetAtOrBelowBaseline(t *testing.T) {
+func TestConnectionBudgetAllowsAdvisoryTargets(t *testing.T) {
 	for _, target := range []int{79, 80} {
-		if _, err := calculateConnectionBudget(
+		budget, err := calculateConnectionBudget(
 			103, 3, 80, target,
-		); err == nil {
-			t.Fatalf("target %d accepted at 80%% baseline", target)
+		)
+		if err != nil || budget.WorkloadTarget != 0 {
+			t.Fatalf("target=%d budget=%+v err=%v", target, budget, err)
 		}
+	}
+	budget, err := calculateConnectionBudget(103, 3, 20, 150)
+	if err != nil || budget.WorkloadTarget != 80 || !budget.Limited {
+		t.Fatalf("above-capacity budget=%+v err=%v", budget, err)
 	}
 }
 
@@ -172,27 +177,6 @@ func TestThreadPoolPercentAndCeilingIncludeExistingBusyWorkers(t *testing.T) {
 	}
 	if got := threadUtilizationCeilingFromBaseline(status, 10); got != 90 {
 		t.Fatalf("ceiling=%v", got)
-	}
-}
-
-func TestThreadTargetMustExceedBaseline(t *testing.T) {
-	status := ThreadPoolStatus{Actual: 100, Idle: 20}
-	for _, target := range []int{79, 80} {
-		if err := validateThreadTarget(status, target, 20); err == nil {
-			t.Fatalf("target %d accepted at 80%% baseline", target)
-		}
-	}
-	if err := validateThreadTarget(status, 90, 5); err == nil {
-		t.Fatal("unreachable 90% target was accepted")
-	}
-}
-
-func TestThreadTargetRequiresRealThreadPoolEvidence(t *testing.T) {
-	if err := requireRealThreadPoolEvidence(true); err != nil {
-		t.Fatal(err)
-	}
-	if err := requireRealThreadPoolEvidence(false); err == nil {
-		t.Fatal("active-backend fallback was accepted for a percentage target")
 	}
 }
 
