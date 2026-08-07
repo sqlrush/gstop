@@ -1,6 +1,6 @@
 # gstop (Go)
 
-当前版本：**gstop v1.6.3 / gsbench v1.1.7**
+当前版本：**gstop v1.6.3 / gsbench v1.1.8**
 
 GaussDB / openGauss 实时监控与应急诊断终端工具 —— 原 Python 工具
 [gausstop](https://gitee.com/sqlrush/gausstop)（`gstop_ABC_1.4` 分支，作者：吴海存）的
@@ -95,9 +95,10 @@ docs/gsbench/         gsbench 操作手册
 六种独立执行计划跳变、锁堆积和 vacuum 性能问题。所有敏感变更先写恢复日志；支持
 `doctor/init/run/status/stop/restore/cleanup` 生命周期与管理员/普通用户双路径。
 
-401/402 的百分比目标按数据库物理会话余量加压，不受配置中的人工
-`safety.max_connections/max_workers` 上限限制；其他场景仍保留这些安全上限。数据库真实
-资源拒绝仍返回失败。运行锁与恢复锁使用独立单连接会话，并只对已知临时连接/资源错误重连。
+gsbench v1.1.8 将产品/拓扑、容量、数据、元数据和执行计划检查全部改为告警：不自动优化，
+不使用人工策略上限阻挡场景。真实 SQL、连接或故障注入错误只使当前场景失败，后续场景继续。
+`restore` 展示所有场景恢复 DDL/DML，`run 601-606 recover` 只展示对应场景；两者都不执行。
+未显式指定索引方法时，`btree` 与 Ustore 的 `ubtree` 兼容。
 
 场景 2/3 的 AP 慢 SQL默认只输入 100 万事实表行，CPU 目标为 70%；独立 AP 最大并发
 8，混合场景总并发最大 20、AP 最大 4。AP 不设单 SQL超时，run 结束时通过取消并关闭
@@ -114,13 +115,13 @@ export GSBENCH_PASSWORD='数据库密码'
 ./gsbench doctor
 ./gsbench init --profile quick
 ./gsbench init --size 100GB
-./gsbench run -s 1,2,8 -d 5m
-./gsbench run -s 10 -d 2m
-./gsbench run -s 11,12,13,14,15 -d 2m
+./gsbench run -s 101,102 -d 5m
+./gsbench run 401 --percent 90 -d 2m
+./gsbench run 601 recover
 ./gsbench restore
 ```
 
-`-s` 等价于 `--scenario`，`-d` 等价于 `--duration`；场景支持 `1–15` 编号、别名和完整名称混用，其中 `7` 是 `11` 的兼容入口。计划跳变慢 SQL 使用固定字面量且数据由 `init` 自动生成。`-c/--config` 仍保留兼容。
+`-s` 等价于 `--scenario`，`-d` 等价于 `--duration`；场景使用三位编号、别名或完整名称。计划跳变慢 SQL 使用固定字面量且数据由 `init` 生成。`-c/--config` 保留兼容。
 
 `init --size` 可直接指定 1 GB–2 TiB 的初始化目标（例如 `100GB`、`1.5TB`、`2TB`），
 优先级高于 `data.max_size_gb` 和 profile 默认值。实际压测的所有可规划业务 SQL 均以完整

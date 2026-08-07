@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.1.7"
+const Version = "v1.1.8"
 
 const ConfigEnv = "GSBENCH_CONFIG"
 
@@ -141,14 +141,14 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	flags.IntVar(&options.TPWorkers, "tp-workers", 0, "fixed TP workers for scenario 103")
 	flags.IntVar(&options.APWorkers, "ap-workers", 0, "fixed AP workers for scenario 103")
 	flags.StringVar(&workMemText, "work-mem", "", "work_mem for scenarios 201/202 (kB, MB, or GB)")
-	flags.IntVar(&options.PoolPercent, "percent", 0, "target percent for scenarios 401/402 (1-100)")
+	flags.IntVar(&options.PoolPercent, "percent", 0, "positive target percent for scenarios 401/402")
 	flags.IntVar(&options.Sessions, "sessions", 0, "total holder plus waiter sessions for scenarios 501-503")
-	flags.IntVar(&options.ChainDepth, "chain-depth", 0, "row wait chain depth for scenario 501 (1-5)")
+	flags.IntVar(&options.ChainDepth, "chain-depth", 0, "positive row wait chain depth for scenario 501")
 	flags.StringVar(&options.Profile, "profile", "", "data profile")
 	flags.BoolVar(&options.DryRun, "dry-run", false, "show actions without mutation")
 	flags.BoolVar(&options.WithData, "data", false, "include benchmark data")
 	flags.StringVar(&options.RunID, "run-id", "", "specific run id")
-	flags.StringVar(&sizeText, "size", "", "target init data size (1GB-2TB)")
+	flags.StringVar(&sizeText, "size", "", "positive init data size with unit")
 	flags.StringVar(&allowRiskText, "allow-risk", "", "explicit maximum risk authorization (A, B, or C)")
 	parseArgs := append([]string(nil), args[1:]...)
 	if command == "run" && len(parseArgs) > 0 &&
@@ -606,9 +606,9 @@ func printUsage(w io.Writer) {
   gsbench run 503 --sessions N --duration DURATION
   gsbench run 601 init --worker N --duration DURATION
   gsbench run 601 fault
-  gsbench run 601 recover
-  gsbench restore [--run-id RUN_ID]
-	gsbench cleanup [--data]
+  gsbench run 601 recover              display-only recovery DDL/DML for scenario 601
+  gsbench restore [--run-id RUN_ID]    display all recovery DDL/DML; does not execute recovery SQL
+  gsbench cleanup [--data]
   gsbench init --size 100GB
 
 Options:
@@ -620,14 +620,14 @@ Options:
       --tp-workers N     fixed TP workers for scenario 103 (use with --ap-workers)
       --ap-workers N     fixed AP workers for scenario 103 (use with --tp-workers)
       --work-mem VALUE   work_mem for scenarios 201/202: integer kB, MB, or GB (minimum 64kB)
-      --percent N        target percentage for selected scenarios 401/402 (1-100)
+      --percent N        positive target percentage for selected scenarios 401/402
       --sessions N       total holder plus waiter sessions for scenarios 501-503
-      --chain-depth N    row wait chain depth for scenario 501 (1-5, default 1)
+      --chain-depth N    positive row wait chain depth for scenario 501 (default 1)
       --profile VALUE    data profile: quick or stress
       --dry-run          validate and show actions without workload mutation
-      --run-id ID        select one run for status, stop, or restore; cannot combine with cleanup --data
+      --run-id ID        select one run for status, stop, or restore display; cannot combine with cleanup --data
       --data             also remove benchmark data during cleanup
-      --size VALUE       init target data size, for example 100GB or 1.5TB (maximum 2TB)
+      --size VALUE       positive size with unit, for example 100GB or 4TB
       --allow-risk A|B|C explicitly authorize the maximum permitted scenario risk
 
 Configuration:

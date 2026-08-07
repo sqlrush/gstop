@@ -884,6 +884,22 @@ func commandRunCore(
 		runtime.Catalog,
 		DefaultScenarioFactories(),
 	).Run(ctx, cfg.Run.ScenarioCodes)
+	if err := recordRunOutcome(
+		context.WithoutCancel(parent),
+		db,
+		cfg.Data.Schema,
+		runID,
+		summary.Outcome,
+		"run completed; recovery is manual",
+	); err != nil {
+		log.Warn("%s", (PrecheckWarning{
+			Check:    "run_metadata",
+			Object:   runID,
+			Actual:   err.Error(),
+			Expected: "final_status_recorded",
+			Impact:   "run_result_is_unchanged; status_may_show_stale",
+		}).LogLine())
+	}
 	for _, result := range summary.Results {
 		if err := log.Evidence(
 			NewEvidenceEnvelope(summary.RunID, result),
@@ -3150,6 +3166,36 @@ func formatScenarioCodes(codes []ScenarioCode) string {
 	}
 	return strings.Join(values, ",")
 }
+
+type runOutcomeExecutor interface {
+	Exec(context.Context, string, ...any) (sql.Result, error)
+}
+
+func recordRunOutcome(
+	ctx context.Context,
+	executor runOutcomeExecutor,
+	schema string,
+	runID string,
+	outcome Outcome,
+	detail string,
+) error {
+	if executor == nil {
+		return fmt.Errorf("run outcome recorder is unavailable")
+	}
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+	_, err := executor.Exec(
+		ctx,
+		"UPDATE "+quotedSchema+".meta_runs "+
+			"SET phase=$1,status=$2,detail=$3,updated_at=current_timestamp "+
+			"WHERE run_id=$4",
+		string(PhaseStop), string(outcome), detail, runID,
+	)
+	return err
+}
+
 func finishRun(ctx context.Context, db *Database, schema, runID string, outcome Outcome, detail string) error {
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {

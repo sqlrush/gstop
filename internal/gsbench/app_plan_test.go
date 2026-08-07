@@ -1481,6 +1481,28 @@ func TestCleanupDataAcceptsSupportedOwnershipVersions(t *testing.T) {
 	}
 }
 
+func TestRecordRunOutcomeFinishesAtStopWithoutRestore(t *testing.T) {
+	db := &planControlTestDB{}
+	err := recordRunOutcome(
+		context.Background(), db, "gsbench", "run-1",
+		OutcomeCompletedWithWarnings, "manual recovery available",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{
+		string(PhaseStop), string(OutcomeCompletedWithWarnings),
+		"manual recovery available", "run-1",
+	} {
+		if !containsAnyString(db.execArgs, token) {
+			t.Fatalf("query=%q args=%v missing %q", db.execQuery, db.execArgs, token)
+		}
+	}
+	if containsAnyString(db.execArgs, string(PhaseRestore)) {
+		t.Fatalf("run completion reported a restore phase: args=%v", db.execArgs)
+	}
+}
+
 func TestCleanupAfterRestoreUsesProtectedLockSession(t *testing.T) {
 	log, err := NewRunLog(io.Discard, "", Version)
 	if err != nil {

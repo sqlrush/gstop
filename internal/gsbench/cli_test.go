@@ -176,7 +176,7 @@ func TestCLIVersionPrintsAuthor(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Author: WangYingJie <sqlrush@gmail.com>") {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.7\n") {
+	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.8\n") {
 		t.Fatalf("version=%q", stdout.String())
 	}
 }
@@ -229,6 +229,7 @@ func TestCLIHelpDocumentsIndependentPlanScenariosAndRestore(t *testing.T) {
 		"605=planchange_index_drop", "606=planchange_index_shape",
 		"gsbench run 601 init --worker N --duration DURATION",
 		"gsbench run 601 fault", "gsbench run 601 recover",
+		"display-only recovery DDL/DML", "does not execute recovery SQL",
 		"--worker N", "601-606 init", "--workers alias",
 	} {
 		if !strings.Contains(text, token) {
@@ -1143,10 +1144,13 @@ func TestCLIHelpDocumentsInitSize(t *testing.T) {
 	if code := RunCLI(context.Background(), []string{"help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	for _, token := range []string{"gsbench init --size 100GB", "--size VALUE", "maximum 2TB"} {
+	for _, token := range []string{"gsbench init --size 100GB", "--size VALUE", "positive size with unit"} {
 		if !strings.Contains(stdout.String(), token) {
 			t.Fatalf("help missing %q:\n%s", token, stdout.String())
 		}
+	}
+	if strings.Contains(stdout.String(), "maximum 2TB") {
+		t.Fatalf("help advertises removed size policy limit:\n%s", stdout.String())
 	}
 }
 
