@@ -30,6 +30,72 @@ type advisoryLockTestConnector struct {
 	state *advisoryLockTestState
 }
 
+type ownershipRetryTestState struct {
+	attempts int
+	errors   []error
+}
+
+type ownershipRetryTestConnector struct {
+	state *ownershipRetryTestState
+}
+
+func (c ownershipRetryTestConnector) Connect(context.Context) (driver.Conn, error) {
+	return &ownershipRetryTestConn{state: c.state}, nil
+}
+
+func (ownershipRetryTestConnector) Driver() driver.Driver {
+	return ownershipRetryTestDriver{}
+}
+
+type ownershipRetryTestDriver struct{}
+
+func (ownershipRetryTestDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("use connector")
+}
+
+type ownershipRetryTestConn struct {
+	state *ownershipRetryTestState
+}
+
+func (*ownershipRetryTestConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not supported")
+}
+
+func (*ownershipRetryTestConn) Close() error { return nil }
+
+func (*ownershipRetryTestConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not supported")
+}
+
+func (c *ownershipRetryTestConn) QueryContext(
+	context.Context,
+	string,
+	[]driver.NamedValue,
+) (driver.Rows, error) {
+	c.state.attempts++
+	if len(c.state.errors) != 0 {
+		err := c.state.errors[0]
+		c.state.errors = c.state.errors[1:]
+		return nil, err
+	}
+	return &ownershipRetryTestRows{}, nil
+}
+
+type ownershipRetryTestRows struct {
+	read bool
+}
+
+func (*ownershipRetryTestRows) Columns() []string { return []string{"value"} }
+func (*ownershipRetryTestRows) Close() error      { return nil }
+func (r *ownershipRetryTestRows) Next(dest []driver.Value) error {
+	if r.read {
+		return io.EOF
+	}
+	r.read = true
+	dest[0] = datasetVersion
+	return nil
+}
+
 func (c advisoryLockTestConnector) Connect(context.Context) (driver.Conn, error) {
 	return &advisoryLockTestConn{state: c.state}, nil
 }
@@ -896,6 +962,31 @@ func TestAcquireDatabaseRestoreLockUsesSimpleDedicatedSession(t *testing.T) {
 	}
 	if !reflect.DeepEqual(state.events, want) {
 		t.Fatalf("events=%v want=%v", state.events, want)
+	}
+}
+
+func TestDatabaseRestoreOwnershipRetriesTemporaryResourceFailure(t *testing.T) {
+	state := &ownershipRetryTestState{
+		errors: []error{advisoryLockSQLStateError{state: "53200"}},
+	}
+	pool := sql.OpenDB(ownershipRetryTestConnector{state: state})
+	t.Cleanup(func() { _ = pool.Close() })
+	cfg := BenchConfig{
+		Data:   DataConfig{Schema: "Bench"},
+		Safety: SafetyConfig{QueryTimeout: time.Second},
+	}
+	backend := &databaseRestoreBackend{
+		db: &Database{
+			cfg: cfg, ctx: context.Background(), pool: pool,
+		},
+		cfg:                 cfg,
+		restorePollInterval: time.Nanosecond,
+	}
+	if err := backend.ValidateRestoreOwnership(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state.attempts != 2 {
+		t.Fatalf("ownership attempts=%d want=2", state.attempts)
 	}
 }
 

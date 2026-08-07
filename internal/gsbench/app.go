@@ -1257,11 +1257,29 @@ func (b *databaseRestoreBackend) ValidateRestoreOwnership(
 		// constructing a SQL pool. Production backends always carry b.db.
 		return nil
 	}
-	return validateDatasetOwnership(
-		ctx,
-		dbDatasetExecutor{db: b.db, schema: b.cfg.Data.Schema},
-		b.cfg.Data.Schema,
-	)
+	interval := b.restorePollInterval
+	if interval <= 0 {
+		interval = 200 * time.Millisecond
+	}
+	for {
+		err := validateDatasetOwnership(
+			ctx,
+			dbDatasetExecutor{db: b.db, schema: b.cfg.Data.Schema},
+			b.cfg.Data.Schema,
+		)
+		if err == nil || !isRetryableAdvisoryLockError(err) {
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 var errRestoreBusy = errors.New("restore is busy")
