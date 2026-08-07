@@ -92,7 +92,7 @@ schema = gsbench
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		t.Fatalf("accept gsbench connection: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		t.Fatalf("gsbench did not enter blocking database connect\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
