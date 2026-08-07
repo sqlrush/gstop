@@ -871,7 +871,7 @@ func TestExecuteCommandCreatesDefaultLogUnderConfigDirectory(t *testing.T) {
 	}
 }
 
-func TestPreparePlanRunBaselineAlwaysRepairsAndOnlyStrictlyVerifies(t *testing.T) {
+func TestPreparePlanRunBaselineInspectsWithoutRepairing(t *testing.T) {
 	for _, validationEnabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("validation_%v", validationEnabled), func(t *testing.T) {
 			var output bytes.Buffer
@@ -904,15 +904,11 @@ func TestPreparePlanRunBaselineAlwaysRepairsAndOnlyStrictlyVerifies(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantVerifyCalls := 0
-			if validationEnabled {
-				wantVerifyCalls = 1
+			if repairCalls != 0 || verifyCalls != 1 {
+				t.Fatalf("repair calls=%d verify calls=%d want=0/1", repairCalls, verifyCalls)
 			}
-			if repairCalls != 1 || verifyCalls != wantVerifyCalls {
-				t.Fatalf("repair calls=%d verify calls=%d want=1/%d", repairCalls, verifyCalls, wantVerifyCalls)
-			}
-			if !strings.Contains(output.String(), "target=plan_index status=RESTORED") {
-				t.Fatalf("baseline repair result was not logged: %q", output.String())
+			if strings.Contains(output.String(), "status=RESTORED") {
+				t.Fatalf("baseline repair result was logged: %q", output.String())
 			}
 		})
 	}

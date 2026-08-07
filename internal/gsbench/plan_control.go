@@ -219,7 +219,7 @@ func (s *planControlStore) MarkFaultFailed(
 			"UPDATE "+s.schema+
 				".meta_runs SET status=$1,detail=$2,"+
 				"updated_at=current_timestamp WHERE run_id=$3",
-			"restore_failed",
+			"fault_failed_recovery_pending",
 			detail,
 			runID,
 		)
@@ -280,7 +280,7 @@ func (s *planControlStore) ResolveFault(
 		"SELECT run_id,scenarios,phase,status,started_at FROM "+s.schema+
 			".meta_runs WHERE scenarios=$1 AND status IN ("+
 			"'running','stop_requested','restore_requested',"+
-			"'restore_failed','RESTORE_FAILED') "+
+			"'fault_failed_recovery_pending','restore_failed','RESTORE_FAILED') "+
 			"ORDER BY started_at DESC,run_id DESC",
 		fmt.Sprintf("%03d", code),
 	)

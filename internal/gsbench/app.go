@@ -848,7 +848,7 @@ func commandRunCore(
 				db,
 				cfg,
 				log,
-				RepairPlanBaseline,
+				nil,
 				VerifyPlanBaseline,
 			); err != nil {
 				return err
@@ -986,31 +986,23 @@ func preparePlanRunBaseline(
 	db *Database,
 	cfg BenchConfig,
 	log *RunLog,
-	repair planBaselineRepairFunc,
+	_ planBaselineRepairFunc,
 	verify planBaselineVerifyFunc,
 ) error {
-	if repair == nil {
-		return fmt.Errorf("plan baseline repair is unavailable")
-	}
-	results, err := repair(ctx, db, cfg.Data.Schema)
-	for _, result := range results {
-		log.Info(
-			"pre-run plan baseline target=%s status=%s",
-			result.Target,
-			result.Status,
-		)
-	}
-	if err != nil {
-		return fmt.Errorf("repair pre-run plan baseline: %w", err)
-	}
-	if !cfg.Run.ValidationEnabled {
+	if verify == nil {
+		log.Warn("%s", (PrecheckWarning{
+			Check: "plan_baseline", Object: "baseline_inspector",
+			Actual: "unavailable", Expected: "read_only_inspector",
+			Impact: "run_continues_without_baseline_inspection",
+		}).LogLine())
 		return nil
 	}
-	if verify == nil {
-		return fmt.Errorf("plan baseline verification is unavailable")
-	}
 	if err := verify(ctx, db, cfg.Data.Schema); err != nil {
-		return fmt.Errorf("verify pre-run plan baseline: %w", err)
+		log.Warn("%s", (PrecheckWarning{
+			Check: "plan_baseline", Object: cfg.Data.Schema,
+			Actual: err.Error(), Expected: "expected_baseline_metadata",
+			Impact: "run_continues; review gsbench restore",
+		}).LogLine())
 	}
 	return nil
 }

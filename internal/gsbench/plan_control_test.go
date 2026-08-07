@@ -202,7 +202,7 @@ func TestPlanControlMarksFaultFailureRecoverable(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	for _, token := range []string{"restore_failed", "DDL failed", "fault-1"} {
+	for _, token := range []string{"fault_failed_recovery_pending", "DDL failed", "fault-1"} {
 		if !containsAnyString(db.execArgs, token) {
 			t.Fatalf("query=%q args=%v missing %q", db.execQuery, db.execArgs, token)
 		}

@@ -189,20 +189,22 @@ func TestExecutePlanFaultActionUsesLiveWorkloadAndOneShotFaultRun(t *testing.T) 
 	}
 }
 
-func TestExecutePlanFaultActionRejectsUnchanged602PlanAndRestores(t *testing.T) {
+func TestExecutePlanFaultActionKeepsUnchanged602PlanWithWarning(t *testing.T) {
 	backend := &planActionBackendTest{
 		workload:      planRunRecord{RunID: "workload-602", Code: 602},
 		workloadAlive: true,
 		faultErr:      errPlanFaultNotFound,
 		verifyErr:     errors.New("fault plan candidate 2 still uses index"),
 	}
+	var warnings []PrecheckWarning
 	runID, err := executePlanFaultAction(
 		context.Background(),
 		602,
 		backend,
 		func() string { return "fault-602" },
+		func(warning PrecheckWarning) { warnings = append(warnings, warning) },
 	)
-	if err == nil || !strings.Contains(err.Error(), "fault plan") {
+	if err != nil {
 		t.Fatalf("runID=%q error=%v", runID, err)
 	}
 	want := []string{
@@ -213,19 +215,18 @@ func TestExecutePlanFaultActionRejectsUnchanged602PlanAndRestores(t *testing.T) 
 		"start-fault:fault-602",
 		"apply-fault:fault-602",
 		"verify-fault:602",
-		"restore-fault:fault-602",
-		"mark-failed:fault-602:restored=true:fault plan candidate 2 still uses index",
+		"mark-active:fault-602",
 		"unlock",
 	}
 	if !reflect.DeepEqual(backend.events, want) {
 		t.Fatalf("events=%v want=%v", backend.events, want)
 	}
-	if containsEventPrefix(backend.events, "mark-active") {
-		t.Fatalf("unverified fault became active: %v", backend.events)
+	if len(warnings) != 1 || warnings[0].Check != "fault_effect" {
+		t.Fatalf("warnings=%+v", warnings)
 	}
 }
 
-func TestExecutePlanFaultActionRestoresWhenActivationCannotBeRecorded(
+func TestExecutePlanFaultActionLeavesJournalWhenActivationCannotBeRecorded(
 	t *testing.T,
 ) {
 	backend := &planActionBackendTest{
@@ -243,10 +244,10 @@ func TestExecutePlanFaultActionRestoresWhenActivationCannotBeRecorded(
 	if err == nil || !strings.Contains(err.Error(), "record active phase failed") {
 		t.Fatalf("error=%v", err)
 	}
-	if !containsEventPrefix(backend.events, "restore-fault:fault-602") ||
+	if containsEventPrefix(backend.events, "restore-fault:fault-602") ||
 		!containsEventPrefix(
 			backend.events,
-			"mark-failed:fault-602:restored=true",
+			"mark-failed:fault-602:restored=false",
 		) {
 		t.Fatalf("events=%v", backend.events)
 	}
@@ -277,7 +278,7 @@ func TestExecutePlanFaultActionPersistsFailureForRecovery(t *testing.T) {
 		workloadAlive: true,
 		faultErr:      errPlanFaultNotFound,
 		applyErr:      errors.New("create bad index failed"),
-		restoreErr:    errors.New("automatic restore failed"),
+		restoreErr:    errors.New("restore must not be called"),
 	}
 	_, err := executePlanFaultAction(
 		context.Background(),
@@ -291,7 +292,7 @@ func TestExecutePlanFaultActionPersistsFailureForRecovery(t *testing.T) {
 	if !containsEventPrefix(
 		backend.events,
 		"mark-failed:fault-606:restored=false",
-	) || !containsEventPrefix(backend.events, "restore-fault:fault-606") {
+	) || containsEventPrefix(backend.events, "restore-fault:fault-606") {
 		t.Fatalf("events=%v", backend.events)
 	}
 }
