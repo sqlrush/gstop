@@ -6,20 +6,32 @@ import (
 	"testing"
 )
 
-func TestConnectionTargetHonorsInstanceAndSafetyCeilings(t *testing.T) {
-	if got := connectionTarget(200, 95, 500); got != 190 {
+func TestConnectionTargetUsesPhysicalCapacity(t *testing.T) {
+	if got := connectionTarget(200, 95); got != 190 {
 		t.Fatalf("target=%d", got)
 	}
-	if got := connectionTarget(1000, 95, 500); got != 500 {
-		t.Fatalf("safety-capped target=%d", got)
+	if got := connectionTarget(1000, 95); got != 950 {
+		t.Fatalf("physical target=%d", got)
 	}
-	if got := connectionTarget(101, 95, 500); got != 96 {
+	if got := connectionTarget(101, 95); got != 96 {
 		t.Fatalf("fractional target was not rounded up: %d", got)
 	}
 }
 
+func TestConnectionBudgetIgnoresArtificialSafetyCap(t *testing.T) {
+	budget, err := calculateConnectionBudget(103, 3, 20, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.UsableCapacity != 100 || budget.DesiredTotal != 90 ||
+		budget.WorkloadTarget != 70 || budget.ReachableTotal != 90 ||
+		budget.Limited {
+		t.Fatalf("budget=%+v", budget)
+	}
+}
+
 func TestConnectionBudgetSubtractsReservedAndExistingSessions(t *testing.T) {
-	budget, err := calculateConnectionBudget(101, 3, 7, 95, 100)
+	budget, err := calculateConnectionBudget(101, 3, 7, 95)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,20 +43,20 @@ func TestConnectionBudgetSubtractsReservedAndExistingSessions(t *testing.T) {
 		t.Fatalf("unnecessarily limited budget=%+v", budget)
 	}
 
-	limited, err := calculateConnectionBudget(1000, 10, 100, 95, 500)
+	physical, err := calculateConnectionBudget(1000, 10, 100, 95)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !limited.Limited || limited.WorkloadTarget != 500 || limited.ReachableTotal != 600 {
-		t.Fatalf("limited budget=%+v", limited)
+	if physical.Limited || physical.WorkloadTarget != 841 || physical.ReachableTotal != 941 {
+		t.Fatalf("physical budget=%+v", physical)
 	}
-	if math.Abs(limited.CeilingPercent-600.0/990.0*100) > 0.001 {
-		t.Fatalf("ceiling percent=%f budget=%+v", limited.CeilingPercent, limited)
+	if math.Abs(physical.CeilingPercent-941.0/990.0*100) > 0.001 {
+		t.Fatalf("ceiling percent=%f budget=%+v", physical.CeilingPercent, physical)
 	}
 }
 
 func TestConnectionBudgetInjectsOnlyBaselineDelta(t *testing.T) {
-	budget, err := calculateConnectionBudget(103, 3, 80, 90, 100)
+	budget, err := calculateConnectionBudget(103, 3, 80, 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,23 +69,20 @@ func TestConnectionBudgetInjectsOnlyBaselineDelta(t *testing.T) {
 func TestConnectionBudgetRejectsTargetAtOrBelowBaseline(t *testing.T) {
 	for _, target := range []int{79, 80} {
 		if _, err := calculateConnectionBudget(
-			103, 3, 80, target, 100,
+			103, 3, 80, target,
 		); err == nil {
 			t.Fatalf("target %d accepted at 80%% baseline", target)
 		}
 	}
 }
 
-func TestConnectionScenarioRejectsUnreachableBudgetBeforeRamp(t *testing.T) {
-	budget, err := calculateConnectionBudget(103, 3, 80, 90, 5)
+func TestConnectionBudgetUsesAllPhysicalHeadroomAtOneHundredPercent(t *testing.T) {
+	budget, err := calculateConnectionBudget(103, 3, 20, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !budget.Limited || budget.WorkloadTarget != 5 {
+	if budget.WorkloadTarget != 80 || budget.ReachableTotal != 100 {
 		t.Fatalf("budget=%+v", budget)
-	}
-	if err := validateConnectionBudget(budget); err == nil {
-		t.Fatal("unreachable connection budget was accepted")
 	}
 }
 

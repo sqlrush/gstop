@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-func connectionTarget(instanceMax, targetPercent, safetyMax int) int {
-	budget, err := calculateConnectionBudget(instanceMax, 0, 0, targetPercent, safetyMax)
+func connectionTarget(instanceMax, targetPercent int) int {
+	budget, err := calculateConnectionBudget(instanceMax, 0, 0, targetPercent)
 	if err != nil {
 		return 0
 	}
@@ -33,7 +33,7 @@ type ConnectionBudget struct {
 	Limited         bool
 }
 
-func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, safetyMax int) (ConnectionBudget, error) {
+func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent int) (ConnectionBudget, error) {
 	if instanceMax <= 0 {
 		return ConnectionBudget{}, fmt.Errorf("max_connections must be positive")
 	}
@@ -46,9 +46,6 @@ func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, s
 	if targetPercent < 1 || targetPercent > 100 {
 		return ConnectionBudget{}, fmt.Errorf("connection target percent must be between 1 and 100")
 	}
-	if safetyMax < 1 {
-		return ConnectionBudget{}, fmt.Errorf("connection safety maximum must be positive")
-	}
 	usable := instanceMax - reserved
 	baselinePercent := float64(existing) / float64(usable) * 100
 	if float64(targetPercent) <= baselinePercent {
@@ -60,7 +57,7 @@ func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, s
 	desired := int(math.Ceil(float64(usable) * float64(targetPercent) / 100))
 	needed := max(0, desired-existing)
 	headroom := max(0, usable-existing)
-	workloadTarget := min(needed, headroom, safetyMax)
+	workloadTarget := min(needed, headroom)
 	reachable := min(usable, existing+workloadTarget)
 	ceilingPercent := float64(reachable) / float64(usable) * 100
 	return ConnectionBudget{
@@ -167,7 +164,7 @@ func (s *ConnectionScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	s.targetPercent = rt.Config.PoolTargets.ConnectionPercent
 	s.budget, err = calculateConnectionBudget(
 		facts.InstanceMax, facts.Reserved, facts.Existing,
-		s.targetPercent, rt.Config.Safety.MaxConnections,
+		s.targetPercent,
 	)
 	if err != nil {
 		return err
