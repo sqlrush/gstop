@@ -1036,7 +1036,8 @@ func preparePlanRunBaseline(
 
 func exitCodeForOutcome(outcome Outcome) int {
 	switch outcome {
-	case OutcomeSuccess, OutcomeUnverified, OutcomeNotApplicable:
+	case OutcomeSuccess, OutcomeCompletedWithWarnings,
+		OutcomeUnverified, OutcomeNotApplicable:
 		return 0
 	case OutcomeDegraded:
 		return 3
