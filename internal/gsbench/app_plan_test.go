@@ -1055,6 +1055,71 @@ func TestDatabaseRestoreOwnershipUsesFreshDedicatedSessionAfterPressure(
 	}
 }
 
+func TestNewIsolatedRunRestoreBackendOwnsFreshControlDatabase(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	cfg := BenchConfig{
+		Database: DatabaseConfig{
+			Database:        "postgres",
+			ApplicationName: "gsbench-test",
+		},
+		Data:   DataConfig{Schema: "Bench"},
+		Safety: SafetyConfig{QueryTimeout: time.Second},
+	}
+	state := &ownershipRetryTestState{}
+	pool := sql.OpenDB(ownershipRetryTestConnector{state: state})
+	databaseCtx, cancelDatabase := context.WithCancel(context.Background())
+	fresh := &Database{
+		cfg:    cfg,
+		ctx:    databaseCtx,
+		cancel: cancelDatabase,
+		pool:   pool,
+		tagged: map[*TaggedConn]struct{}{},
+	}
+	fresh.openAdvisorySession = func(
+		context.Context,
+		*Database,
+		string,
+	) (advisoryLockSession, error) {
+		return &retryAdvisoryLockSession{}, nil
+	}
+	opened := 0
+	backend, closeBackend, err := newIsolatedRunRestoreBackend(
+		parent,
+		cfg,
+		nil,
+		DefaultFaultProviderRegistry(),
+		func(openCtx context.Context, got BenchConfig) (*Database, error) {
+			opened++
+			if err := openCtx.Err(); err != nil {
+				t.Fatalf("restore database inherited run cancellation: %v", err)
+			}
+			if !reflect.DeepEqual(got, cfg) {
+				t.Fatalf("restore config=%+v want=%+v", got, cfg)
+			}
+			return fresh, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened != 1 || backend.db != fresh {
+		t.Fatalf("opened=%d backend database=%p want=%p", opened, backend.db, fresh)
+	}
+	if err := backend.ValidateRestoreOwnership(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state.attempts != 0 {
+		t.Fatalf("restore ownership used control pool attempts=%d", state.attempts)
+	}
+	if err := closeBackend(); err != nil {
+		t.Fatal(err)
+	}
+	if err := databaseCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("restore database context error=%v want canceled", err)
+	}
+}
+
 func TestDatabaseRestoreLockDatasetVersionUsesZeroArgumentQuery(t *testing.T) {
 	session := &retryAdvisoryLockSession{}
 	lock := &databaseRestoreLock{session: session}

@@ -869,12 +869,22 @@ func commandRunCore(
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	go watchStop(ctx, db, cfg.Data.Schema, runID, cancel)
-	restoreBackend := newDatabaseRestoreBackend(
-		db,
+	restoreBackend, closeRestoreBackend, err := newIsolatedRunRestoreBackend(
+		ctx,
 		cfg,
 		log,
 		DefaultFaultProviderRegistry(),
+		OpenRestoreDatabase,
 	)
+	if err != nil {
+		log.Error("open isolated run restore database: %v", err)
+		return 1
+	}
+	defer func() {
+		if err := closeRestoreBackend(); err != nil {
+			log.Error("close isolated run restore database: %v", err)
+		}
+	}()
 	// Plan scenarios keep the outer plan/schema lock through Runner restore.
 	// A non-plan run cannot journal plan baseline actions, so requiring the
 	// plan lock here would only make unrelated cleanup conflict with a plan run.
@@ -1625,6 +1635,33 @@ func newDatabaseRestoreBackend(
 		},
 		health: databaseRestoreHealthVerifier{db: db},
 	}
+}
+
+type runRestoreDatabaseOpener func(
+	context.Context,
+	BenchConfig,
+) (*Database, error)
+
+func newIsolatedRunRestoreBackend(
+	ctx context.Context,
+	cfg BenchConfig,
+	log *RunLog,
+	registry *FaultProviderRegistry,
+	open runRestoreDatabaseOpener,
+) (*databaseRestoreBackend, func() error, error) {
+	if open == nil {
+		open = OpenRestoreDatabase
+	}
+	db, err := open(context.WithoutCancel(ctx), cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if db == nil {
+		return nil, nil, fmt.Errorf(
+			"restore database opener returned no database",
+		)
+	}
+	return newDatabaseRestoreBackend(db, cfg, log, registry), db.Close, nil
 }
 
 type databaseRestoreLock struct {
