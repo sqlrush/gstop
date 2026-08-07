@@ -95,6 +95,10 @@ docs/gsbench/         gsbench 操作手册
 六种独立执行计划跳变、锁堆积和 vacuum 性能问题。所有敏感变更先写恢复日志；支持
 `doctor/init/run/status/stop/restore/cleanup` 生命周期与管理员/普通用户双路径。
 
+401/402 的百分比目标按数据库物理会话余量加压，不受配置中的人工
+`safety.max_connections/max_workers` 上限限制；其他场景仍保留这些安全上限。数据库真实
+资源拒绝仍返回失败。运行锁与恢复锁使用独立单连接会话，并只对已知临时连接/资源错误重连。
+
 场景 2/3 的 AP 慢 SQL默认只输入 100 万事实表行，CPU 目标为 70%；独立 AP 最大并发
 8，混合场景总并发最大 20、AP 最大 4。AP 不设单 SQL超时，run 结束时通过取消并关闭
 当前 run 的 tagged connections 强制终止。

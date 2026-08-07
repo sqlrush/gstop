@@ -90,7 +90,7 @@ gsbench run -s 621,624 -d 2m
 
 401/402 的 `--percent N` 接受 1–100，并只覆盖本次选中的 401/402；同一命令选中两者时使用同一个值，其他场景忽略该参数。目标必须严格大于运行前基线：401 的分母是 `max_connections - sysadmin_reserved_connections`，例如当前 80%、目标 90% 时只新建补足差值所需的连接；402 的占用率是 `global_threadpool_status` 中 `(actual-idle)/actual`，active-backend fallback 不会被当作百分比成功证据。
 
-安全上限不足、真实指标缺失或 `--duration` 到期前仍未达标都会使对应场景失败，即使 `run.validation_enabled=false` 也不会降级。同一次运行中的其他场景继续自己的生命周期，最终命令聚合为非零退出码。达到目标后，401 不再补连接，402 连续 3 次确认后冻结 worker 数；已建立的本次连接/worker 保持到 duration 结束，丢失则失败。正常结束和场景失败都会自动关闭本次 tagged 会话；402 只关闭客户端会话和本地 worker，数据库自有 idle worker 的回收由数据库管理。
+`safety.max_connections` 和 `safety.max_workers` 仍是其他容量感知场景的硬上限，但 401/402 明确忽略这两个人工上限：两者按数据库物理会话余量尝试达到请求百分比。数据库真实拒绝连接、真实指标缺失或 `--duration` 到期前仍未达标都会使对应场景失败，不会自动降低目标，即使 `run.validation_enabled=false` 也不会降级。同一次运行中的其他场景继续自己的生命周期，最终命令聚合为非零退出码。达到目标后，401 不再补连接，402 连续 3 次确认后冻结 worker 数；已建立的本次连接/worker 保持到 duration 结束，丢失则失败。正常结束和场景失败都会自动关闭本次 tagged 会话；402 只关闭客户端会话和本地 worker，数据库自有 idle worker 的回收由数据库管理。
 
 第一次 Ctrl+C 仍由操作系统立即终止进程；客户端 socket 断开后数据库会结束对应会话并回滚未提交事务。下次运行仍会执行 stale recovery。只有旧 run 身份可完整证明为非空的 401/402-only、database/local recovery action 均为零且恢复锁已正常释放时，旧恢复失败才记录原始错误为 WARN 并允许新 run 使用新 ID 继续；发现失败、未知场景、任何 action（包括 402 自动启用线程池的实例参数 mutation）或其他场景仍会阻断。
 
@@ -109,6 +109,8 @@ gsbench restore
 ```
 
 dry-run 仅发现数据库 journal 和本地 ledger 中的动作：不申请恢复锁、不改运行状态、不终止会话、不执行逆操作，也不会因 ledger 缺失而创建文件。看到 `RESTORE_FAILED` 或 stale run 时，先执行 dry-run，再执行 restore 和 status。
+
+运行锁和恢复锁使用独立的单连接会话，不复用正在承受压力的主控制连接池；锁键以安全 SQL 字面量发送，不使用驱动绑定参数。已知连接中断、连接耗尽或临时内存不足会在清理不确定会话后重新连接，权限、语法、锁占用和未知错误仍立即失败并保持 fail-closed。
 
 ## 风险与配置
 

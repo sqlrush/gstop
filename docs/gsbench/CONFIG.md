@@ -151,7 +151,7 @@ allow_database_restart = false
 restart_command =
 ```
 
-- `max_connections`、`max_workers`：连接与 worker 的全局硬上限，必须为正数。固定 worker 和 501–503 的 workload 会话在启动前累计检查；401/402 只在这些硬上限内逐步增加，达标后冻结。
+- `max_connections`、`max_workers`：除 401/402 外，容量感知场景的连接与 worker 硬上限，必须为正数。固定 worker 和 501–503 的 workload 会话在启动前累计检查；401/402 保留并读取配置值以兼容同一配置文件，但不使用这两个人工上限。
 - `query_timeout`、`restore_timeout`：查询和恢复超时，必须大于 0。
 - `profile_cap_gb`：数据集硬上限，1–2048 GiB；必须不小于 `init --size`。
 - `restore_on_exit`：必须为 `true`；设为 `false` 会被拒绝。
@@ -220,11 +220,13 @@ gsbench run 503 --sessions 10 --duration 1m
 
 CLI worker 参数覆盖上述场景配置。103 的总并发为 `tp_workers + ap_workers`；所有 worker 先建立独立 tagged session 并等待同一个启动屏障，加压计时开始后才统一执行。
 
-`--percent` 只允许 `run`，范围 1–100，且最终场景必须包含 401 或 402；同一值覆盖所有选中的池场景，其他场景不受影响。目标必须严格大于运行前基线。401 使用 `max_connections - sysadmin_reserved_connections` 为容量分母，只创建基线到目标之间的连接差值；402 使用 `global_threadpool_status` 的 `(actual-idle)/actual`，不接受 active-backend fallback。目标不可达、指标缺失或 duration 内未连续确认达标都会失败，关闭 `validation_enabled` 也不会绕过。
+`--percent` 只允许 `run`，范围 1–100，且最终场景必须包含 401 或 402；同一值覆盖所有选中的池场景，其他场景不受影响。目标必须严格大于运行前基线。401 使用 `max_connections - sysadmin_reserved_connections` 为容量分母，只创建基线到目标之间的连接差值；402 使用 `global_threadpool_status` 的 `(actual-idle)/actual`，不接受 active-backend fallback。401/402 的尝试容量来自数据库物理会话余量，明确忽略 `safety.max_connections` 和 `safety.max_workers`；数据库真实拒绝、目标不可达、指标缺失或 duration 内未连续确认达标都会失败，既不自动降低目标，也不能通过关闭 `validation_enabled` 绕过。
 
 达标后 401/402 停止增加并保持本次资源到 duration 结束；401 不因外部业务连接退出而补建，402 不补建冻结后丢失的 worker，本次资源丢失会使场景失败。正常结束、失败和 Runner 的取消路径会关闭本次创建的 tagged 会话；数据库自身 idle thread-pool worker 的销毁不由 gsbench 控制。第一次 Ctrl+C 仍立即退出，连接断开由数据库回收；后续运行会再次尝试 stale recovery。
 
 stale recovery 默认继续 fail-closed。仅当所有旧 run 的场景身份读取/解析成功、每个场景列表非空且只含 401/402、database journal 与 local ledger 均没有 action、恢复锁成功释放且新 run 启动回调尚未尝试时，恢复失败才输出含原始错误的 WARN 并用新 run ID 继续。未知/缺失身份、发现失败、任何其他场景或 action（包括 402 自动启用线程池的参数修改）仍阻断。
+
+数据库运行锁和恢复锁各自创建专用的单连接池，不复用压力中的主控制池。advisory-lock 键经过 SQL 字面量转义并以零绑定参数执行，以兼容 openGauss 驱动；已知连接/资源临时错误会丢弃状态不确定的物理会话并重新连接，权限、语法、锁占用和未知错误不重试。
 
 201/202 的命令行覆盖一次只允许选择一个场景，例如 `gsbench run 201 --workers 8 --work-mem 256MB --duration 1m`。配置文件可以同时选择 201 和 202，并分别使用各自的 `workers/work_mem`；配置校验会累计两者 worker 数。固定 worker 场景不能与未纳入并发预算的场景混跑；501–503 已纳入连接预算，可以与固定 worker 场景组合，但所有 worker 和锁 workload 会话的总数必须不超过 `safety.max_connections`。
 

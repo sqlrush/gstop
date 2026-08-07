@@ -222,6 +222,41 @@ target_percent = 82
 	}
 }
 
+func TestPoolTargetsRetainButIgnoreOtherScenarioCaps(t *testing.T) {
+	body := minimalConfig() + `
+[safety]
+max_connections = 1
+max_workers = 1
+`
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{
+		ScenarioCodes: []ScenarioCode{401, 402},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Safety.MaxConnections != 1 || cfg.Safety.MaxWorkers != 1 {
+		t.Fatalf("configured safety caps=%+v", cfg.Safety)
+	}
+	budget, err := calculateConnectionBudget(1000, 10, 100, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.WorkloadTarget != 791 {
+		t.Fatalf("401 workload target=%d want=791", budget.WorkloadTarget)
+	}
+	facts := connectionCapacityFacts{
+		InstanceMax: 1000,
+		Reserved:    10,
+		Existing:    100,
+	}
+	if got := threadPressureCapacity(facts); got != 890 {
+		t.Fatalf("402 capacity=%d want=890", got)
+	}
+	if got := threadSessionCapacity(1000, 10, 100, 1, 1); got != 1 {
+		t.Fatalf("cap-aware scenario capacity=%d want=1", got)
+	}
+}
+
 func TestConfigPoolOverrideLeavesUnselectedPoolUntouched(t *testing.T) {
 	body := minimalConfig() + `
 [scenario.connection_pool]
