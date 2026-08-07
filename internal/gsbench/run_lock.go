@@ -2,7 +2,6 @@ package gsbench
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,45 +17,6 @@ type runLockSession interface {
 	Discard() error
 }
 
-type sqlRunLockSession struct {
-	db   *Database
-	conn *sql.Conn
-}
-
-func (s *sqlRunLockSession) TryLock(ctx context.Context, key string) (bool, error) {
-	opCtx, cancel := s.db.operationContext(ctx)
-	defer cancel()
-	var acquired bool
-	err := s.conn.QueryRowContext(
-		opCtx,
-		"SELECT pg_try_advisory_lock(hashtext($1))",
-		key,
-	).Scan(&acquired)
-	return acquired, err
-}
-
-func (s *sqlRunLockSession) Unlock(ctx context.Context, key string) (bool, error) {
-	opCtx, cancel := s.db.operationContext(ctx)
-	defer cancel()
-	var released bool
-	err := s.conn.QueryRowContext(
-		opCtx,
-		"SELECT pg_advisory_unlock(hashtext($1))",
-		key,
-	).Scan(&released)
-	return released, err
-}
-
-func (s *sqlRunLockSession) Close() error { return s.conn.Close() }
-
-func (s *sqlRunLockSession) Discard() error {
-	// Mark the physical connection bad before closing the sql.Conn wrapper, so
-	// a session whose lock state is uncertain can never return to the pool.
-	discardErr := discardSessionConnection(s.conn)
-	closeErr := normalizeConnectionCloseError(s.conn.Close())
-	return errors.Join(discardErr, closeErr)
-}
-
 func AcquireDatabaseRunLock(
 	ctx context.Context,
 	db *Database,
@@ -69,13 +29,11 @@ func AcquireDatabaseRunLock(
 		ctx,
 		identity,
 		func(openCtx context.Context) (runLockSession, error) {
-			opCtx, cancel := db.operationContext(openCtx)
-			defer cancel()
-			conn, err := db.pool.Conn(opCtx)
-			if err != nil {
-				return nil, err
-			}
-			return &sqlRunLockSession{db: db, conn: conn}, nil
+			return openAdvisoryLockSession(
+				openCtx,
+				db,
+				db.cfg.Database.ApplicationName+"/advisory-lock",
+			)
 		},
 	)
 }
@@ -92,13 +50,11 @@ func DatabaseRunLockHeld(
 		ctx,
 		identity,
 		func(openCtx context.Context) (runLockSession, error) {
-			opCtx, cancel := db.operationContext(openCtx)
-			defer cancel()
-			conn, err := db.pool.Conn(opCtx)
-			if err != nil {
-				return nil, err
-			}
-			return &sqlRunLockSession{db: db, conn: conn}, nil
+			return openAdvisoryLockSession(
+				openCtx,
+				db,
+				db.cfg.Database.ApplicationName+"/advisory-lock",
+			)
 		},
 	)
 }
