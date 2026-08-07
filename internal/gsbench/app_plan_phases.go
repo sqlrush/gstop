@@ -18,7 +18,6 @@ type planActionBackend interface {
 	VerifyFault(context.Context, ScenarioCode) error
 	MarkFaultActive(context.Context, string) error
 	MarkFaultFailed(context.Context, string, error, bool) error
-	RestoreFault(context.Context, string) error
 }
 
 func executePlanFaultAction(
@@ -120,36 +119,6 @@ func recordPlanFaultFailure(
 		),
 		markErr,
 	)
-}
-
-func executePlanRecoverAction(
-	ctx context.Context,
-	code ScenarioCode,
-	backend planActionBackend,
-) (runID string, restored bool, err error) {
-	if backend == nil {
-		return "", false, fmt.Errorf("plan recover backend is required")
-	}
-	release, err := backend.Lock(ctx)
-	if err != nil {
-		return "", false, err
-	}
-	if release == nil {
-		return "", false, fmt.Errorf("plan recover control lock release is unavailable")
-	}
-	defer func() { err = errors.Join(err, release()) }()
-
-	fault, err := backend.ResolveFault(ctx, code)
-	if errors.Is(err, errPlanFaultNotFound) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("resolve plan fault: %w", err)
-	}
-	if err := backend.RestoreFault(ctx, fault.RunID); err != nil {
-		return fault.RunID, false, fmt.Errorf("restore plan fault: %w", err)
-	}
-	return fault.RunID, true, nil
 }
 
 type databasePlanActionBackend struct {
@@ -401,32 +370,6 @@ func (b *databasePlanActionBackend) MarkFaultFailed(
 	return b.control.MarkFaultFailed(ctx, runID, faultErr, restored)
 }
 
-func (b *databasePlanActionBackend) RestoreFault(
-	ctx context.Context,
-	runID string,
-) error {
-	backend := newDatabaseRestoreBackend(
-		b.db,
-		b.cfg,
-		b.log,
-		DefaultFaultProviderRegistry(),
-	)
-	// The caller already holds the plan mutation lock. Reacquiring it inside
-	// restore would self-deadlock; the remaining restore locks stay enabled.
-	backend.requirePlanLock = false
-	backend.executor.database = dbActionExecutor{
-		db: planMaintenanceActionDatabase{db: b.db},
-	}
-	summary := NewRestoreCoordinatorWithValidation(
-		backend,
-		b.cfg.Run.ValidationEnabled,
-	).Restore(ctx, RestoreRequest{RunID: runID})
-	if summary.Failed {
-		return summary.Err
-	}
-	return nil
-}
-
 func planScenarioDefinitionForCode(
 	schema string,
 	code ScenarioCode,
@@ -478,6 +421,9 @@ func commandPlanRunAction(
 			Impact:       "plan_action_will_attempt_execution",
 		}).LogLine())
 	}
+	if options.PlanAction == PlanRunRecover {
+		return commandRecoveryPlan(ctx, db, cfg, log, "", &code)
+	}
 	backend, err := newDatabasePlanActionBackend(db, cfg, log)
 	if err != nil {
 		log.Error("initialize plan action: %v", err)
@@ -512,18 +458,6 @@ func commandPlanRunAction(
 			return 1
 		}
 		log.Info("plan fault SUCCESS scenario=%03d fault_run_id=%s", code, faultRunID)
-		return 0
-	case PlanRunRecover:
-		faultRunID, restored, err := executePlanRecoverAction(ctx, code, backend)
-		if err != nil {
-			log.Error("plan recover scenario=%03d run_id=%s: %v", code, faultRunID, err)
-			return 1
-		}
-		if !restored {
-			log.Info("plan recover ALREADY_RECOVERED scenario=%03d", code)
-			return 0
-		}
-		log.Info("plan recover SUCCESS scenario=%03d fault_run_id=%s", code, faultRunID)
 		return 0
 	default:
 		log.Error("unknown plan action %q", options.PlanAction)

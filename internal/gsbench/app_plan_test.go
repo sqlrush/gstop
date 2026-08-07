@@ -659,7 +659,7 @@ func TestRequestRestoreRunsStopUsesParameterizedTarget(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			executor := &stopRequestTestExecutor{}
-			if err := requestRestoreRunsStop(
+			if err := requestRunsStop(
 				context.Background(), executor, "Bench", test.runID,
 			); err != nil {
 				t.Fatal(err)

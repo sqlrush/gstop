@@ -63,7 +63,6 @@ type planActionBackendTest struct {
 	applyErr        error
 	verifyErr       error
 	markActiveErr   error
-	restoreErr      error
 }
 
 func (b *planActionBackendTest) Lock(context.Context) (func() error, error) {
@@ -145,14 +144,6 @@ func (b *planActionBackendTest) MarkFaultFailed(
 		),
 	)
 	return nil
-}
-
-func (b *planActionBackendTest) RestoreFault(
-	_ context.Context,
-	runID string,
-) error {
-	b.events = append(b.events, "restore-fault:"+runID)
-	return b.restoreErr
 }
 
 func TestExecutePlanFaultActionUsesLiveWorkloadAndOneShotFaultRun(t *testing.T) {
@@ -278,7 +269,6 @@ func TestExecutePlanFaultActionPersistsFailureForRecovery(t *testing.T) {
 		workloadAlive: true,
 		faultErr:      errPlanFaultNotFound,
 		applyErr:      errors.New("create bad index failed"),
-		restoreErr:    errors.New("restore must not be called"),
 	}
 	_, err := executePlanFaultAction(
 		context.Background(),
@@ -294,32 +284,6 @@ func TestExecutePlanFaultActionPersistsFailureForRecovery(t *testing.T) {
 		"mark-failed:fault-606:restored=false",
 	) || containsEventPrefix(backend.events, "restore-fault:fault-606") {
 		t.Fatalf("events=%v", backend.events)
-	}
-}
-
-func TestExecutePlanRecoverActionIsOneShotAndIdempotent(t *testing.T) {
-	backend := &planActionBackendTest{
-		fault: planRunRecord{RunID: "fault-605", Code: 605},
-	}
-	runID, restored, err := executePlanRecoverAction(
-		context.Background(), 605, backend,
-	)
-	if err != nil || !restored || runID != "fault-605" {
-		t.Fatalf("runID=%q restored=%v err=%v", runID, restored, err)
-	}
-	want := []string{
-		"lock", "resolve-fault", "restore-fault:fault-605", "unlock",
-	}
-	if !reflect.DeepEqual(backend.events, want) {
-		t.Fatalf("events=%v want=%v", backend.events, want)
-	}
-
-	backend = &planActionBackendTest{faultErr: errPlanFaultNotFound}
-	runID, restored, err = executePlanRecoverAction(
-		context.Background(), 605, backend,
-	)
-	if err != nil || restored || runID != "" {
-		t.Fatalf("idempotent runID=%q restored=%v err=%v", runID, restored, err)
 	}
 }
 

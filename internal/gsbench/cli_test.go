@@ -24,6 +24,7 @@ func TestReadOnlyCLICommandsDoNotCreateLogsOrDirectories(t *testing.T) {
 		dryRun  bool
 	}{
 		{name: "restore dry run", command: "restore", dryRun: true},
+		{name: "restore", command: "restore"},
 		{name: "cleanup dry run", command: "cleanup", dryRun: true},
 		{name: "doctor", command: "doctor"},
 		{name: "status", command: "status"},
@@ -78,7 +79,7 @@ func TestReadOnlyCLICommandsDoNotCreateLogsOrDirectories(t *testing.T) {
 	}
 }
 
-func TestRestoreCLIExecutesLocalInverseWhenInitialDatabaseIsUnreachable(
+func TestRestoreCLINeverExecutesLocalInverseWhenDatabaseIsUnreachable(
 	t *testing.T,
 ) {
 	t.Setenv("GSBENCH_TEST_PASSWORD", "test-only")
@@ -154,16 +155,15 @@ ledger_path = %s
 			stderr.String(),
 		)
 	}
-	if len(provider.restored) != 1 ||
-		provider.restored[0].Target != action.Target {
-		t.Fatalf("provider restores=%v want exactly once", provider.restored)
+	if len(provider.restored) != 0 {
+		t.Fatalf("read-only restore invoked provider: %v", provider.restored)
 	}
 	pending, err := ledger.Pending(context.Background(), action.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 0 {
-		t.Fatalf("local recovery did not converge: %+v", pending)
+	if len(pending) != 1 {
+		t.Fatalf("read-only restore changed ledger: %+v", pending)
 	}
 }
 

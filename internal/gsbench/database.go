@@ -225,6 +225,11 @@ func taggedSessionPredicate(
 		}
 		columnPrefix = activityAlias + "."
 	}
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return columnPrefix + "application_name LIKE $1 ESCAPE E'\\\\'",
+			[]any{taggedLIKEPattern("gsbench/")}, nil
+	}
 	runToken, err := applicationToken("run id", runID, applicationRunTokenMaxBytes)
 	if err != nil {
 		return "", nil, err

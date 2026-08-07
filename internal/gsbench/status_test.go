@@ -23,6 +23,17 @@ func TestStopTaggedSQLUsesExactRunBoundary(t *testing.T) {
 	}
 }
 
+func TestStopTaggedSQLAllowsAllGSBenchRuns(t *testing.T) {
+	query, args, err := StopTaggedSQL("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	arg := onlyStringArgument(t, args)
+	if arg != "gsbench/%" || !strings.Contains(query, "pg_terminate_session") {
+		t.Fatalf("query=%q arg=%q", query, arg)
+	}
+}
+
 func TestCleanupPlanDropsSchemaOnlyWhenRequested(t *testing.T) {
 	withoutData, err := CleanupPlan("gsbench", false)
 	if err != nil {

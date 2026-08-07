@@ -197,8 +197,8 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 func commandIsReadOnly(command string, dryRun bool) bool {
 	return command == "doctor" ||
 		command == "status" ||
-		(dryRun && (command == "restore" ||
-			command == "stop" ||
+		command == "restore" ||
+		(dryRun && (command == "stop" ||
 			command == "cleanup"))
 }
 
@@ -217,23 +217,19 @@ func commandDoctor(ctx context.Context, db *Database, cfg BenchConfig, env Envir
 			log,
 			DefaultFaultProviderRegistry(),
 		)
-		summary := NewRestoreCoordinatorWithValidation(
-			backend,
-			cfg.Run.ValidationEnabled,
-		).Restore(
-			ctx,
-			RestoreRequest{DryRun: true},
-		)
+		discovery, discoverErr := backend.DiscoverRestore(ctx, "", true)
+		runs, actions, planErr := prepareRestorePlan(discovery, "")
+		readErr := errors.Join(discoverErr, planErr)
 		log.Info(
 			"stale recovery runs=%d pending_actions=%d action=report_only",
-			len(summary.RunIDs),
-			len(summary.PlannedActions),
+			len(runs),
+			len(actions),
 		)
-		for _, runID := range summary.RunIDs {
+		for _, runID := range restoreRunIDs(runs) {
 			log.Info("stale run_id=%s action=report_only", runID)
 		}
-		if summary.Failed {
-			log.Error("read stale recovery state: %v", summary.Err)
+		if readErr != nil {
+			log.Error("read stale recovery state: %v", readErr)
 			return 1
 		}
 	}
@@ -1107,6 +1103,9 @@ func commandStatus(ctx context.Context, db *Database, cfg BenchConfig, log *RunL
 	for _, staleRunID := range stale.RunIDs {
 		log.Info("stale run_id=%s", staleRunID)
 	}
+	if len(stale.RunIDs) != 0 {
+		log.Info("recovery_hint=gsbench restore display_only=true")
+	}
 	if staleErr != nil {
 		log.Error("read stale recovery state: %v", staleErr)
 		return 1
@@ -1115,64 +1114,37 @@ func commandStatus(ctx context.Context, db *Database, cfg BenchConfig, log *RunL
 }
 
 func commandStop(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string) int {
-	return commandRestoreOperation(ctx, db, cfg, log, runID, "stop", true, nil)
-}
-
-func commandRestoreOperation(
-	ctx context.Context,
-	db *Database,
-	cfg BenchConfig,
-	log *RunLog,
-	runID string,
-	commandName string,
-	requirePlanLock bool,
-	afterSuccess func(context.Context, RestoreLock) error,
-) int {
+	if cfg.Run.DryRun {
+		log.Info("stop SUCCESS (dry run, tagged sessions only)")
+		return 0
+	}
+	if err := requestRunsStop(
+		ctx,
+		dbDatasetExecutor{db: db, schema: cfg.Data.Schema},
+		cfg.Data.Schema,
+		runID,
+	); err != nil {
+		log.Warn("stop request metadata update: %v", err)
+	}
 	backend := newDatabaseRestoreBackend(
 		db,
 		cfg,
 		log,
 		DefaultFaultProviderRegistry(),
 	)
-	backend.requirePlanLock = requirePlanLock
-	if requirePlanLock && !cfg.Run.DryRun {
-		requestStop := func(requestCtx context.Context) error {
-			return requestRestoreRunsStop(
-				requestCtx,
-				dbDatasetExecutor{db: db, schema: cfg.Data.Schema},
-				cfg.Data.Schema,
-				runID,
-			)
-		}
-		backend.requestPlanLockOwnerStop = requestStop
-		if err := requestStop(ctx); err != nil {
-			log.Info(
-				"%s: initial stop request deferred until database recovery: %v",
-				commandName,
-				err,
-			)
-		}
+	if err := backend.StopTaggedSessions(ctx, runID); err != nil {
+		log.Error("stop tagged sessions: %v", err)
+		return 1
 	}
-	return executeRestoreService(
-		ctx,
-		NewRestoreCoordinatorWithValidation(
-			backend,
-			cfg.Run.ValidationEnabled,
-		),
-		RestoreRequest{
-			RunID: runID, DryRun: cfg.Run.DryRun,
-			afterSuccess: afterSuccess,
-		},
-		commandName,
-		log,
-	)
+	log.Info("stop SUCCESS tagged_sessions_only=true")
+	return 0
 }
 
 type restoreStopRequestExecutor interface {
 	Exec(context.Context, string, ...any) error
 }
 
-func requestRestoreRunsStop(
+func requestRunsStop(
 	ctx context.Context,
 	executor restoreStopRequestExecutor,
 	schema string,
@@ -2934,9 +2906,65 @@ func (b *databaseRestoreBackend) MarkRestoreOutcome(
 }
 
 func commandRestore(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string) int {
-	return commandRestoreOperation(
-		ctx, db, cfg, log, runID, "restore", true, nil,
+	return commandRecoveryPlan(ctx, db, cfg, log, runID, nil)
+}
+
+func commandRecoveryPlan(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	log *RunLog,
+	runID string,
+	scenarioCode *ScenarioCode,
+) int {
+	backend := newDatabaseRestoreBackend(
+		db,
+		cfg,
+		log,
+		DefaultFaultProviderRegistry(),
 	)
+	discovery, err := backend.DiscoverRestore(ctx, runID, true)
+	if err != nil {
+		log.Error("discover recovery plan: %v", err)
+		return 1
+	}
+	filter := RecoveryPlanFilter{RunID: runID, ScenarioCode: scenarioCode}
+	verifier := func(verifyCtx context.Context, action Action) (bool, error) {
+		if action.Kind != ActionSQLMutation && action.Kind != ActionDataBaseline {
+			return false, fmt.Errorf("external action requires operator verification")
+		}
+		if len(action.Verify) == 0 {
+			return false, fmt.Errorf("recorded action has no read-only verifier")
+		}
+		if err := (dbActionExecutor{db: db}).VerifyRestored(
+			verifyCtx,
+			action,
+		); err != nil {
+			return false, nil
+		}
+		return true, nil
+	}
+	plan, err := BuildRecoveryPlan(ctx, discovery, filter, verifier)
+	if err != nil {
+		log.Error("build recovery plan: %v", err)
+		return 1
+	}
+	findings, err := InspectPlanBaseline(ctx, db, cfg.Data.Schema)
+	if err != nil {
+		log.Error("inspect gsbench baseline: %v", err)
+		return 1
+	}
+	plan = MergePlanBaselineFindings(plan, findings, filter)
+	if scenarioCode != nil {
+		log.Info(
+			"PLAN_RECOVER_DISPLAY_ONLY scenario=%03d execution=operator_controlled",
+			*scenarioCode,
+		)
+	}
+	for _, line := range RecoveryPlanLines(plan) {
+		log.Info("%s", line)
+	}
+	return 0
 }
 
 func commandCleanup(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string, withData bool) int {
@@ -2952,33 +2980,20 @@ func commandCleanup(ctx context.Context, db *Database, cfg BenchConfig, log *Run
 		return 0
 	}
 	if cfg.Run.DryRun {
-		if code := commandRestoreOperation(
-			ctx, db, cfg, log, runID, "stop", true, nil,
-		); code != 0 {
-			return code
-		}
 		if code := cleanupData(ctx, db, cfg, log); code != 0 {
 			return code
 		}
 		log.Info("cleanup SUCCESS")
 		return 0
 	}
-	// RestoreCoordinator invokes afterSuccess before releasing restore/local/
-	// plan locks. Keeping ownership verification and DROP in this callback
-	// closes the gap in which a new run could otherwise start.
-	afterSuccess := func(
-		callbackCtx context.Context,
-		lock RestoreLock,
-	) error {
-		if err := ensureNoPlanWorkload(callbackCtx, db, cfg); err != nil {
-			return err
-		}
-		return cleanupDataAfterRestore(callbackCtx, lock, cfg, log)
+	if code := commandStop(ctx, db, cfg, log, runID); code != 0 {
+		return code
 	}
-	code := commandRestoreOperation(
-		ctx, db, cfg, log, runID, "stop", true, afterSuccess,
-	)
-	if code != 0 {
+	if err := ensureNoPlanWorkload(ctx, db, cfg); err != nil {
+		log.Error("cleanup --data: %v", err)
+		return 1
+	}
+	if code := cleanupData(ctx, db, cfg, log); code != 0 {
 		return code
 	}
 	log.Info("cleanup SUCCESS")
