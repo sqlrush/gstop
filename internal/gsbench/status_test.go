@@ -34,6 +34,19 @@ func TestStopTaggedSQLAllowsAllGSBenchRuns(t *testing.T) {
 	}
 }
 
+func TestTaggedSessionStateExcludesItsOwnControlSession(t *testing.T) {
+	query, args, err := taggedSessionStateSQL("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onlyStringArgument(t, args) != "gsbench/%" {
+		t.Fatalf("args=%v", args)
+	}
+	if !strings.Contains(query, "a.pid <> pg_backend_pid()") {
+		t.Fatalf("state query counts its own control session: %s", query)
+	}
+}
+
 func TestCleanupPlanDropsSchemaOnlyWhenRequested(t *testing.T) {
 	withoutData, err := CleanupPlan("gsbench", false)
 	if err != nil {

@@ -175,6 +175,38 @@ func TestObserveRequiredStreamSupportsMultiColumnExplainRows(t *testing.T) {
 	}
 }
 
+func TestResourcePrepareKeepsMissingStreamAdvisory(t *testing.T) {
+	pool := sql.OpenDB(&explainRowsTestConnector{rows: &explainRowsTestRows{
+		columns: []string{"QUERY PLAN"},
+		values:  [][]driver.Value{{"Seq Scan on fact_sales"}},
+	}})
+	t.Cleanup(func() { _ = pool.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	database := &Database{
+		pool: pool, ctx: ctx, cancel: cancel,
+		tagged: map[*TaggedConn]struct{}{},
+	}
+	var warnings []PrecheckWarning
+	scenario := newResourceScenario(332, "network_distributed_shuffle")
+	if err := scenario.Prepare(ctx, &Runtime{
+		Config:   BenchConfig{Data: DataConfig{Schema: "gsbench"}},
+		Database: database,
+		Environment: Environment{
+			Product: ProductOpenGauss, Topology: TopologyDistributed,
+			Nodes: []Node{{Name: "dn_1", Role: NodeRoleDNPrimary}},
+		},
+		ReportWarning: func(warning PrecheckWarning) {
+			warnings = append(warnings, warning)
+		},
+	}); err != nil {
+		t.Fatalf("missing stream evidence blocked workload: %v", err)
+	}
+	if len(warnings) != 1 || warnings[0].Check != "required_stream" {
+		t.Fatalf("warnings=%+v", warnings)
+	}
+}
+
 func TestResourceFactoriesBuildApprovedCodesAndKeepDeferredCodesAbsent(t *testing.T) {
 	factories := ResourceScenarioFactories()
 	for _, code := range []ScenarioCode{

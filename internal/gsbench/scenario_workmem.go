@@ -93,8 +93,8 @@ func (s *workMemScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if s.workers <= 0 {
 		return fmt.Errorf("%s workers must be positive", s.Name())
 	}
-	if s.targetKB < minWorkMemKB {
-		return fmt.Errorf("%s work_mem must be at least %dkB", s.Name(), minWorkMemKB)
+	if s.targetKB <= 0 {
+		return fmt.Errorf("%s work_mem must be positive", s.Name())
 	}
 	calibrated, err := calibrateWorkMemDatabase(
 		ctx, rt, s.Name(), s.kind, s.targetKB,
@@ -460,8 +460,8 @@ func buildWorkMemSessionSetup(
 	targetKB int64,
 	forceNormalExplain bool,
 ) ([]string, error) {
-	if targetKB < 64 {
-		return nil, fmt.Errorf("work_mem must be at least 64kB")
+	if targetKB <= 0 {
+		return nil, fmt.Errorf("work_mem must be positive")
 	}
 	statements := []string{
 		"SET LOCAL work_mem='" + strconv.FormatInt(targetKB, 10) + "kB'",
@@ -672,8 +672,8 @@ func calibrateWorkMemRange(
 	kind workMemKind,
 	probe workMemProbe,
 ) (workMemCalibration, error) {
-	if targetKB < 64 {
-		return workMemCalibration{}, fmt.Errorf("work_mem must be at least 64kB")
+	if targetKB <= 0 {
+		return workMemCalibration{}, fmt.Errorf("work_mem must be positive")
 	}
 	if probe == nil {
 		return workMemCalibration{}, fmt.Errorf("work_mem calibration probe is unavailable")

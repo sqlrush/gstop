@@ -518,6 +518,40 @@ func TestDatasetExecutorDefaultsToWorkloadQueryTimeout(t *testing.T) {
 	}
 }
 
+func TestOperationContextAllowsBoundedFinalizationAfterDatabaseRootCancellation(
+	t *testing.T,
+) {
+	state := &maintenanceExecTestState{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	pool := sql.OpenDB(&maintenanceExecTestConnector{state: state})
+	defer pool.Close()
+	databaseContext, cancelDatabase := context.WithCancel(context.Background())
+	cancelDatabase()
+	database := &Database{
+		cfg: BenchConfig{Safety: SafetyConfig{QueryTimeout: time.Second}},
+		ctx: databaseContext, pool: pool,
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := database.Exec(
+			context.Background(),
+			`UPDATE "gsbench".meta_runs SET status='complete'`,
+		)
+		result <- err
+	}()
+	select {
+	case <-state.started:
+	case <-time.After(time.Second):
+		t.Fatal("finalization query did not start after database root cancellation")
+	}
+	close(state.release)
+	if err := <-result; err != nil {
+		t.Fatalf("finalization query error=%v", err)
+	}
+}
+
 func (c *sessionCleanupTestConnector) Connect(context.Context) (driver.Conn, error) {
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()

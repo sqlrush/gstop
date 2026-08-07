@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"slices"
 	"testing"
 	"time"
 )
@@ -73,6 +74,42 @@ func (r *explainRowsTestRows) Next(dest []driver.Value) error {
 		return err
 	}
 	return io.EOF
+}
+
+func TestPlanPrepareKeepsHighWaterAndExplainProbeFailuresAdvisory(t *testing.T) {
+	pool := sql.OpenDB(&explainRowsTestConnector{rows: &explainRowsTestRows{
+		columns:     []string{"value"},
+		terminalErr: errors.New("catalog probe denied"),
+	}})
+	t.Cleanup(func() { _ = pool.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var warnings []PrecheckWarning
+	scenario := NewPlanChangeScenario(PlanScenarioDefinition{
+		Code: 601, Name: "planchange_stats_target",
+		Candidates: []string{"SELECT 1"},
+	}, &PlanCoordinator{})
+	err := scenario.Prepare(ctx, &Runtime{
+		Config: BenchConfig{Data: DataConfig{Schema: "gsbench"}},
+		Database: &Database{
+			pool: pool, ctx: ctx, cancel: cancel,
+			tagged: map[*TaggedConn]struct{}{},
+		},
+		ReportWarning: func(warning PrecheckWarning) {
+			warnings = append(warnings, warning)
+		},
+	})
+	if err != nil {
+		t.Fatalf("plan probes blocked prepare: %v", err)
+	}
+	var checks []string
+	for _, warning := range warnings {
+		checks = append(checks, warning.Check)
+	}
+	if !slices.Contains(checks, "data_volume_probe") ||
+		!slices.Contains(checks, "baseline_plan_probe") {
+		t.Fatalf("warnings=%+v", warnings)
+	}
 }
 
 func openExplainRowsForTest(

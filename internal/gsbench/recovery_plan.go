@@ -39,6 +39,151 @@ type RecoveryPlanFilter struct {
 
 type RecoveryVerifyFunc func(context.Context, Action) (bool, error)
 
+type recoveryReadOnlyDatabase interface {
+	ScanReadOnly(context.Context, string, []any, ...any) error
+}
+
+func newRecoveryActionVerifier(
+	database actionSQLDatabase,
+	cfg BenchConfig,
+) RecoveryVerifyFunc {
+	return func(ctx context.Context, action Action) (bool, error) {
+		readOnly, ok := database.(recoveryReadOnlyDatabase)
+		if !ok {
+			return false, fmt.Errorf("database read-only verifier is unavailable")
+		}
+		payload, err := trustedRecoveryVerifyPayload(cfg, action)
+		if err != nil {
+			return false, err
+		}
+		var actual string
+		if err := readOnly.ScanReadOnly(ctx, payload.SQL, nil, &actual); err != nil {
+			return false, fmt.Errorf("run trusted read-only verifier: %w", err)
+		}
+		switch payload.Comparison {
+		case "":
+			return databaseValuesEqual(actual, payload.Expected), nil
+		case sqlVerifyComparisonIndexDDL:
+			return datasetIndexMatches(actual, payload.Expected), nil
+		default:
+			return false, fmt.Errorf(
+				"trusted verifier comparison %q is unsupported",
+				payload.Comparison,
+			)
+		}
+	}
+}
+
+func trustedRecoveryVerifyPayload(
+	cfg BenchConfig,
+	action Action,
+) (sqlActionPayload, error) {
+	if action.Kind != ActionSQLMutation && action.Kind != ActionDataBaseline {
+		return sqlActionPayload{}, fmt.Errorf(
+			"action kind %q has no SQL recovery verifier",
+			action.Kind,
+		)
+	}
+	candidates, err := canonicalRecoveryActions(cfg, action.ScenarioCode)
+	if err != nil {
+		return sqlActionPayload{}, err
+	}
+	for _, candidate := range candidates {
+		if candidate.Target != action.Target ||
+			!recoveryActionsHaveSameDesiredState(candidate, action) {
+			continue
+		}
+		trusted, err := decodeSQLActionPayload(candidate.Verify)
+		if err != nil {
+			return sqlActionPayload{}, fmt.Errorf(
+				"decode trusted recovery verifier: %w",
+				err,
+			)
+		}
+		recorded, err := decodeSQLActionPayload(action.Verify)
+		if err != nil {
+			return sqlActionPayload{}, fmt.Errorf(
+				"decode recorded recovery verifier: %w",
+				err,
+			)
+		}
+		if trusted.SQL != recorded.SQL ||
+			trusted.Expected != recorded.Expected ||
+			trusted.Comparison != recorded.Comparison ||
+			trusted.SkipInverseWhenRestored != recorded.SkipInverseWhenRestored {
+			return sqlActionPayload{}, fmt.Errorf(
+				"recorded recovery verifier does not match the canonical definition",
+			)
+		}
+		return trusted, nil
+	}
+	return sqlActionPayload{}, fmt.Errorf(
+		"no trusted recovery verifier for scenario %03d target %s",
+		action.ScenarioCode,
+		advisoryLogValue(action.Target),
+	)
+}
+
+func canonicalRecoveryActions(
+	cfg BenchConfig,
+	code ScenarioCode,
+) ([]Action, error) {
+	var mutations []Mutation
+	var err error
+	switch {
+	case isPlanChangeCode(code):
+		definition, lookupErr := DefaultScenarioCatalog().LookupCode(code)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		mutations, err = PlanMutationSet(
+			"recovery-verifier", cfg.Data.Schema, definition.Name,
+		)
+	case code == 625:
+		mutations, err = HardParseInvalidationMutations(
+			"recovery-verifier", cfg.Data.Schema,
+		)
+	case code == 801:
+		if _, ok := quoteDatasetSchema(cfg.Data.Schema); !ok {
+			return nil, fmt.Errorf("unsafe dataset schema %q", cfg.Data.Schema)
+		}
+		table := cfg.Data.Schema + ".vacuum_targets"
+		mutations = []Mutation{{
+			RunID: "recovery-verifier", ScenarioCode: 801,
+			Target: table,
+			InverseSQL: "UPDATE " + table +
+				" SET version=0,payload=repeat('v',900),updated_at=current_timestamp",
+			VerifySQL:   "SELECT count(*) FROM " + table + " WHERE version<>0",
+			VerifyValue: "0",
+		}}
+	default:
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	actions := make([]Action, 0, len(mutations))
+	for _, mutation := range mutations {
+		actions = append(actions, SQLAction(mutation))
+	}
+	return actions, nil
+}
+
+func recoveryActionsHaveSameDesiredState(left, right Action) bool {
+	leftStatements, leftManual, leftErr := renderRecoveryAction(left)
+	rightStatements, rightManual, rightErr := renderRecoveryAction(right)
+	if leftErr != nil || rightErr != nil || leftManual != rightManual ||
+		len(leftStatements) != len(rightStatements) {
+		return false
+	}
+	for index := range leftStatements {
+		if leftStatements[index] != rightStatements[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func BuildRecoveryPlan(
 	ctx context.Context,
 	discovery RestoreDiscovery,
@@ -51,15 +196,8 @@ func BuildRecoveryPlan(
 			return RecoveryPlan{}, err
 		}
 	}
-	_, actions, mergeErr := prepareRestorePlan(discovery, filter.RunID)
-	plan := RecoveryPlan{}
-	if mergeErr != nil {
-		plan.Items = append(plan.Items, RecoveryPlanItem{
-			State:  RecoveryConflict,
-			Target: "journal_identity",
-			Detail: journalSafeErrorText(mergeErr.Error()),
-		})
-	}
+	actions, conflicts := scopedRecoveryActions(discovery, filter)
+	plan := RecoveryPlan{Items: conflicts}
 
 	type plannedAction struct {
 		action Action
@@ -67,9 +205,6 @@ func BuildRecoveryPlan(
 	}
 	planned := make([]plannedAction, 0, len(actions))
 	for _, action := range actions {
-		if filter.ScenarioCode != nil && action.ScenarioCode != *filter.ScenarioCode {
-			continue
-		}
 		item := RecoveryPlanItem{
 			RunID: action.RunID, Sequence: action.Sequence,
 			ScenarioCode: action.ScenarioCode, Kind: action.Kind,
@@ -131,6 +266,91 @@ func BuildRecoveryPlan(
 	return plan, nil
 }
 
+func scopedRecoveryActions(
+	discovery RestoreDiscovery,
+	filter RecoveryPlanFilter,
+) ([]Action, []RecoveryPlanItem) {
+	groups := make(map[string][]Action)
+	order := make([]string, 0)
+	add := func(action Action) {
+		if filter.RunID != "" && action.RunID != filter.RunID {
+			return
+		}
+		if filter.ScenarioCode != nil && action.ScenarioCode != *filter.ScenarioCode {
+			return
+		}
+		var key string
+		if action.Sequence > 0 {
+			key = fmt.Sprintf("state\x00%s\x00%d", action.RunID, action.Sequence)
+		} else {
+			identity := restoreIdentity(action)
+			key = fmt.Sprintf(
+				"action\x00%s\x00%s\x00%s",
+				identity.runID, identity.kind, identity.target,
+			)
+		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		for _, existing := range groups[key] {
+			if sameRestoreAction(existing, action) {
+				return
+			}
+		}
+		groups[key] = append(groups[key], action)
+	}
+	for _, action := range discovery.DatabaseActions {
+		add(action)
+	}
+	for _, action := range discovery.LocalActions {
+		add(action)
+	}
+
+	var actions []Action
+	var conflicts []RecoveryPlanItem
+	for _, key := range order {
+		group := groups[key]
+		if len(group) == 1 {
+			actions = append(actions, group[0])
+			continue
+		}
+		for _, action := range group {
+			conflicts = append(conflicts, RecoveryPlanItem{
+				RunID: action.RunID, Sequence: action.Sequence,
+				ScenarioCode: action.ScenarioCode, Kind: action.Kind,
+				Target: action.Target, State: RecoveryConflict,
+				Detail: recoveryConflictDetail(action),
+			})
+		}
+	}
+	sort.SliceStable(conflicts, func(i, j int) bool {
+		if conflicts[i].RunID != conflicts[j].RunID {
+			return conflicts[i].RunID < conflicts[j].RunID
+		}
+		if conflicts[i].Sequence != conflicts[j].Sequence {
+			return conflicts[i].Sequence < conflicts[j].Sequence
+		}
+		return conflicts[i].Target < conflicts[j].Target
+	})
+	return actions, conflicts
+}
+
+func recoveryConflictDetail(action Action) string {
+	statements, manual, err := renderRecoveryAction(action)
+	if err != nil {
+		return journalSafeErrorText(
+			"conflicting desired state; SQL suppressed: " + err.Error(),
+		)
+	}
+	desired := manual
+	if desired == "" {
+		desired = strings.Join(statements, " ")
+	}
+	return journalSafeErrorText(
+		"conflicting desired state; SQL suppressed: " + desired,
+	)
+}
+
 func renderRecoveryAction(action Action) ([]string, string, error) {
 	if err := validateJournalStringField("target", action.Target); err != nil {
 		return nil, "", err
@@ -176,11 +396,19 @@ func renderRecoveryAction(action Action) ([]string, string, error) {
 		if err := validateActionPayload("inverse", action.Inverse, true); err != nil {
 			return nil, "", err
 		}
+		if journalStringContainsCredentialMaterial(string(action.Inverse)) {
+			return nil, "", fmt.Errorf("manual inverse contains credential material")
+		}
+		inverse, err := canonicalRecoveryJSON(action.Inverse)
+		if err != nil {
+			return nil, "", fmt.Errorf("canonicalize manual inverse: %w", err)
+		}
 		return nil, fmt.Sprintf(
-			"%s node=%s target=%s",
+			"%s node=%s target=%s inverse=%s",
 			action.Kind,
 			advisoryLogValue(action.Node),
 			advisoryLogValue(action.Target),
+			inverse,
 		), nil
 	}
 }
@@ -209,6 +437,14 @@ func MergePlanBaselineFindings(
 	findings []PlanBaselineFinding,
 	filter RecoveryPlanFilter,
 ) RecoveryPlan {
+	runScopedScenarios := make(map[ScenarioCode]bool)
+	if strings.TrimSpace(filter.RunID) != "" {
+		for _, item := range plan.Items {
+			if item.RunID == filter.RunID {
+				runScopedScenarios[item.ScenarioCode] = true
+			}
+		}
+	}
 	existingTargets := make(map[string]bool, len(plan.Items))
 	for _, item := range plan.Items {
 		if item.Target != "" {
@@ -216,6 +452,18 @@ func MergePlanBaselineFindings(
 		}
 	}
 	for _, finding := range findings {
+		if strings.TrimSpace(filter.RunID) != "" {
+			matched := false
+			for _, code := range finding.ScenarioCodes {
+				if runScopedScenarios[code] {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
 		code, selected := selectBaselineFindingScenario(
 			finding.ScenarioCodes,
 			filter.ScenarioCode,
@@ -248,7 +496,36 @@ func MergePlanBaselineFindings(
 		plan.Items = append(plan.Items, item)
 		existingTargets[finding.Target] = true
 	}
+	sortRecoveryPlanItems(plan.Items)
 	return plan
+}
+
+func sortRecoveryPlanItems(items []RecoveryPlanItem) {
+	rank := func(item RecoveryPlanItem) int {
+		if item.State == RecoveryConflict {
+			return 0
+		}
+		hasAnalyze := false
+		analyzeOnlyWithSessionSettings := true
+		for _, statement := range item.Statements {
+			normalized := strings.ToUpper(strings.TrimSpace(statement))
+			switch {
+			case strings.HasPrefix(normalized, "ANALYZE "):
+				hasAnalyze = true
+			case strings.HasPrefix(normalized, "SET "),
+				strings.HasPrefix(normalized, "RESET "):
+			default:
+				analyzeOnlyWithSessionSettings = false
+			}
+		}
+		if hasAnalyze && analyzeOnlyWithSessionSettings {
+			return 2
+		}
+		return 1
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return rank(items[i]) < rank(items[j])
+	})
 }
 
 func selectBaselineFindingScenario(
@@ -271,7 +548,7 @@ func selectBaselineFindingScenario(
 
 func RecoveryPlanLines(plan RecoveryPlan) []string {
 	if len(plan.Items) == 0 {
-		return []string{"RESTORE_PLAN_EMPTY"}
+		return []string{"RESTORE_PLAN_EMPTY state=ALREADY_RESTORED"}
 	}
 	lines := []string{"RECOVERY_PLAN display_only=true execution=operator_controlled"}
 	for _, item := range plan.Items {

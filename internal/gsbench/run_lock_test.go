@@ -18,6 +18,22 @@ type fakeRunLockSession struct {
 	discarded    int
 }
 
+func (s *fakeRunLockSession) TryLockShared(
+	_ context.Context,
+	key string,
+) (bool, error) {
+	s.keys = append(s.keys, "try-shared:"+key)
+	return s.tryResult, s.tryErr
+}
+
+func (s *fakeRunLockSession) UnlockShared(
+	_ context.Context,
+	key string,
+) (bool, error) {
+	s.keys = append(s.keys, "unlock-shared:"+key)
+	return s.unlockResult, s.unlockErr
+}
+
 func (s *fakeRunLockSession) TryLock(_ context.Context, key string) (bool, error) {
 	s.keys = append(s.keys, "try:"+key)
 	return s.tryResult, s.tryErr
@@ -260,6 +276,65 @@ func TestWithRunExecutionDatabaseLockHoldsLeaseUntilRunCompletes(
 	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events=%v want=%v", events, want)
+	}
+}
+
+func TestDatasetLifecycleLockSerializesRunRegistrationAndDataCleanup(t *testing.T) {
+	cfg := BenchConfig{
+		Database: DatabaseConfig{Database: "postgres"},
+		Data:     DataConfig{Schema: "Bench"},
+	}
+	var events []string
+	err := withDatasetLifecycleDatabaseLock(
+		context.Background(), nil, cfg,
+		func(_ context.Context, _ *Database, identity string) (func() error, error) {
+			events = append(events, "acquire "+identity)
+			return func() error {
+				events = append(events, "release "+identity)
+				return nil
+			}, nil
+		},
+		func() error {
+			events = append(events, "protected operation")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"acquire gsbench:dataset-lifecycle:postgres:Bench",
+		"protected operation",
+		"release gsbench:dataset-lifecycle:postgres:Bench",
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%v want=%v", events, want)
+	}
+}
+
+func TestDatasetExecutionLeaseUsesSharedLifecycleLock(t *testing.T) {
+	cfg := BenchConfig{
+		Database: DatabaseConfig{Database: "postgres"},
+		Data:     DataConfig{Schema: "Bench"},
+	}
+	session := &fakeRunLockSession{tryResult: true, unlockResult: true}
+	release, err := acquireDatabaseSharedRunLock(
+		context.Background(),
+		"gsbench:dataset-lifecycle:postgres:Bench",
+		func(context.Context) (runLockSession, error) { return session, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"try-shared:" + datasetLifecycleLockIdentity(cfg),
+		"unlock-shared:" + datasetLifecycleLockIdentity(cfg),
+	}
+	if !reflect.DeepEqual(session.keys, want) {
+		t.Fatalf("events=%v want=%v", session.keys, want)
 	}
 }
 

@@ -2,11 +2,47 @@ package gsbench
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+type recoveryVerifierTestDatabase struct {
+	actual        string
+	readOnlyError error
+	readOnlySQL   []string
+	unsafeScans   int
+}
+
+func (*recoveryVerifierTestDatabase) Exec(
+	context.Context, string, ...any,
+) (sql.Result, error) {
+	return nil, errors.New("unexpected recovery verifier mutation")
+}
+
+func (d *recoveryVerifierTestDatabase) Scan(
+	context.Context, string, []any, ...any,
+) error {
+	d.unsafeScans++
+	return errors.New("unsafe non-transactional verifier scan")
+}
+
+func (d *recoveryVerifierTestDatabase) ScanReadOnly(
+	_ context.Context,
+	query string,
+	_ []any,
+	dest ...any,
+) error {
+	d.readOnlySQL = append(d.readOnlySQL, query)
+	if d.readOnlyError != nil {
+		return d.readOnlyError
+	}
+	*(dest[0].(*string)) = d.actual
+	return nil
+}
 
 func recoverySQLAction(runID string, sequence int64, code ScenarioCode, target, inverse string) Action {
 	return Action{
@@ -76,6 +112,48 @@ func TestRecoveryPlanVerifierSuppressesSatisfiedInverse(t *testing.T) {
 	}
 }
 
+func TestRecoveryActionVerifierUsesOnlyCanonicalReadOnlyProbe(t *testing.T) {
+	mutations, err := PlanMutationSet(
+		"run-1", "gsbench", "planchange_stats_target",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := SQLAction(mutations[0])
+	action.TargetProduct = ProductOpenGauss
+	db := &recoveryVerifierTestDatabase{actual: "wrong index definition"}
+	verify := newRecoveryActionVerifier(db, BenchConfig{
+		Data: DataConfig{Schema: "gsbench"},
+	})
+
+	restored, err := verify(context.Background(), action)
+	if err != nil || restored {
+		t.Fatalf("canonical mismatch restored=%t err=%v", restored, err)
+	}
+	if len(db.readOnlySQL) != 1 || db.unsafeScans != 0 {
+		t.Fatalf("read-only SQL=%v unsafe scans=%d", db.readOnlySQL, db.unsafeScans)
+	}
+
+	db.readOnlyError = errors.New("catalog probe denied")
+	restored, err = verify(context.Background(), action)
+	if err == nil || restored || !strings.Contains(err.Error(), "catalog probe denied") {
+		t.Fatalf("probe failure restored=%t err=%v", restored, err)
+	}
+
+	db.readOnlyError = nil
+	db.readOnlySQL = nil
+	action.Verify = json.RawMessage(
+		`{"sql":"DELETE FROM gsbench.plan_data RETURNING id","expected":"0"}`,
+	)
+	restored, err = verify(context.Background(), action)
+	if err == nil || restored {
+		t.Fatalf("untrusted verifier restored=%t err=%v", restored, err)
+	}
+	if len(db.readOnlySQL) != 0 || db.unsafeScans != 0 {
+		t.Fatalf("untrusted verifier executed SQL=%v unsafe=%d", db.readOnlySQL, db.unsafeScans)
+	}
+}
+
 func TestRecoveryPlanFiltersScenarioAndRendersExternalManualAction(t *testing.T) {
 	external := Action{
 		RunID: "run-2", Sequence: 1, ScenarioCode: 706,
@@ -97,6 +175,7 @@ func TestRecoveryPlanFiltersScenarioAndRendersExternalManualAction(t *testing.T)
 	}
 	if len(plan.Items) != 1 || plan.Items[0].ScenarioCode != 706 ||
 		!strings.Contains(plan.Items[0].ManualAction, "NETWORK_QDISC") ||
+		!strings.Contains(plan.Items[0].ManualAction, `{"operation":"delete"}`) ||
 		len(plan.Items[0].Statements) != 0 {
 		t.Fatalf("plan=%+v", plan)
 	}
@@ -208,23 +287,118 @@ func TestRecoveryPlanKeepsConflictsVisibleAndOrdersAnalyzeLast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Items) < 3 || plan.Items[0].State != RecoveryConflict {
+	if len(plan.Items) != 3 || plan.Items[0].State != RecoveryConflict ||
+		plan.Items[1].State != RecoveryConflict {
 		t.Fatalf("conflict not visible: %+v", plan.Items)
 	}
-	var createAt, analyzeAt = -1, -1
+	var analyzeAt = -1
 	for index, item := range plan.Items {
-		if item.Target == "plan_index_drop_idx" {
-			createAt = index
-		}
 		if item.Target == "plan_data analyze" {
 			analyzeAt = index
 		}
+		if item.State == RecoveryConflict && len(item.Statements) != 0 {
+			t.Fatalf("conflicting SQL was rendered: %+v", item)
+		}
 	}
-	if createAt < 0 || analyzeAt <= createAt {
+	if analyzeAt != 2 {
 		t.Fatalf("items=%+v", plan.Items)
 	}
 	lines := RecoveryPlanLines(plan)
 	if !strings.Contains(strings.Join(lines, "\n"), "display_only=true") {
+		t.Fatalf("lines=%q", lines)
+	}
+}
+
+func TestRecoveryPlanFiltersScenarioBeforeConflictDetection(t *testing.T) {
+	selected := recoverySQLAction("run-1", 1, 601, "index-601", "DROP INDEX index_601")
+	conflictA := recoverySQLAction("run-2", 1, 602, "stats-a", "ANALYZE stats_a")
+	conflictB := conflictA
+	conflictB.Target = "stats-b"
+	code := ScenarioCode(601)
+	plan, err := BuildRecoveryPlan(
+		context.Background(),
+		RestoreDiscovery{DatabaseActions: []Action{selected, conflictA, conflictB}},
+		RecoveryPlanFilter{ScenarioCode: &code},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Items) != 1 || plan.Items[0].ScenarioCode != 601 ||
+		plan.Items[0].State == RecoveryConflict {
+		t.Fatalf("scenario filter leaked unrelated conflict: %+v", plan.Items)
+	}
+}
+
+func TestRecoveryPlanRunFilterMergesOnlyMatchingSharedDependency(t *testing.T) {
+	plan := MergePlanBaselineFindings(
+		RecoveryPlan{Items: []RecoveryPlanItem{{
+			RunID: "run-1", ScenarioCode: 605, Target: "journal-target",
+		}}},
+		[]PlanBaselineFinding{
+			{
+				ScenarioCodes: []ScenarioCode{605}, Target: "plan_index_drop_idx",
+				Statements: []string{"CREATE INDEX plan_index_drop_idx ON gsbench.plan_data(id)"},
+			},
+			{
+				ScenarioCodes: []ScenarioCode{606}, Target: "unrelated-index",
+				Statements: []string{"CREATE INDEX unrelated_index ON gsbench.plan_data(id)"},
+			},
+		},
+		RecoveryPlanFilter{RunID: "run-1"},
+	)
+	if len(plan.Items) != 2 || plan.Items[1].Target != "plan_index_drop_idx" {
+		t.Fatalf("run-scoped dependencies=%+v", plan.Items)
+	}
+}
+
+func TestRecoveryPlanMergeKeepsStructuralDDLBeforeAnalyze(t *testing.T) {
+	plan := RecoveryPlan{Items: []RecoveryPlanItem{{
+		RunID: "run-1", ScenarioCode: 603, Kind: ActionSQLMutation,
+		Target: "plan_data analyze", State: RecoveryPending,
+		Statements: []string{"ANALYZE gsbench.plan_data;"},
+	}}}
+	merged := MergePlanBaselineFindings(
+		plan,
+		[]PlanBaselineFinding{{
+			ScenarioCodes: []ScenarioCode{605}, Target: "plan_index_drop_idx",
+			Statements: []string{"CREATE INDEX plan_index_drop_idx ON gsbench.plan_data(id)"},
+		}},
+		RecoveryPlanFilter{},
+	)
+	if len(merged.Items) != 2 || merged.Items[0].Target != "plan_index_drop_idx" ||
+		merged.Items[1].Target != "plan_data analyze" {
+		t.Fatalf("merged order=%+v", merged.Items)
+	}
+}
+
+func TestRecoveryPlanMergeKeepsStructuralDDLBeforeSessionAnalyzeGroup(t *testing.T) {
+	plan := RecoveryPlan{Items: []RecoveryPlanItem{{
+		RunID: "run-1", ScenarioCode: 604, Kind: ActionSQLMutation,
+		Target: "session analyze", State: RecoveryPending,
+		Statements: []string{
+			"SET default_statistics_target=-2;",
+			"ANALYZE gsbench.plan_data ((stats_corr_a,stats_corr_b));",
+			"RESET default_statistics_target;",
+		},
+	}}}
+	merged := MergePlanBaselineFindings(
+		plan,
+		[]PlanBaselineFinding{{
+			ScenarioCodes: []ScenarioCode{605}, Target: "plan_index_drop_idx",
+			Statements: []string{"CREATE INDEX plan_index_drop_idx ON gsbench.plan_data(id)"},
+		}},
+		RecoveryPlanFilter{},
+	)
+	if len(merged.Items) != 2 || merged.Items[0].Target != "plan_index_drop_idx" ||
+		merged.Items[1].Target != "session analyze" {
+		t.Fatalf("merged order=%+v", merged.Items)
+	}
+}
+
+func TestRecoveryPlanEmptyReportsAlreadyRestored(t *testing.T) {
+	lines := RecoveryPlanLines(RecoveryPlan{})
+	if len(lines) != 1 || !strings.Contains(lines[0], "ALREADY_RESTORED") {
 		t.Fatalf("lines=%q", lines)
 	}
 }

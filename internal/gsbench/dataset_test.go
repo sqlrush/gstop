@@ -67,12 +67,19 @@ func TestDatasetChecksDiskCapacityBetweenBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &guardedDatasetExecutor{recordingDatasetExecutor: recordingDatasetExecutor{completed: map[string]int64{}}}
-	err = NewDatasetManager(exec).Init(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "disk safety") {
-		t.Fatalf("err=%v", err)
+	var reports []string
+	err = NewDatasetManager(exec, func(format string, args ...any) {
+		reports = append(reports, fmt.Sprintf(format, args...))
+	}).Init(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("advisory disk threshold blocked init: %v", err)
 	}
-	if exec.checks != 1 {
-		t.Fatalf("capacity checks=%d", exec.checks)
+	if exec.checks < 2 {
+		t.Fatalf("capacity checks=%d, want repeated advisory checks", exec.checks)
+	}
+	if !strings.Contains(strings.Join(reports, "\n"), "PRECHECK_WARN") ||
+		!strings.Contains(strings.Join(reports, "\n"), "disk_safety_threshold_reached") {
+		t.Fatalf("reports=%v", reports)
 	}
 }
 
@@ -1014,7 +1021,7 @@ func TestDatasetInitCatalogChecksAndValidatesExistingObjects(t *testing.T) {
 	}
 }
 
-func TestDatasetInitValidatesExistingTablesBeforeCreatingIndexes(t *testing.T) {
+func TestDatasetInitReportsExistingTableMismatchAndContinues(t *testing.T) {
 	plan, err := PlanDataset(
 		datasetConfig("quick", 1),
 		Capacity{TotalBytes: 20 << 30, FreeBytes: 20 << 30},
@@ -1043,14 +1050,21 @@ func TestDatasetInitValidatesExistingTablesBeforeCreatingIndexes(t *testing.T) {
 		},
 		version: datasetVersion,
 	}
-	err = NewDatasetManager(exec).Init(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "validate dataset table accounts") {
-		t.Fatalf("err=%v", err)
+	var progress []string
+	err = NewDatasetManager(exec, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	}).Init(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
 	}
+	created := false
 	for _, statement := range exec.statements {
 		if strings.HasPrefix(statement, "CREATE INDEX accounts_customer_idx ") {
-			t.Fatalf("dependent index was created before table validation: %s", statement)
+			created = true
 		}
+	}
+	if !created || !strings.Contains(strings.Join(progress, "\n"), "table_contract") {
+		t.Fatalf("created=%t progress=%v", created, progress)
 	}
 }
 

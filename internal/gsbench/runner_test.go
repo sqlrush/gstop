@@ -624,29 +624,33 @@ func TestRunnerVerifiesCleanExecutionWhenLegacyValidationFlagIsDisabled(t *testi
 	}
 }
 
-func TestRunnerKeepsRuntimeMeasurementsWhenModelValidationDisabled(t *testing.T) {
-	scenario := &runtimeEvidenceScenario{
-		fakeScenario: fakeScenario{name: "one", outcome: OutcomeSuccess},
-		evidence: []Evidence{{
-			Metric: "cpu_percent", Target: 95, Actual: 94, Available: true,
-		}},
-	}
-	runtime := &Runtime{RunID: "run-1"}
-	runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
-	runner.runtime.Config.Run.ValidationEnabled = false
-	summary := runner.Run(context.Background(), codes)
-	if summary.Outcome != OutcomeSuccess {
-		t.Fatalf("summary=%+v", summary)
-	}
-	var found bool
-	for _, evidence := range summary.Results[0].Evidence {
-		if evidence.Metric == "cpu_percent" && evidence.Target == 95 &&
-			evidence.Actual == 94 && evidence.Available {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("runtime measurements were discarded: %+v", summary.Results[0])
+func TestRunnerKeepsRuntimeMeasurementsRegardlessOfLegacyValidationFlag(t *testing.T) {
+	for _, validationEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("validation_%t", validationEnabled), func(t *testing.T) {
+			scenario := &runtimeEvidenceScenario{
+				fakeScenario: fakeScenario{name: "one", outcome: OutcomeSuccess},
+				evidence: []Evidence{{
+					Metric: "cpu_percent", Target: 95, Actual: 94, Available: true,
+				}},
+			}
+			runtime := &Runtime{RunID: "run-1"}
+			runner, codes := newTestRunner(t, runtime, []Scenario{scenario})
+			runner.runtime.Config.Run.ValidationEnabled = validationEnabled
+			summary := runner.Run(context.Background(), codes)
+			if summary.Outcome != OutcomeSuccess {
+				t.Fatalf("summary=%+v", summary)
+			}
+			var found bool
+			for _, evidence := range summary.Results[0].Evidence {
+				if evidence.Metric == "cpu_percent" && evidence.Target == 95 &&
+					evidence.Actual == 94 && evidence.Available {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("runtime measurements were discarded: %+v", summary.Results[0])
+			}
+		})
 	}
 }
 

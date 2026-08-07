@@ -66,7 +66,7 @@ func ScenarioWorkloadStatements(runtime *Runtime, scenario string) ([]string, er
 				kind = workMemHash
 				targetKB = runtime.Config.MemoryWorkloads.HashWorkMemKB
 			}
-			if targetKB < minWorkMemKB {
+			if targetKB <= 0 {
 				targetKB = defaultWorkMemKB
 			}
 			statement, statementErr := workMemCursorSQL(

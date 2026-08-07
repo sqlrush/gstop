@@ -53,16 +53,17 @@ func TestPlanFinalizationWaitsForTransientControlLock(t *testing.T) {
 }
 
 type planActionBackendTest struct {
-	events          []string
-	workload        planRunRecord
-	workloadErr     error
-	workloadAlive   bool
-	workloadLiveErr error
-	fault           planRunRecord
-	faultErr        error
-	applyErr        error
-	verifyErr       error
-	markActiveErr   error
+	events           []string
+	workload         planRunRecord
+	workloadErr      error
+	workloadAlive    bool
+	workloadLiveErr  error
+	fault            planRunRecord
+	faultErr         error
+	applyErr         error
+	verifyErr        error
+	markActiveErr    error
+	markFailedCtxErr error
 }
 
 func (b *planActionBackendTest) Lock(context.Context) (func() error, error) {
@@ -129,11 +130,12 @@ func (b *planActionBackendTest) MarkFaultActive(
 }
 
 func (b *planActionBackendTest) MarkFaultFailed(
-	_ context.Context,
+	ctx context.Context,
 	runID string,
 	err error,
 	restored bool,
 ) error {
+	b.markFailedCtxErr = ctx.Err()
 	b.events = append(
 		b.events,
 		fmt.Sprintf(
@@ -144,6 +146,22 @@ func (b *planActionBackendTest) MarkFaultFailed(
 		),
 	)
 	return nil
+}
+
+func TestRecordPlanFaultFailureFinalizesAfterCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	backend := &planActionBackendTest{}
+
+	err := recordPlanFaultFailure(
+		ctx, backend, "fault-601", 601, "apply plan fault", errors.New("apply failed"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "apply failed") {
+		t.Fatalf("error=%v", err)
+	}
+	if backend.markFailedCtxErr != nil {
+		t.Fatalf("finalization context error=%v", backend.markFailedCtxErr)
+	}
 }
 
 func TestExecutePlanFaultActionUsesLiveWorkloadAndOneShotFaultRun(t *testing.T) {

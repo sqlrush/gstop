@@ -265,18 +265,13 @@ func (d *Database) operationContext(parent context.Context) (context.Context, co
 	if parent == nil {
 		parent = d.ctx
 	}
-	ctx, cancelParent := context.WithCancel(d.ctx)
-	stop := context.AfterFunc(parent, cancelParent)
-	ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
-	return ctx, func() {
-		stop()
-		cancelTimeout()
-		cancelParent()
-	}
+	return context.WithTimeout(parent, timeout)
 }
 
-// maintenanceContext links long-running maintenance work to both the command
-// and database lifetimes without imposing the per-query workload timeout.
+// maintenanceContext follows the supplied operation lifetime without imposing
+// the per-query workload timeout. Normal callers pass the command context;
+// bounded finalizers may deliberately pass an independent context after a
+// command cancellation while the database pool is still open.
 // Dataset DDL such as CREATE INDEX can legitimately run longer than that
 // workload guard, especially when initializing large datasets.
 func (d *Database) maintenanceContext(
@@ -285,12 +280,7 @@ func (d *Database) maintenanceContext(
 	if parent == nil {
 		parent = d.ctx
 	}
-	ctx, cancel := context.WithCancel(d.ctx)
-	stop := context.AfterFunc(parent, cancel)
-	return ctx, func() {
-		stop()
-		cancel()
-	}
+	return context.WithCancel(parent)
 }
 
 func (d *Database) OpenTagged(parent context.Context, runID, scenario, workerID string) (*TaggedConn, error) {
@@ -460,6 +450,31 @@ func (d *Database) Scan(parent context.Context, query string, args []any, dest .
 	return d.pool.QueryRowContext(ctx, query, args...).Scan(dest...)
 }
 
+// ScanReadOnly executes a one-row probe in a database-enforced read-only
+// transaction and always rolls it back. Recovery planning uses this boundary
+// so a verifier can never turn a display-only command into a mutation path.
+func (d *Database) ScanReadOnly(
+	parent context.Context,
+	query string,
+	args []any,
+	dest ...any,
+) error {
+	ctx, cancel := d.operationContext(parent)
+	defer cancel()
+	tx, err := d.pool.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin read-only probe: %w", err)
+	}
+	scanErr := tx.QueryRowContext(ctx, query, args...).Scan(dest...)
+	rollbackErr := tx.Rollback()
+	if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		rollbackErr = fmt.Errorf("rollback read-only probe: %w", rollbackErr)
+	} else {
+		rollbackErr = nil
+	}
+	return errors.Join(scanErr, rollbackErr)
+}
+
 func (d *Database) Probe(parent context.Context, _, query string) (string, error) {
 	ctx, cancel := d.operationContext(parent)
 	defer cancel()
@@ -544,7 +559,7 @@ func taggedSessionStateSQL(
 	}
 	return "SELECT count(DISTINCT a.pid),count(l.pid) " +
 		"FROM pg_stat_activity a LEFT JOIN pg_locks l ON l.pid=a.pid " +
-		"WHERE " + predicate, args, nil
+		"WHERE " + predicate + " AND a.pid <> pg_backend_pid()", args, nil
 }
 
 func (d *Database) Close() error {

@@ -1421,6 +1421,25 @@ func TestCommandCleanupRejectsDataWithRunIDBeforeDatabaseWork(t *testing.T) {
 	}
 }
 
+func TestDatasetExecutionLeaseCoversEveryDatasetMutationEntryPoint(t *testing.T) {
+	for _, test := range []struct {
+		options CLIOptions
+		want    bool
+	}{
+		{options: CLIOptions{Command: "init"}, want: true},
+		{options: CLIOptions{Command: "run"}, want: true},
+		{options: CLIOptions{Command: "run", PlanAction: PlanRunInit}, want: true},
+		{options: CLIOptions{Command: "run", PlanAction: PlanRunFault}, want: true},
+		{options: CLIOptions{Command: "run", PlanAction: PlanRunRecover}, want: false},
+		{options: CLIOptions{Command: "restore"}, want: false},
+		{options: CLIOptions{Command: "cleanup", WithData: true}, want: false},
+	} {
+		if got := commandNeedsDatasetExecutionLease(test.options); got != test.want {
+			t.Fatalf("options=%+v got=%t want=%t", test.options, got, test.want)
+		}
+	}
+}
+
 func TestCleanupDataRejectsMissingOrUnsupportedOwnershipMarker(
 	t *testing.T,
 ) {
@@ -1500,6 +1519,26 @@ func TestRecordRunOutcomeFinishesAtStopWithoutRestore(t *testing.T) {
 	}
 	if containsAnyString(db.execArgs, string(PhaseRestore)) {
 		t.Fatalf("run completion reported a restore phase: args=%v", db.execArgs)
+	}
+}
+
+type zeroAffectedRunOutcomeExecutor struct{}
+
+func (zeroAffectedRunOutcomeExecutor) Exec(
+	context.Context,
+	string,
+	...any,
+) (sql.Result, error) {
+	return fakeJournalResult(0), nil
+}
+
+func TestRecordRunOutcomeRejectsMissingRunRow(t *testing.T) {
+	err := recordRunOutcome(
+		context.Background(), zeroAffectedRunOutcomeExecutor{}, "gsbench", "missing-run",
+		OutcomeSuccess, "complete",
+	)
+	if err == nil || !strings.Contains(err.Error(), "missing-run") {
+		t.Fatalf("error=%v", err)
 	}
 }
 

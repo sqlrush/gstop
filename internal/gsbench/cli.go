@@ -23,7 +23,6 @@ var datasetSizeRE = regexp.MustCompile(`(?i)^([0-9]+(?:\.[0-9]{1,2})?)(GB|TB)$`)
 
 var workMemSizeRE = regexp.MustCompile(`(?i)^([1-9][0-9]*)(kB|MB|GB)$`)
 
-const minWorkMemKB int64 = 64
 const defaultWorkMemKB int64 = 256 * 1024
 
 var lifecycleCommands = map[string]struct{}{
@@ -105,8 +104,8 @@ func ParseWorkMemKB(value string) (int64, error) {
 		return 0, fmt.Errorf("work_mem value is out of range")
 	}
 	workMemKB := int64(quantity * multiplier)
-	if workMemKB < minWorkMemKB {
-		return 0, fmt.Errorf("work_mem must be at least %dkB", minWorkMemKB)
+	if workMemKB <= 0 {
+		return 0, fmt.Errorf("work_mem must be positive")
 	}
 	if workMemKB > math.MaxInt64/1024 {
 		return 0, fmt.Errorf("work_mem value is out of range")
@@ -619,7 +618,7 @@ Options:
       --workers N        fixed workers for scenarios 101/102 or 201/202
       --tp-workers N     fixed TP workers for scenario 103 (use with --ap-workers)
       --ap-workers N     fixed AP workers for scenario 103 (use with --tp-workers)
-      --work-mem VALUE   work_mem for scenarios 201/202: integer kB, MB, or GB (minimum 64kB)
+      --work-mem VALUE   work_mem for scenarios 201/202: positive integer kB, MB, or GB
       --percent N        positive target percentage for selected scenarios 401/402
       --sessions N       total holder plus waiter sessions for scenarios 501-503
       --chain-depth N    positive row wait chain depth for scenario 501 (default 1)

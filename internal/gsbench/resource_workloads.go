@@ -181,7 +181,12 @@ func (s *resourceScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	}
 	if workload.RequiredStream != "" {
 		if err := s.observeRequiredStream(ctx, rt); err != nil {
-			return err
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "required_stream", Object: workload.RequiredStream,
+				Actual: err.Error(), Expected: "stream_visible_in_explain",
+				Impact: "workload_continues_without_stream_evidence",
+			})
 		}
 	}
 	workerCapacity := max(1, s.workerCapacity)

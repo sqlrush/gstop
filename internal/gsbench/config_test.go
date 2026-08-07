@@ -580,7 +580,6 @@ func TestConfigRejectsFixedWorkerOverridesIncompatibleWithFinalScenarios(t *test
 		{ScenarioCodes: []ScenarioCode{201, 203}, Workers: 2},
 		{ScenarioCodes: []ScenarioCode{201, 202}, Workers: 2, WorkMemKB: 256 * 1024},
 		{ScenarioCodes: []ScenarioCode{201, 202, 201}, WorkMemKB: 256 * 1024},
-		{ScenarioCodes: []ScenarioCode{201}, WorkMemKB: 63},
 	} {
 		if _, err := LoadConfig(path, override); err == nil {
 			t.Fatalf("accepted incompatible override %+v", override)
@@ -785,7 +784,6 @@ func TestConfigRejectsInvalidMemoryWorkloadSettings(t *testing.T) {
 	}{
 		{name: "zero sort workers", settings: "[scenario.memory_workmem_sort]\nworkers = 0\n"},
 		{name: "zero hash workers", settings: "[scenario.memory_workmem_hash]\nworkers = 0\n"},
-		{name: "sort work mem below minimum", settings: "[scenario.memory_workmem_sort]\nwork_mem = 63kB\n"},
 		{name: "hash work mem missing unit", settings: "[scenario.memory_workmem_hash]\nwork_mem = 256\n"},
 		{name: "hash work mem unsafe", settings: "[scenario.memory_workmem_hash]\nwork_mem = 64kB;RESET ALL\n"},
 	} {
@@ -800,6 +798,19 @@ func TestConfigRejectsInvalidMemoryWorkloadSettings(t *testing.T) {
 				t.Fatalf("invalid memory setting error=%v", err)
 			}
 		})
+	}
+}
+
+func TestConfigAcceptsPositiveWorkMemBelowLegacyMinimum(t *testing.T) {
+	cfg, err := LoadConfig(writeTestConfig(
+		t,
+		minimalConfig()+"\n[scenario.memory_workmem_sort]\nwork_mem = 1kB\n",
+	), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MemoryWorkloads.SortWorkMemKB != 1 {
+		t.Fatalf("sort work_mem=%d", cfg.MemoryWorkloads.SortWorkMemKB)
 	}
 }
 

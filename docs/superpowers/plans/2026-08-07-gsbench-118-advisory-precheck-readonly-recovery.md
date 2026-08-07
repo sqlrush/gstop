@@ -661,4 +661,3 @@ git log --oneline -12
 Do not deploy into `/Users/sqlrush/gstop/gsbench-local`, publish an archive, or
 push GitHub unless the user explicitly requests those external delivery actions
 after source verification.
-

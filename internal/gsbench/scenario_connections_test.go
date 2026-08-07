@@ -168,6 +168,36 @@ func TestConnectionRampSampleKeepsUnreachedTargetAdvisory(t *testing.T) {
 	}
 }
 
+func TestConnectionPrepareKeepsCapacityProbeFailureAdvisory(t *testing.T) {
+	state := &resourceExecTestState{}
+	pool := sql.OpenDB(&resourceExecTestConnector{state: state})
+	t.Cleanup(func() { _ = pool.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var warnings []PrecheckWarning
+	scenario := NewConnectionScenario()
+	err := scenario.Prepare(ctx, &Runtime{
+		Config: BenchConfig{
+			Safety:      SafetyConfig{MaxConnections: 5},
+			PoolTargets: PoolTargetConfig{ConnectionPercent: 90},
+		},
+		Database: &Database{
+			pool: pool, ctx: ctx, cancel: cancel,
+			tagged: map[*TaggedConn]struct{}{},
+		},
+		ReportWarning: func(warning PrecheckWarning) {
+			warnings = append(warnings, warning)
+		},
+	})
+	if err != nil {
+		t.Fatalf("capacity probe blocked prepare: %v", err)
+	}
+	if scenario.budget.WorkloadTarget == 0 || len(warnings) == 0 ||
+		warnings[0].Check != "capacity_probe" {
+		t.Fatalf("budget=%+v warnings=%+v", scenario.budget, warnings)
+	}
+}
+
 func TestConnectionRampDeadlineRemainsFailureWithoutWrappingDeadline(
 	t *testing.T,
 ) {

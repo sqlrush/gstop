@@ -139,17 +139,39 @@ func (s *ConnectionScenario) Strategy() string {
 	return "capacity_aware_tagged_connection_state_mix"
 }
 func (s *ConnectionScenario) Prepare(ctx context.Context, rt *Runtime) error {
+	s.targetPercent = rt.Config.PoolTargets.ConnectionPercent
 	facts, err := probeConnectionCapacity(ctx, rt)
 	if err != nil {
-		return err
+		fallbackCapacity := max(1, rt.Config.Safety.MaxConnections)
+		facts = connectionCapacityFacts{InstanceMax: fallbackCapacity}
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity_probe", Object: "connection_pool",
+			Actual: err.Error(), Expected: "database_capacity_visible",
+			Impact: fmt.Sprintf(
+				"workload_continues_with_advisory_denominator=%d",
+				fallbackCapacity,
+			),
+		})
 	}
-	s.targetPercent = rt.Config.PoolTargets.ConnectionPercent
 	s.budget, err = calculateConnectionBudget(
 		facts.InstanceMax, facts.Reserved, facts.Existing,
 		s.targetPercent,
 	)
 	if err != nil {
-		return err
+		fallbackCapacity := max(1, rt.Config.Safety.MaxConnections)
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity_shape", Object: "connection_pool",
+			Actual: err.Error(), Expected: "consistent_capacity_metadata",
+			Impact: fmt.Sprintf(
+				"workload_continues_with_advisory_denominator=%d",
+				fallbackCapacity,
+			),
+		})
+		s.budget, _ = calculateConnectionBudget(
+			fallbackCapacity, 0, 0, max(1, s.targetPercent),
+		)
 	}
 	if float64(s.targetPercent) <= s.budget.BaselinePercent {
 		runtimeWarn(rt, PrecheckWarning{

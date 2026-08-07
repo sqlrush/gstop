@@ -16,8 +16,10 @@ import (
 type advisoryLockOperation string
 
 const (
-	advisoryTryLock advisoryLockOperation = "try"
-	advisoryUnlock  advisoryLockOperation = "unlock"
+	advisoryTryLock       advisoryLockOperation = "try"
+	advisoryUnlock        advisoryLockOperation = "unlock"
+	advisoryTryLockShared advisoryLockOperation = "try_shared"
+	advisoryUnlockShared  advisoryLockOperation = "unlock_shared"
 )
 
 type advisoryLockSession interface {
@@ -53,6 +55,10 @@ func sessionAdvisoryLockQuery(
 		function = "pg_try_advisory_lock"
 	case advisoryUnlock:
 		function = "pg_advisory_unlock"
+	case advisoryTryLockShared:
+		function = "pg_try_advisory_lock_shared"
+	case advisoryUnlockShared:
+		function = "pg_advisory_unlock_shared"
 	default:
 		return "", fmt.Errorf(
 			"unsupported advisory lock operation %q",
@@ -115,6 +121,20 @@ func (s *sqlAdvisoryLockSession) Unlock(
 	key string,
 ) (bool, error) {
 	return s.queryLock(ctx, advisoryUnlock, key)
+}
+
+func (s *sqlAdvisoryLockSession) TryLockShared(
+	ctx context.Context,
+	key string,
+) (bool, error) {
+	return s.queryLock(ctx, advisoryTryLockShared, key)
+}
+
+func (s *sqlAdvisoryLockSession) UnlockShared(
+	ctx context.Context,
+	key string,
+) (bool, error) {
+	return s.queryLock(ctx, advisoryUnlockShared, key)
 }
 
 func (s *sqlAdvisoryLockSession) queryLock(

@@ -419,8 +419,8 @@ func validateFixedWorkerOverrideCompatibility(
 	if workers < 0 || tpWorkers < 0 || apWorkers < 0 {
 		return fmt.Errorf("worker counts must be positive")
 	}
-	if workMemKB < 0 || (workMemKB > 0 && workMemKB < minWorkMemKB) {
-		return fmt.Errorf("work_mem must be at least %dkB", minWorkMemKB)
+	if workMemKB < 0 {
+		return fmt.Errorf("work_mem must be positive")
 	}
 	if (tpWorkers == 0) != (apWorkers == 0) {
 		return fmt.Errorf("--tp-workers and --ap-workers must be provided together")
@@ -629,9 +629,9 @@ func (c BenchConfig) Validate() error {
 		c.MemoryWorkloads.HashWorkers <= 0 {
 		return fmt.Errorf("memory workload workers must be positive")
 	}
-	if c.MemoryWorkloads.SortWorkMemKB < minWorkMemKB ||
-		c.MemoryWorkloads.HashWorkMemKB < minWorkMemKB {
-		return fmt.Errorf("memory workload work_mem must be at least %dkB", minWorkMemKB)
+	if c.MemoryWorkloads.SortWorkMemKB <= 0 ||
+		c.MemoryWorkloads.HashWorkMemKB <= 0 {
+		return fmt.Errorf("memory workload work_mem must be positive")
 	}
 	if c.LockWorkloads.RowChainSessions < 2 ||
 		c.LockWorkloads.TableExclusiveSessions < 2 ||

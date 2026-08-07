@@ -23,6 +23,164 @@ type PlanBaselineFinding struct {
 	Detail        string
 }
 
+type datasetBaselineCatalog interface {
+	SchemaExists(context.Context, string) (bool, error)
+	DatasetObjectExists(context.Context, DatasetObject) (bool, error)
+	ValidateDatasetObject(context.Context, DatasetObject) error
+}
+
+func InspectDatasetBaseline(
+	ctx context.Context,
+	cfg BenchConfig,
+	environment Environment,
+	catalog datasetBaselineCatalog,
+) ([]PlanBaselineFinding, error) {
+	if catalog == nil {
+		return nil, fmt.Errorf("dataset baseline catalog is unavailable")
+	}
+	plan, err := PlanDataset(cfg, Capacity{}, environment)
+	if err != nil {
+		return nil, err
+	}
+	statements := append([]string(nil), plan.DDL...)
+	statements = append(statements, plan.PostMigrationDDL...)
+	findings := make([]PlanBaselineFinding, 0)
+	schemaExists, schemaErr := catalog.SchemaExists(ctx, plan.Schema)
+	if schemaErr != nil {
+		findings = append(findings, PlanBaselineFinding{
+			Check: "schema_presence", Target: plan.Schema,
+			Actual: "unavailable", Expected: "present",
+			Detail: journalSafeErrorText(schemaErr.Error()),
+		})
+	} else if !schemaExists {
+		quotedSchema, _ := quoteDatasetSchema(plan.Schema)
+		findings = append(findings, PlanBaselineFinding{
+			Check: "schema_presence", Target: plan.Schema,
+			Actual: "missing", Expected: "present",
+			Statements: []string{"CREATE SCHEMA " + quotedSchema},
+		})
+	}
+	for _, statement := range statements {
+		object, err := parseDatasetObject(statement)
+		if err != nil {
+			return nil, err
+		}
+		codes := datasetObjectScenarioCodes(cfg, environment, object)
+		if schemaErr == nil && !schemaExists {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_presence", Target: object.Name,
+				Actual: "missing", Expected: "present",
+				Statements: []string{object.DDL},
+			})
+			continue
+		}
+		exists, err := catalog.DatasetObjectExists(ctx, object)
+		if err != nil {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_presence", Target: object.Name,
+				Actual: "unavailable", Expected: "present",
+				Detail: journalSafeErrorText(err.Error()),
+			})
+			continue
+		}
+		if !exists {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_presence", Target: object.Name,
+				Actual: "missing", Expected: "present",
+				Statements: []string{object.DDL},
+			})
+			continue
+		}
+		if err := catalog.ValidateDatasetObject(ctx, object); err != nil {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_contract", Target: object.Name,
+				Actual: "mismatch", Expected: "canonical_gsbench_shape",
+				Detail: journalSafeErrorText(err.Error()),
+			})
+		}
+	}
+	return findings, nil
+}
+
+func datasetObjectScenarioCodes(
+	cfg BenchConfig,
+	environment Environment,
+	object DatasetObject,
+) []ScenarioCode {
+	dependency := object.Name
+	if object.Kind == DatasetObjectIndex {
+		if table := datasetIndexTargetTable(object.DDL); table != "" {
+			dependency = table
+		}
+	}
+	runtime := &Runtime{Config: cfg, Environment: environment}
+	codes := make([]ScenarioCode, 0)
+	for _, definition := range implementedScenarioDefinitions() {
+		var statements []string
+		var err error
+		if definition.Code >= 621 && definition.Code <= 625 {
+			var statement string
+			statement, err = HardParseStatement(
+				definition.Code,
+				cfg.Data.Schema,
+				42,
+			)
+			if err == nil {
+				statements = []string{statement}
+			}
+		} else {
+			statements, err = ScenarioWorkloadStatements(
+				runtime,
+				definition.Name,
+			)
+		}
+		if err != nil {
+			continue
+		}
+		for _, statement := range statements {
+			if sqlReferencesDatasetRelation(statement, cfg.Data.Schema, dependency) {
+				codes = append(codes, definition.Code)
+				break
+			}
+		}
+	}
+	return codes
+}
+
+func datasetIndexTargetTable(ddl string) string {
+	fields := strings.Fields(ddl)
+	for index, field := range fields {
+		if strings.EqualFold(field, "ON") && index+1 < len(fields) {
+			qualified := strings.Trim(fields[index+1], `"`)
+			if dot := strings.LastIndex(qualified, "."); dot >= 0 {
+				qualified = qualified[dot+1:]
+			}
+			return strings.Trim(qualified, `"`)
+		}
+	}
+	return ""
+}
+
+func sqlReferencesDatasetRelation(statement, schema, relation string) bool {
+	normalized := strings.ToLower(statement)
+	schema = strings.ToLower(strings.Trim(schema, `"`))
+	relation = strings.ToLower(strings.Trim(relation, `"`))
+	for _, candidate := range []string{
+		schema + "." + relation,
+		`"` + schema + `".` + relation,
+		`"` + schema + `"."` + relation + `"`,
+	} {
+		if strings.Contains(normalized, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func InspectPlanBaseline(
 	ctx context.Context,
 	db *Database,

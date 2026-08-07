@@ -153,9 +153,15 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		"SELECT high_water FROM "+quotedSchema+
 			".meta_batches WHERE table_name='plan_data'",
 		nil, &rows); err != nil {
-		return fmt.Errorf("read plan_data high-water: %w", err)
+		rows = -1
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "data_volume_probe", Object: "plan_data",
+			Actual: err.Error(), Expected: "high_water_visible",
+			Impact: "scenario_continues_without_row_count_evidence",
+		})
 	}
-	if rows < minimumRows {
+	if rows >= 0 && rows < minimumRows {
 		runtimeWarn(rt, PrecheckWarning{
 			ScenarioCode: s.Code(), Scenario: s.Name(),
 			Check: "data_volume", Object: "plan_data",
@@ -184,7 +190,13 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	for _, sqlText := range s.def.Candidates {
 		observation, err := ObserveLiteralPlan(ctx, rt.Database, sqlText, s.samples)
 		if err != nil {
-			return fmt.Errorf("observe baseline candidate: %w", err)
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "baseline_plan_probe", Object: sqlText,
+				Actual: err.Error(), Expected: "baseline_plan_visible",
+				Impact: "fault_continues_without_plan_evidence",
+			})
+			continue
 		}
 		s.baselines = append(s.baselines, observation)
 	}
@@ -210,13 +222,31 @@ func (s *PlanChangeScenario) Ramp(ctx context.Context, rt *Runtime) error {
 }
 
 func (s *PlanChangeScenario) Hold(ctx context.Context, rt *Runtime) error {
+	if len(s.baselines) == 0 {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "fault_plan_probe", Object: "all_candidates",
+			Actual: "baseline_unavailable", Expected: "plan_change_visible",
+			Impact: "fault_is_retained_for_manual_observation",
+		})
+		return nil
+	}
 	changedPlans := make(map[string]string, len(s.baselines))
 	for _, baseline := range s.baselines {
 		planText, err := explainLiteral(ctx, rt.Database, baseline.SQL)
 		if err != nil {
-			return err
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "fault_plan_probe", Object: baseline.SQL,
+				Actual: err.Error(), Expected: "changed_plan_visible",
+				Impact: "fault_is_retained_for_manual_observation",
+			})
+			continue
 		}
 		changedPlans[baseline.SQL] = planText
+	}
+	if len(changedPlans) == 0 {
+		return nil
 	}
 	baseline, _, err := SelectChangedCandidate(s.baselines, changedPlans)
 	if err != nil {

@@ -123,7 +123,7 @@ export GSBENCH_PASSWORD='数据库密码'
 
 `-s` 等价于 `--scenario`，`-d` 等价于 `--duration`；场景使用三位编号、别名或完整名称。计划跳变慢 SQL 使用固定字面量且数据由 `init` 生成。`-c/--config` 保留兼容。
 
-`init --size` 可直接指定 1 GB–2 TiB 的初始化目标（例如 `100GB`、`1.5TB`、`2TB`），
+`init --size` 可直接指定任意可解析的正数初始化目标（例如 `100GB`、`1.5TB`、`4TB`），
 优先级高于 `data.max_size_gb` 和 profile 默认值。实际压测的所有可规划业务 SQL 均以完整
 字面量发送，不携带绑定实参；数据库累计视图把常量归一化为 `?` 只是展示行为。
 

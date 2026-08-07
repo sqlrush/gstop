@@ -15,6 +15,7 @@ type planControlTestDB struct {
 	queries   []string
 	rows      [][]any
 	queryErr  error
+	forceZero bool
 }
 
 func (*planControlTestDB) Scan(
@@ -33,7 +34,45 @@ func (d *planControlTestDB) Exec(
 ) (sql.Result, error) {
 	d.execQuery = query
 	d.execArgs = append([]any(nil), args...)
+	if d.forceZero {
+		return fakeJournalResult(0), nil
+	}
 	return fakeJournalResult(1), nil
+}
+
+func TestPlanControlRejectsMissingRowsDuringFinalization(t *testing.T) {
+	db := &planControlTestDB{forceZero: true}
+	store, err := newPlanControlStore(db, "gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{name: "finish workload", call: func() error {
+			return store.FinishWorkload(
+				context.Background(), "missing-run", OutcomeSuccess, "complete",
+			)
+		}},
+		{name: "set fault phase", call: func() error {
+			return store.SetFaultPhase(
+				context.Background(), "missing-run", PhaseStop, "complete",
+			)
+		}},
+		{name: "mark fault failed", call: func() error {
+			return store.MarkFaultFailed(
+				context.Background(), "missing-run", errors.New("failed"), false,
+			)
+		}},
+	}
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			if err := check.call(); err == nil || !strings.Contains(err.Error(), "missing-run") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
 }
 
 func (d *planControlTestDB) Query(
@@ -100,7 +139,32 @@ func TestPlanControlStartsAndFinishesResidentWorkload(t *testing.T) {
 	}
 }
 
-func TestPlanControlResolvesExactlyOneResidentWorkload(t *testing.T) {
+func TestPlanControlMarksRecordedWorkloadsStaleWithoutRecovery(t *testing.T) {
+	db := &planControlTestDB{}
+	store, err := newPlanControlStore(db, "gsbench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkWorkloadsStale(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{
+		"UPDATE \"gsbench\".meta_runs",
+		"workload_preparing",
+		"workload_running",
+		"stale_report_only",
+	} {
+		if !strings.Contains(db.execQuery, token) &&
+			!containsAnyString(db.execArgs, token) {
+			t.Fatalf("query=%q args=%v missing %q", db.execQuery, db.execArgs, token)
+		}
+	}
+	if strings.Contains(db.execQuery, "meta_journal") {
+		t.Fatalf("stale workload marker touched recovery journal: %s", db.execQuery)
+	}
+}
+
+func TestPlanControlResolvesLatestResidentWorkload(t *testing.T) {
 	started := time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC)
 	db := &planControlTestDB{rows: [][]any{
 		{"workload-1", "601", "plan_baseline", "workload_running", started},
@@ -118,12 +182,13 @@ func TestPlanControlResolvesExactlyOneResidentWorkload(t *testing.T) {
 		t.Fatalf("run=%+v", run)
 	}
 
-	db.rows = append(db.rows, []any{
-		"workload-2", "602", "plan_baseline", "workload_running", started.Add(time.Second),
-	})
-	if _, err := store.ResolveWorkload(context.Background(), 601); err == nil ||
-		!strings.Contains(err.Error(), "multiple") {
-		t.Fatalf("multiple workload error=%v", err)
+	db.rows = [][]any{
+		{"workload-2", "602", "plan_baseline", "workload_running", started.Add(time.Second)},
+		{"workload-1", "601", "plan_baseline", "workload_running", started},
+	}
+	latest, err := store.ResolveAnyWorkload(context.Background())
+	if err != nil || latest.RunID != "workload-2" {
+		t.Fatalf("latest workload=%+v err=%v", latest, err)
 	}
 }
 

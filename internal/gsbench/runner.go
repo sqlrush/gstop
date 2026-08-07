@@ -564,13 +564,11 @@ func (r *Runner) runOne(
 				))
 			}
 		}
-		if !r.runtime.Config.Run.ValidationEnabled {
-			if reporter, ok := scenario.(runtimeEvidenceReporter); ok {
-				result.Evidence = append(
-					result.Evidence,
-					reporter.RuntimeEvidence()...,
-				)
-			}
+		if reporter, ok := scenario.(runtimeEvidenceReporter); ok {
+			result.Evidence = append(
+				result.Evidence,
+				reporter.RuntimeEvidence()...,
+			)
 		}
 	}
 	warnings := r.advisories.Scenario(definition.Code)

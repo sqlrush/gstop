@@ -571,7 +571,6 @@ func TestParseCLIArgsRejectsInvalidMemoryWorkloadOverrides(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "below minimum", args: []string{"run", "201", "--work-mem=63kB"}},
 		{name: "zero", args: []string{"run", "201", "--work-mem=0kB"}},
 		{name: "negative", args: []string{"run", "201", "--work-mem=-1MB"}},
 		{name: "fractional", args: []string{"run", "201", "--work-mem=1.5MB"}},
@@ -594,6 +593,13 @@ func TestParseCLIArgsRejectsInvalidMemoryWorkloadOverrides(t *testing.T) {
 				t.Fatalf("ParseCLIArgs(%v) accepted invalid memory override", test.args)
 			}
 		})
+	}
+}
+
+func TestParseWorkMemAcceptsPositiveValueBelowLegacyMinimum(t *testing.T) {
+	got, err := ParseWorkMemKB("1kB")
+	if err != nil || got != 1 {
+		t.Fatalf("work_mem=%d error=%v", got, err)
 	}
 }
 

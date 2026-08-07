@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 var errDatabaseRunLockBusy = errors.New("database run lock is busy")
@@ -15,6 +16,12 @@ type runLockSession interface {
 	Unlock(context.Context, string) (bool, error)
 	Close() error
 	Discard() error
+}
+
+type sharedRunLockSession interface {
+	runLockSession
+	TryLockShared(context.Context, string) (bool, error)
+	UnlockShared(context.Context, string) (bool, error)
 }
 
 func runExecutionLockIdentity(
@@ -31,6 +38,83 @@ func runExecutionLockIdentity(
 		cfg.Data.Schema,
 		runID,
 	), nil
+}
+
+func datasetLifecycleLockIdentity(cfg BenchConfig) string {
+	return fmt.Sprintf(
+		"gsbench:dataset-lifecycle:%s:%s",
+		cfg.Database.Database,
+		cfg.Data.Schema,
+	)
+}
+
+func withDatasetLifecycleDatabaseLock(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	acquire databaseRunLockAcquirer,
+	work func() error,
+) (err error) {
+	if acquire == nil {
+		return fmt.Errorf("dataset lifecycle lock acquirer is unavailable")
+	}
+	if work == nil {
+		return fmt.Errorf("dataset lifecycle callback is unavailable")
+	}
+	identity := datasetLifecycleLockIdentity(cfg)
+	var release func() error
+	for {
+		release, err = acquire(ctx, db, identity)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errDatabaseRunLockBusy) {
+			return fmt.Errorf("acquire dataset lifecycle lock: %w", err)
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	if release == nil {
+		return fmt.Errorf("dataset lifecycle lock release is unavailable")
+	}
+	defer func() { err = errors.Join(err, release()) }()
+	return work()
+}
+
+func withDatasetExecutionDatabaseLease(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	acquire databaseRunLockAcquirer,
+	work func() int,
+) (exitCode int, err error) {
+	if acquire == nil {
+		return 1, fmt.Errorf("dataset execution lease acquirer is unavailable")
+	}
+	if work == nil {
+		return 1, fmt.Errorf("dataset execution callback is unavailable")
+	}
+	release, err := acquire(ctx, db, datasetLifecycleLockIdentity(cfg))
+	if err != nil {
+		return 1, fmt.Errorf("acquire shared dataset execution lease: %w", err)
+	}
+	if release == nil {
+		return 1, fmt.Errorf("shared dataset execution lease release is unavailable")
+	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil {
+			exitCode = 1
+			err = fmt.Errorf("release shared dataset execution lease: %w", releaseErr)
+		}
+	}()
+	return work(), nil
 }
 
 func withRunExecutionDatabaseLock(
@@ -80,6 +164,31 @@ func AcquireDatabaseRunLock(
 		openSession = openAdvisoryLockSession
 	}
 	return acquireDatabaseRunLock(
+		ctx,
+		identity,
+		func(openCtx context.Context) (runLockSession, error) {
+			return openSession(
+				openCtx,
+				db,
+				db.cfg.Database.ApplicationName+"/advisory-lock",
+			)
+		},
+	)
+}
+
+func AcquireDatabaseSharedRunLock(
+	ctx context.Context,
+	db *Database,
+	identity string,
+) (func() error, error) {
+	if db == nil || db.pool == nil {
+		return nil, fmt.Errorf("database advisory lock connection is unavailable")
+	}
+	openSession := db.openAdvisorySession
+	if openSession == nil {
+		openSession = openAdvisoryLockSession
+	}
+	return acquireDatabaseSharedRunLock(
 		ctx,
 		identity,
 		func(openCtx context.Context) (runLockSession, error) {
@@ -210,4 +319,66 @@ func acquireDatabaseRunLock(
 		return releaseErr
 	}
 	return release, nil
+}
+
+func acquireDatabaseSharedRunLock(
+	ctx context.Context,
+	identity string,
+	open func(context.Context) (runLockSession, error),
+) (func() error, error) {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return nil, fmt.Errorf("database shared advisory lock identity is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if open == nil {
+		return nil, fmt.Errorf("database shared advisory lock session opener is required")
+	}
+	raw, err := open(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open database shared advisory lock session: %w", err)
+	}
+	session, ok := raw.(sharedRunLockSession)
+	if !ok {
+		return nil, errors.Join(
+			fmt.Errorf("database advisory lock session has no shared-lock support"),
+			raw.Close(),
+		)
+	}
+	acquired, err := session.TryLockShared(ctx, identity)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("acquire database shared advisory lock: %w", err),
+			session.Discard(),
+		)
+	}
+	if !acquired {
+		return nil, errors.Join(
+			fmt.Errorf("operation already running for lock %q", identity),
+			errDatabaseRunLockBusy,
+			session.Close(),
+		)
+	}
+	var once sync.Once
+	var releaseErr error
+	return func() error {
+		once.Do(func() {
+			released, unlockErr := session.UnlockShared(
+				context.Background(), identity,
+			)
+			if unlockErr == nil && !released {
+				unlockErr = fmt.Errorf(
+					"database shared advisory lock %q was not held", identity,
+				)
+			}
+			if unlockErr != nil {
+				releaseErr = errors.Join(unlockErr, session.Discard())
+				return
+			}
+			releaseErr = session.Close()
+		})
+		return releaseErr
+	}, nil
 }

@@ -104,8 +104,13 @@ func recordPlanFaultFailure(
 	operation string,
 	faultErr error,
 ) error {
+	finalizeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		30*time.Second,
+	)
+	defer cancel()
 	markErr := backend.MarkFaultFailed(
-		ctx,
+		finalizeCtx,
 		runID,
 		faultErr,
 		false,
@@ -519,6 +524,9 @@ func runPlanInit(
 				active.RunID,
 				active.Code,
 			)
+			if markErr := backend.control.MarkWorkloadsStale(ctx); markErr != nil {
+				log.Warn("mark stale plan workloads report-only: %v", markErr)
+			}
 		}
 	} else if !errors.Is(activeErr, errPlanWorkloadNotFound) {
 		log.Error("resolve active plan workload: %v", activeErr)
