@@ -1717,6 +1717,34 @@ func TestPoolOnlyRecoveryFailureContinuationPolicy(t *testing.T) {
 	}
 }
 
+func TestRunMetadataFailureIsAdvisoryForNonPersistentWorkload(t *testing.T) {
+	var output bytes.Buffer
+	log, err := NewRunLog(&output, "", Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	wantErr := errors.New("metadata insert denied")
+	if err := startRunWithMetadataPolicy(
+		false,
+		log,
+		func() error { return wantErr },
+	); err != nil {
+		t.Fatalf("non-persistent metadata error blocked run: %v", err)
+	}
+	if !strings.Contains(output.String(), "PRECHECK_WARN") ||
+		!strings.Contains(output.String(), "run_metadata") {
+		t.Fatalf("missing advisory warning: %s", output.String())
+	}
+	if err := startRunWithMetadataPolicy(
+		true,
+		log,
+		func() error { return wantErr },
+	); !errors.Is(err, wantErr) {
+		t.Fatalf("persistent run error=%v want=%v", err, wantErr)
+	}
+}
+
 func TestContinueAfterPoolOnlyRecoveryFailureStartsNewRun(t *testing.T) {
 	var output bytes.Buffer
 	log, err := NewRunLog(&output, "", Version)

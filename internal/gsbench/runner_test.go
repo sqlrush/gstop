@@ -504,7 +504,7 @@ func (s *resourceLifetimeScenario) Verify(context.Context, *Runtime) (Result, er
 	return Result{Scenario: s.name, Outcome: s.outcome}, nil
 }
 
-func TestRunnerUsesExactLifecycleOrder(t *testing.T) {
+func TestRunnerUsesExactLifecycleOrderWithoutPersistentRestore(t *testing.T) {
 	s := &fakeScenario{name: "one", outcome: OutcomeSuccess}
 	service := &runnerRestoreService{result: RestoreSummary{
 		Outcome: OutcomeSuccess,
@@ -519,14 +519,17 @@ func TestRunnerUsesExactLifecycleOrder(t *testing.T) {
 	if !reflect.DeepEqual(s.phases, want) {
 		t.Fatalf("phases=%v want=%v", s.phases, want)
 	}
-	if len(service.requests) != 1 {
-		t.Fatalf("coordinator calls=%d want=1", len(service.requests))
+	if len(service.requests) != 0 {
+		t.Fatalf("coordinator calls=%d want=0", len(service.requests))
 	}
 	if summary.Outcome != OutcomeSuccess {
 		t.Fatalf("summary=%+v", summary)
 	}
 	if summary.Results[0].StartedAt.IsZero() || summary.Results[0].EndedAt.IsZero() {
 		t.Fatalf("runner timestamps missing: %+v", summary.Results[0])
+	}
+	if summary.Results[0].Restore.State != "manual_recovery" {
+		t.Fatalf("restore evidence=%+v", summary.Results[0].Restore)
 	}
 }
 
@@ -647,7 +650,7 @@ func TestRunnerKeepsRuntimeMeasurementsWhenModelValidationDisabled(t *testing.T)
 	}
 }
 
-func TestRunnerStopsAllScenariosThenCallsCoordinatorExactlyOnce(t *testing.T) {
+func TestRunnerStopsAllScenariosWithoutCallingCoordinator(t *testing.T) {
 	first := &fakeScenario{name: "one", outcome: OutcomeSuccess}
 	second := &fakeScenario{name: "two", outcome: OutcomeSuccess}
 	service := &runnerRestoreService{result: RestoreSummary{
@@ -670,9 +673,7 @@ func TestRunnerStopsAllScenariosThenCallsCoordinatorExactlyOnce(t *testing.T) {
 	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
-	if len(service.requests) != 1 ||
-		service.requests[0].RunID != "run-1" ||
-		service.requests[0].completedOutcome != OutcomeSuccess {
+	if len(service.requests) != 0 {
 		t.Fatalf("restore requests=%+v", service.requests)
 	}
 	for _, scenario := range []*fakeScenario{first, second} {
@@ -771,7 +772,7 @@ func TestRunnerCompletionAndExternalRestoreRaceExecutesInverseOnce(
 	}
 }
 
-func TestRunnerUsesBoundedRestoreContextAfterWorkloadCancellation(
+func TestRunnerCancellationStopsOwnedResourcesWithoutPersistentRestore(
 	t *testing.T,
 ) {
 	const (
@@ -868,7 +869,7 @@ func TestRunnerUsesBoundedRestoreContextAfterWorkloadCancellation(
 		)
 	}
 	if summary.Results[0].Restore.Failed ||
-		summary.Results[0].Restore.State != "restored" {
+		summary.Results[0].Restore.State != "manual_recovery" {
 		t.Fatalf("restore evidence=%+v", summary.Results[0].Restore)
 	}
 	backend.mu.Lock()
@@ -878,11 +879,11 @@ func TestRunnerUsesBoundedRestoreContextAfterWorkloadCancellation(
 	unboundedContexts := backend.unboundedContexts
 	verificationPassed := backend.verificationPassed
 	backend.mu.Unlock()
-	if coordinatorCalls != 1 ||
+	if coordinatorCalls != 0 ||
 		canceledContexts != 0 ||
 		missingValues != 0 ||
 		unboundedContexts != 0 ||
-		!verificationPassed {
+		verificationPassed {
 		t.Fatalf(
 			"coordinator calls=%d canceled=%d missing_values=%d "+
 				"unbounded=%d verified=%v events=%v",
@@ -894,7 +895,7 @@ func TestRunnerUsesBoundedRestoreContextAfterWorkloadCancellation(
 			events.snapshot(),
 		)
 	}
-	if inverseCalls != 1 || len(executor.verifyActions) != 1 {
+	if inverseCalls != 0 || len(executor.verifyActions) != 0 {
 		t.Fatalf(
 			"inverse calls=%d action verifications=%d",
 			inverseCalls,
@@ -905,33 +906,26 @@ func TestRunnerUsesBoundedRestoreContextAfterWorkloadCancellation(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 0 {
-		t.Fatalf("pending actions after restore=%+v", pending)
+	if len(pending) != 1 {
+		t.Fatalf("pending actions must remain visible=%+v", pending)
 	}
 	gotEvents := events.snapshot()
-	if len(gotEvents) < 3 {
+	if len(gotEvents) < 2 {
 		t.Fatalf("events=%v", gotEvents)
 	}
-	coordinatorIndex := -1
-	stopsBeforeCoordinator := map[string]bool{}
-	for index, event := range gotEvents {
-		if event == "coordinator" {
-			coordinatorIndex = index
-			break
-		}
-		stopsBeforeCoordinator[event] = true
+	stopped := map[string]bool{}
+	for _, event := range gotEvents {
+		stopped[event] = true
 	}
-	if coordinatorIndex < 2 ||
-		!stopsBeforeCoordinator["stop:first"] ||
-		!stopsBeforeCoordinator["stop:second"] {
+	if !stopped["stop:first"] || !stopped["stop:second"] {
 		t.Fatalf(
-			"not every scenario stopped before coordinator: %v",
+			"not every scenario stopped: %v",
 			gotEvents,
 		)
 	}
 	phaseMu.Lock()
 	defer phaseMu.Unlock()
-	if restorePhaseContexts != 4 ||
+	if restorePhaseContexts != 0 ||
 		canceledRestorePhaseContexts != 0 ||
 		missingRestorePhaseValues != 0 {
 		t.Fatalf(
@@ -943,7 +937,7 @@ func TestRunnerUsesBoundedRestoreContextAfterWorkloadCancellation(
 	}
 }
 
-func TestRunnerCallsCoordinatorAfterRampFailure(t *testing.T) {
+func TestRunnerDoesNotCallCoordinatorAfterRampFailure(t *testing.T) {
 	s := &fakeScenario{name: "one", failPhase: PhaseRamp, outcome: OutcomeSuccess}
 	service := &runnerRestoreService{result: RestoreSummary{
 		Outcome: OutcomeSuccess,
@@ -958,15 +952,8 @@ func TestRunnerCallsCoordinatorAfterRampFailure(t *testing.T) {
 	if !reflect.DeepEqual(s.phases, want) {
 		t.Fatalf("phases=%v want=%v", s.phases, want)
 	}
-	if len(service.requests) != 1 {
-		t.Fatalf("coordinator calls=%d want=1", len(service.requests))
-	}
-	if service.requests[0].completedOutcome != OutcomeFailed {
-		t.Fatalf(
-			"coordinator completion outcome=%s want=%s",
-			service.requests[0].completedOutcome,
-			OutcomeFailed,
-		)
+	if len(service.requests) != 0 {
+		t.Fatalf("coordinator calls=%d want=0", len(service.requests))
 	}
 	if summary.Outcome != OutcomeFailed {
 		t.Fatalf("summary=%+v", summary)
@@ -995,7 +982,7 @@ func TestRunnerTargetFailureDoesNotCancelOtherScenario(t *testing.T) {
 	}
 }
 
-func TestRunnerPassesAdvisoryVerificationOutcomeToCoordinator(t *testing.T) {
+func TestRunnerDoesNotPassAdvisoryOutcomeToCoordinator(t *testing.T) {
 	scenario := &fakeScenario{name: "one", outcome: OutcomeDegraded}
 	service := &runnerRestoreService{result: RestoreSummary{
 		Outcome: OutcomeSuccess,
@@ -1011,8 +998,7 @@ func TestRunnerPassesAdvisoryVerificationOutcomeToCoordinator(t *testing.T) {
 	if summary.Outcome != OutcomeCompletedWithWarnings {
 		t.Fatalf("summary=%+v", summary)
 	}
-	if len(service.requests) != 1 ||
-		service.requests[0].completedOutcome != OutcomeCompletedWithWarnings {
+	if len(service.requests) != 0 {
 		t.Fatalf("restore requests=%+v", service.requests)
 	}
 }
@@ -1239,8 +1225,8 @@ func TestRunnerPlanPreflightFailureWarnsAndContinues(t *testing.T) {
 		t.Fatalf("phases=%v", scenario.phases)
 	}
 	assertPrecheckWarning(t, summary.Results[0], "workload_plan")
-	if len(service.requests) != 1 {
-		t.Fatalf("coordinator calls=%d want=1", len(service.requests))
+	if len(service.requests) != 0 {
+		t.Fatalf("coordinator calls=%d want=0", len(service.requests))
 	}
 }
 
@@ -1700,11 +1686,10 @@ func TestRunnerPopulatesCatalogEnvironmentAndRestoreEvidence(t *testing.T) {
 		result.Targets[0].Port != 5432 {
 		t.Fatalf("targets=%+v", result.Targets)
 	}
-	if result.Restore.State != "restored" ||
-		result.Restore.Outcome != OutcomeSuccess ||
-		result.Restore.PlannedActions != 2 ||
-		len(result.Restore.RunIDs) != 1 ||
-		result.Restore.RunIDs[0] != "run-1" ||
+	if result.Restore.State != "manual_recovery" ||
+		result.Restore.Outcome != "" ||
+		result.Restore.PlannedActions != 0 ||
+		len(result.Restore.RunIDs) != 0 ||
 		result.Restore.Failed {
 		t.Fatalf("restore=%+v", result.Restore)
 	}
@@ -1714,7 +1699,7 @@ func TestRunnerPopulatesCatalogEnvironmentAndRestoreEvidence(t *testing.T) {
 	}
 }
 
-func TestRunnerReportsRestoreAndVerifyRestoreAfterEveryScenarioStops(
+func TestRunnerNeverReportsPersistentRestorePhases(
 	t *testing.T,
 ) {
 	first := &fakeScenario{name: "one", outcome: OutcomeSuccess}
@@ -1750,8 +1735,8 @@ func TestRunnerReportsRestoreAndVerifyRestoreAfterEveryScenarioStops(
 
 	got := runner.Run(context.Background(), codes)
 
-	if len(service.requests) != 1 {
-		t.Fatalf("coordinator calls=%d want=1", len(service.requests))
+	if len(service.requests) != 0 {
+		t.Fatalf("coordinator calls=%d want=0", len(service.requests))
 	}
 	for _, scenario := range []*fakeScenario{first, second} {
 		if len(scenario.phases) == 0 ||
@@ -1763,24 +1748,17 @@ func TestRunnerReportsRestoreAndVerifyRestoreAfterEveryScenarioStops(
 			)
 		}
 	}
-	wantReported := []string{
-		"one:restore", "two:restore",
-		"one:verify_restore", "two:verify_restore",
-	}
+	var wantReported []string
 	if !reflect.DeepEqual(reported, wantReported) {
 		t.Fatalf("reported=%v want=%v", reported, wantReported)
 	}
-	if got.Outcome != OutcomeRestoreFailed {
+	if got.Outcome != OutcomeSuccess {
 		t.Fatalf("summary=%+v", got)
 	}
 	for _, result := range got.Results {
-		if result.Outcome != OutcomeRestoreFailed ||
-			result.Restore.State != "restore_failed" ||
-			!result.Restore.Failed ||
-			!strings.Contains(
-				result.Restore.Error,
-				"verification failed",
-			) {
+		if result.Outcome != OutcomeSuccess ||
+			result.Restore.State != "manual_recovery" ||
+			result.Restore.Failed {
 			t.Fatalf("result=%+v", result)
 		}
 	}

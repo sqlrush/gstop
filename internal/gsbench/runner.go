@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"sync"
 	"time"
 )
@@ -222,47 +221,11 @@ func (r *Runner) Run(ctx context.Context, codes []ScenarioCode) RunSummary {
 	close(barrier.ready)
 	wg.Wait()
 	summary := RunSummary{RunID: r.runtime.RunID, Outcome: OutcomeSuccess, Results: results}
-	for _, result := range results {
+	for index, result := range results {
+		summary.Results[index].Restore = RestoreEvidence{
+			State: "manual_recovery",
+		}
 		summary.Outcome = worseOutcome(summary.Outcome, result.Outcome)
-	}
-	if !restoreServiceIsNil(r.runtime.RestoreService) {
-		restoreCtx := context.WithoutCancel(ctx)
-		for index, result := range results {
-			if constructed[index] {
-				r.reportPhase(
-					restoreCtx,
-					result.Scenario,
-					PhaseRestore,
-				)
-			}
-		}
-		restored := r.runtime.RestoreService.Restore(
-			restoreCtx,
-			RestoreRequest{
-				RunID:            r.runtime.RunID,
-				completedOutcome: summary.Outcome,
-			},
-		)
-		restoreEvidence := evidenceForRestoreSummary(restored)
-		for index := range summary.Results {
-			summary.Results[index].Restore = restoreEvidence
-			summary.Results[index].EndedAt = time.Now()
-		}
-		for index, result := range summary.Results {
-			if constructed[index] {
-				r.reportPhase(
-					restoreCtx,
-					result.Scenario,
-					PhaseVerifyRestore,
-				)
-			}
-		}
-		if restored.Failed {
-			summary.Outcome = OutcomeRestoreFailed
-			for index := range summary.Results {
-				summary.Results[index].Outcome = OutcomeRestoreFailed
-			}
-		}
 	}
 	return summary
 }
@@ -365,27 +328,6 @@ func targetsForEnvironment(
 		}
 	}
 	return targets
-}
-
-func evidenceForRestoreSummary(
-	summary RestoreSummary,
-) RestoreEvidence {
-	state := "restored"
-	if summary.Failed {
-		state = "restore_failed"
-	}
-	var detail string
-	if summary.Err != nil {
-		detail = summary.Err.Error()
-	}
-	return RestoreEvidence{
-		State:          state,
-		Outcome:        summary.Outcome,
-		RunIDs:         append([]string{}, summary.RunIDs...),
-		PlannedActions: len(summary.PlannedActions),
-		Failed:         summary.Failed,
-		Error:          detail,
-	}
 }
 
 func (r *Runner) runOne(
@@ -654,24 +596,6 @@ func (r *Runner) runOne(
 	)
 	result.EndedAt = time.Now()
 	return result, scenario != nil
-}
-
-func restoreServiceIsNil(service restoreService) bool {
-	if service == nil {
-		return true
-	}
-	value := reflect.ValueOf(service)
-	switch value.Kind() {
-	case reflect.Chan,
-		reflect.Func,
-		reflect.Interface,
-		reflect.Map,
-		reflect.Pointer,
-		reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
 
 func runDurationElapsed(parentCtx, workloadCtx context.Context, err error) bool {

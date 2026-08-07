@@ -640,10 +640,7 @@ func commandRun(
 	if cfg.Run.DryRun {
 		for _, code := range cfg.Run.ScenarioCodes {
 			definition := DefaultScenarioCatalog().MustCode(code)
-			lifecycle := "preflight,prepare,ramp,hold,stop,restore"
-			if cfg.Run.ValidationEnabled {
-				lifecycle = "preflight,prepare,ramp,hold,verify,stop,restore,verify_restore"
-			}
+			lifecycle := "preflight,prepare,ramp,hold,verify,stop"
 			log.Info(
 				"DRY-RUN scenario=%03d name=%s lifecycle=%s",
 				code,
@@ -795,12 +792,36 @@ func commandRunCore(
 		log,
 		DefaultFaultProviderRegistry(),
 	)
-	// Run preparation always executes under the outer plan/schema lock.
-	// The restore backend must not try to reacquire that session lock.
-	backend.requirePlanLock = false
-	backend.skipLiveExecutionRuns = true
+	stale, staleErr := ReadStaleRecoveryStatus(
+		parent,
+		journal,
+		backend.ledger,
+	)
+	if len(stale.RunIDs) != 0 || staleErr != nil {
+		warning := PrecheckWarning{
+			Check:  "stale_recovery",
+			Object: "journal_and_ledger",
+			Actual: fmt.Sprintf(
+				"runs=%d database_runs=%d local_actions=%d error=%v",
+				len(stale.RunIDs),
+				stale.DatabaseRunCount,
+				stale.LocalActionCount,
+				staleErr,
+			),
+			Expected: "no_pending_recovery",
+			Impact:   "run_continues; review gsbench restore",
+		}
+		log.Warn("%s", warning.LogLine())
+		for _, staleRunID := range stale.RunIDs {
+			log.Warn(
+				"stale run_id=%s action=report_only hint=gsbench_restore",
+				staleRunID,
+			)
+		}
+	}
+	planChangeRun := scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes)
 	startPreparedRun := func(ctx context.Context) error {
-		if scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes) {
+		if planChangeRun {
 			activeRunID, err := findActivePlanRun(
 				ctx,
 				db,
@@ -813,11 +834,14 @@ func commandRunCore(
 				)
 			}
 			if activeRunID != "" {
-				return fmt.Errorf(
-					"plan-change run %s is already active; "+
-						"stop or restore it first",
-					activeRunID,
-				)
+				warning := PrecheckWarning{
+					Check:    "active_plan_run",
+					Object:   activeRunID,
+					Actual:   "recorded_active",
+					Expected: "no_active_plan_run",
+					Impact:   "run_continues_under_current_plan_lock",
+				}
+				log.Warn("%s", warning.LogLine())
 			}
 			if err := preparePlanRunBaseline(
 				ctx,
@@ -830,92 +854,25 @@ func commandRunCore(
 				return err
 			}
 		}
-		return startRun(ctx, db, cfg, runID)
-	}
-	var staleSummary RestoreSummary
-	prepareRun := func() int {
-		staleSummary = NewRestoreCoordinatorWithValidation(
-			backend,
-			cfg.Run.ValidationEnabled,
-		).Restore(
-			parent,
-			RestoreRequest{afterSuccess: func(
-				ctx context.Context,
-				_ RestoreLock,
-			) error {
-				return startPreparedRun(ctx)
-			}},
+		return startRunWithMetadataPolicy(
+			planChangeRun,
+			log,
+			func() error { return startRun(ctx, db, cfg, runID) },
 		)
-		if staleSummary.Failed {
-			if err := continueAfterPoolOnlyRecoveryFailure(
-				staleSummary,
-				log,
-				func() error {
-					return startPreparedRun(parent)
-				},
-			); err != nil {
-				log.Error("recover stale state and record run: %v", err)
-				return 1
-			}
-			return 0
-		}
-		if len(staleSummary.RunIDs) != 0 {
-			log.Info(
-				"stale recovery SUCCESS runs=%d actions=%d",
-				len(staleSummary.RunIDs),
-				len(staleSummary.PlannedActions),
-			)
-		}
-		return 0
 	}
-	prepareCode, prepareLockErr := withPlanRunPreparationDatabaseLock(
-		parent,
-		db,
-		cfg,
-		scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes),
-		AcquireDatabaseRunLock,
-		prepareRun,
-	)
-	if prepareLockErr != nil {
-		log.Error("plan baseline lock for stale recovery: %v", prepareLockErr)
+	if err := startPreparedRun(parent); err != nil {
+		log.Error("prepare and record run: %v", err)
 		return 1
-	}
-	if prepareCode != 0 {
-		return prepareCode
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	go watchStop(ctx, db, cfg.Data.Schema, runID, cancel)
-	restoreBackend, closeRestoreBackend, err := newIsolatedRunRestoreBackend(
-		ctx,
-		cfg,
-		log,
-		DefaultFaultProviderRegistry(),
-		OpenRestoreDatabase,
-	)
-	if err != nil {
-		log.Error("open isolated run restore database: %v", err)
-		return 1
-	}
-	defer func() {
-		if err := closeRestoreBackend(); err != nil {
-			log.Error("close isolated run restore database: %v", err)
-		}
-	}()
-	// Plan scenarios keep the outer plan/schema lock through Runner restore.
-	// A non-plan run cannot journal plan baseline actions, so requiring the
-	// plan lock here would only make unrelated cleanup conflict with a plan run.
-	restoreBackend.requirePlanLock = false
 	runtime := &Runtime{
 		Config: cfg, Database: db, Capabilities: caps, Journal: journal,
 		Environment: environment, Catalog: DefaultScenarioCatalog(),
-		Provider: restoreBackend.provider, Ledger: restoreBackend.ledger,
+		Provider: backend.provider, Ledger: backend.ledger,
 		Log: log, RunID: runID, AllowRisk: allowRisk,
 	}
-	runtime.RestoreService = NewRestoreCoordinatorWithValidation(
-		restoreBackend,
-		cfg.Run.ValidationEnabled,
-	)
 	runtime.PlanPreflight = func(
 		preflightCtx context.Context,
 		scenario string,
@@ -944,6 +901,32 @@ func commandRunCore(
 		}
 	}
 	return exitCodeForOutcome(summary.Outcome)
+}
+
+func startRunWithMetadataPolicy(
+	persistentMutation bool,
+	log *RunLog,
+	start func() error,
+) error {
+	if start == nil {
+		return fmt.Errorf("run metadata recorder is unavailable")
+	}
+	if err := start(); err != nil {
+		if persistentMutation {
+			return err
+		}
+		warning := PrecheckWarning{
+			Check:    "run_metadata",
+			Object:   "meta_runs",
+			Actual:   err.Error(),
+			Expected: "run_row_recorded",
+			Impact:   "status_and_stop_tracking_may_be_unavailable",
+		}
+		if log != nil {
+			log.Warn("%s", warning.LogLine())
+		}
+	}
+	return nil
 }
 
 func canContinueAfterPoolOnlyRecoveryFailure(
