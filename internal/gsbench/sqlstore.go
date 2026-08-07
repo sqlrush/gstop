@@ -779,11 +779,12 @@ func canonicalDatasetDistribution(
 }
 
 type datasetIndexShape struct {
-	unique bool
-	name   string
-	target string
-	method string
-	body   string
+	unique         bool
+	name           string
+	target         string
+	method         string
+	methodExplicit bool
+	body           string
 }
 
 func datasetIndexMatches(actual, expected string) bool {
@@ -793,8 +794,21 @@ func datasetIndexMatches(actual, expected string) bool {
 		actualShape.unique == expectedShape.unique &&
 		datasetIndexObjectMatches(actualShape.name, expectedShape.name) &&
 		datasetIndexObjectMatches(actualShape.target, expectedShape.target) &&
-		actualShape.method == expectedShape.method &&
+		datasetIndexMethodMatches(actualShape, expectedShape) &&
 		actualShape.body == expectedShape.body
+}
+
+func datasetIndexMethodMatches(
+	actual,
+	expected datasetIndexShape,
+) bool {
+	if expected.methodExplicit {
+		return actual.methodExplicit && actual.method == expected.method
+	}
+	if !actual.methodExplicit {
+		return true
+	}
+	return actual.method == "btree" || actual.method == "ubtree"
 }
 
 func parseDatasetIndexShape(definition string) (datasetIndexShape, bool) {
@@ -811,7 +825,7 @@ func parseDatasetIndexShape(definition string) (datasetIndexShape, bool) {
 		"create index ", 1,
 	)
 
-	shape := datasetIndexShape{method: "btree"}
+	shape := datasetIndexShape{}
 	prefix := "create index "
 	if strings.HasPrefix(value, "create unique index ") {
 		shape.unique = true
@@ -835,11 +849,12 @@ func parseDatasetIndexShape(definition string) (datasetIndexShape, bool) {
 		shape.method = strings.TrimSpace(
 			shape.target[using+len(" using "):],
 		)
+		shape.methodExplicit = true
 		shape.target = strings.TrimSpace(shape.target[:using])
 	}
 	if !datasetIndexObjectValid(shape.name) ||
 		!datasetIndexObjectValid(shape.target) ||
-		!identifierRE.MatchString(shape.method) {
+		shape.methodExplicit && !identifierRE.MatchString(shape.method) {
 		return datasetIndexShape{}, false
 	}
 	// CREATE INDEX without TABLESPACE follows the active default tablespace;
