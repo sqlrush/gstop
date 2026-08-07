@@ -19,8 +19,6 @@ const Version = "v1.1.7"
 
 const ConfigEnv = "GSBENCH_CONFIG"
 
-const maxDatasetBytes int64 = 2 << 40
-
 var datasetSizeRE = regexp.MustCompile(`(?i)^([0-9]+(?:\.[0-9]{1,2})?)(GB|TB)$`)
 
 var workMemSizeRE = regexp.MustCompile(`(?i)^([1-9][0-9]*)(kB|MB|GB)$`)
@@ -76,9 +74,13 @@ func ParseDatasetSize(value string) (int64, error) {
 	if strings.EqualFold(match[2], "TB") {
 		unit = float64(int64(1 << 40))
 	}
-	bytes := int64(math.Round(number * unit))
-	if bytes < 1<<30 || bytes > maxDatasetBytes {
-		return 0, fmt.Errorf("size must be between 1GB and 2TB")
+	requested := number * unit
+	if requested > float64(math.MaxInt64) {
+		return 0, fmt.Errorf("size is out of range")
+	}
+	bytes := int64(math.Round(requested))
+	if bytes <= 0 {
+		return 0, fmt.Errorf("size must be positive")
 	}
 	return bytes, nil
 }
@@ -204,9 +206,8 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	if percentSet && command != "run" {
 		return CLIOptions{}, fmt.Errorf("--percent is only valid with run")
 	}
-	if percentSet &&
-		(options.PoolPercent < 1 || options.PoolPercent > 100) {
-		return CLIOptions{}, fmt.Errorf("--percent must be between 1 and 100")
+	if percentSet && options.PoolPercent < 1 {
+		return CLIOptions{}, fmt.Errorf("--percent must be positive")
 	}
 	if (workerOverrideSet || planWorkersSet || workMemSet || lockOverrideSet) && command != "run" {
 		return CLIOptions{}, fmt.Errorf("workload overrides are only valid with run")
@@ -226,8 +227,8 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	if sessionsSet && options.Sessions < 2 {
 		return CLIOptions{}, fmt.Errorf("--sessions must be at least 2")
 	}
-	if chainDepthSet && (options.ChainDepth < 1 || options.ChainDepth > 5) {
-		return CLIOptions{}, fmt.Errorf("--chain-depth must be between 1 and 5")
+	if chainDepthSet && options.ChainDepth < 1 {
+		return CLIOptions{}, fmt.Errorf("--chain-depth must be positive")
 	}
 	if workMemSet {
 		workMemKB, err := ParseWorkMemKB(workMemText)
@@ -365,8 +366,8 @@ func validatePoolPercentOverride(
 	codes []ScenarioCode,
 	percent int,
 ) error {
-	if percent < 1 || percent > 100 {
-		return fmt.Errorf("pool target percent must be between 1 and 100")
+	if percent < 1 {
+		return fmt.Errorf("pool target percent must be positive")
 	}
 	for _, code := range codes {
 		if code == 401 || code == 402 {

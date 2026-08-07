@@ -141,9 +141,6 @@ func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPl
 	}
 	capacityValid := capacity.TotalBytes > 0 && capacity.FreeBytes > 0 &&
 		capacity.FreeBytes <= capacity.TotalBytes
-	if cfg.Run.ValidationEnabled && !capacityValid {
-		return DatasetPlan{}, fmt.Errorf("invalid disk capacity: %+v", capacity)
-	}
 	minFree := cfg.Data.MinFreeDiskPercent
 	if minFree == 0 {
 		minFree = 20
@@ -170,30 +167,6 @@ func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPl
 			}
 		}
 		target = requestedGB << 30
-	}
-	if target < 1<<30 {
-		return DatasetPlan{}, fmt.Errorf("dataset target %d is below 1GB", target)
-	}
-	if target > maxDatasetBytes {
-		return DatasetPlan{}, fmt.Errorf("dataset target %d exceeds 2TB", target)
-	}
-	profileCapGB := cfg.Safety.ProfileCapGB
-	if profileCapGB <= 0 {
-		profileCapGB = 256
-	}
-	profileCapBytes := int64(profileCapGB) << 30
-	if target > profileCapBytes {
-		return DatasetPlan{}, fmt.Errorf(
-			"dataset target %d exceeds safety profile cap %dGB",
-			target,
-			profileCapGB,
-		)
-	}
-	if cfg.Run.ValidationEnabled && target > available {
-		return DatasetPlan{}, fmt.Errorf(
-			"dataset capacity rejected: target=%d free=%d reserved=%d safe_available=%d",
-			target, capacity.FreeBytes, reserved, available,
-		)
 	}
 	plan := DatasetPlan{
 		Schema:            cfg.Data.Schema,

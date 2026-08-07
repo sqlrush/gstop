@@ -1,6 +1,7 @@
 package gsbench
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -93,5 +94,56 @@ func TestCompletedWithWarningsHasZeroExitWithoutHidingFailure(t *testing.T) {
 	}
 	if got := worseOutcome(OutcomeCompletedWithWarnings, OutcomeFailed); got != OutcomeFailed {
 		t.Fatalf("worse warning/failure outcome=%s want=%s", got, OutcomeFailed)
+	}
+}
+
+func TestDeprecatedConfigWarningsIdentifyNonEnforcingKeys(t *testing.T) {
+	cfg := BenchConfig{
+		Run:  RunConfig{ValidationEnabled: true},
+		Data: DataConfig{MaxSizeGB: 7, MinFreeDiskPercent: 8},
+		Safety: SafetyConfig{
+			RestoreOnExit:       false,
+			RestoreOriginalRole: true,
+			MaxWorkers:          4,
+			MaxConnections:      5,
+			ProfileCapGB:        6,
+		},
+	}
+	warnings := deprecatedConfigWarnings(cfg)
+	want := []string{
+		"run.validation_enabled",
+		"safety.restore_on_exit",
+		"safety.restore_original_role",
+		"safety.max_workers",
+		"safety.max_connections",
+		"safety.profile_cap_gb",
+		"data.max_size_gb",
+		"data.min_free_disk_percent",
+	}
+	if len(warnings) != len(want) {
+		t.Fatalf("deprecated warnings=%+v", warnings)
+	}
+	for index, object := range want {
+		warning := warnings[index]
+		if warning.Check != "deprecated_config" || warning.Object != object ||
+			warning.Impact != "accepted_but_not_enforced" {
+			t.Errorf("warning[%d]=%+v", index, warning)
+		}
+	}
+}
+
+func TestLogDeprecatedConfigWarningsWritesEachWarningOnce(t *testing.T) {
+	var output bytes.Buffer
+	log, err := NewRunLog(&output, "", Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logDeprecatedConfigWarnings(BenchConfig{}, log)
+	if got := strings.Count(output.String(), "PRECHECK_WARN"); got != 8 {
+		t.Fatalf("deprecated warning lines=%d output=%q", got, output.String())
+	}
+	if !strings.Contains(output.String(), "object=safety.max_connections") ||
+		!strings.Contains(output.String(), "impact=accepted_but_not_enforced") {
+		t.Fatalf("deprecated warnings missing details: %q", output.String())
 	}
 }

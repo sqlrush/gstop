@@ -70,6 +70,39 @@ type AdvisoryCollector struct {
 	warnings []PrecheckWarning
 }
 
+func deprecatedConfigWarnings(cfg BenchConfig) []PrecheckWarning {
+	values := []struct {
+		object string
+		actual any
+	}{
+		{"run.validation_enabled", cfg.Run.ValidationEnabled},
+		{"safety.restore_on_exit", cfg.Safety.RestoreOnExit},
+		{"safety.restore_original_role", cfg.Safety.RestoreOriginalRole},
+		{"safety.max_workers", cfg.Safety.MaxWorkers},
+		{"safety.max_connections", cfg.Safety.MaxConnections},
+		{"safety.profile_cap_gb", cfg.Safety.ProfileCapGB},
+		{"data.max_size_gb", cfg.Data.MaxSizeGB},
+		{"data.min_free_disk_percent", cfg.Data.MinFreeDiskPercent},
+	}
+	warnings := make([]PrecheckWarning, 0, len(values))
+	for _, value := range values {
+		warnings = append(warnings, PrecheckWarning{
+			Check:    "deprecated_config",
+			Object:   value.object,
+			Actual:   fmt.Sprint(value.actual),
+			Expected: "advisory_only",
+			Impact:   "accepted_but_not_enforced",
+		})
+	}
+	return warnings
+}
+
+func logDeprecatedConfigWarnings(cfg BenchConfig, log *RunLog) {
+	for _, warning := range deprecatedConfigWarnings(cfg) {
+		log.Warn("%s", warning.LogLine())
+	}
+}
+
 func (c *AdvisoryCollector) Report(warning PrecheckWarning) {
 	if c == nil {
 		return

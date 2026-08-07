@@ -125,7 +125,7 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 		logger.Info("command=%s run_id=%s config=%s", options.Command, runID, cfg.Path)
 	}
 	logger.Info("database=%s", cfg.Redacted())
-	logger.Info("runtime_validation_enabled=%v", cfg.Run.ValidationEnabled)
+	logDeprecatedConfigWarnings(cfg, logger)
 	openDatabase := OpenDatabase
 	if options.Command == "restore" || options.Command == "stop" {
 		openDatabase = OpenRestoreDatabase

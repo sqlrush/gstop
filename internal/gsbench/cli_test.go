@@ -281,7 +281,6 @@ func TestParseCLIArgsRejectsInvalidPoolTargetPercent(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "401", "--percent", "0"},
 		{"run", "401", "--percent", "-1"},
-		{"run", "402", "--percent", "101"},
 		{"run", "401", "--percent", "1.5"},
 		{"run", "301", "--percent", "90"},
 		{"doctor", "--scenario", "401", "--percent", "90"},
@@ -289,6 +288,28 @@ func TestParseCLIArgsRejectsInvalidPoolTargetPercent(t *testing.T) {
 		if _, err := ParseCLIArgs(args); err == nil {
 			t.Fatalf("ParseCLIArgs(%v) accepted invalid pool target", args)
 		}
+	}
+}
+
+func TestParseCLIArgsAllowsPoolTargetAboveOneHundred(t *testing.T) {
+	options, err := ParseCLIArgs([]string{"run", "401", "--percent", "125"})
+	if err != nil {
+		t.Fatalf("advisory pool target was rejected: %v", err)
+	}
+	if options.PoolPercent != 125 {
+		t.Fatalf("pool percent=%d want=125", options.PoolPercent)
+	}
+}
+
+func TestParseCLIArgsAllowsChainDepthAboveLegacyMaximum(t *testing.T) {
+	options, err := ParseCLIArgs([]string{
+		"run", "501", "--sessions", "8", "--chain-depth", "6",
+	})
+	if err != nil {
+		t.Fatalf("advisory chain depth was rejected: %v", err)
+	}
+	if options.ChainDepth != 6 || options.Sessions != 8 {
+		t.Fatalf("lock overrides=%+v", options)
 	}
 }
 
@@ -532,7 +553,6 @@ func TestParseCLIArgsRejectsInvalidLockWorkloadOverrides(t *testing.T) {
 		{name: "one session", args: []string{"run", "501", "--sessions=1"}},
 		{name: "depth exceeds sessions", args: []string{"run", "501", "--sessions=2", "--chain-depth=2"}},
 		{name: "zero depth", args: []string{"run", "501", "--chain-depth=0"}},
-		{name: "depth above five", args: []string{"run", "501", "--chain-depth=6"}},
 		{name: "depth on 502", args: []string{"run", "502", "--chain-depth=2"}},
 		{name: "sessions on CPU scenario", args: []string{"run", "101", "--sessions=2"}},
 		{name: "non-run command", args: []string{"doctor", "--sessions=2"}},
@@ -1090,9 +1110,21 @@ func TestParseDatasetSize(t *testing.T) {
 			t.Fatalf("%s: got=%d err=%v want=%d", input, got, err, want)
 		}
 	}
-	for _, input := range []string{"", "0GB", "512MB", "2.01TB", "2049GB", "1.234TB"} {
+	for _, input := range []string{"", "0GB", "512MB", "1.234TB"} {
 		if _, err := ParseDatasetSize(input); err == nil {
 			t.Fatalf("%s: expected error", input)
+		}
+	}
+}
+
+func TestParseDatasetSizeAllowsValuesOutsideLegacyPolicyRange(t *testing.T) {
+	for input, want := range map[string]int64{
+		"0.5GB": 1 << 29,
+		"4TB":   4 << 40,
+	} {
+		got, err := ParseDatasetSize(input)
+		if err != nil || got != want {
+			t.Fatalf("%s: got=%d err=%v want=%d", input, got, err, want)
 		}
 	}
 }

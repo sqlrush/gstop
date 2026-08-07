@@ -102,21 +102,22 @@ func TestDatasetStressPlanDefaultsToAtMostTwentyGB(t *testing.T) {
 	}
 }
 
-func TestDatasetExplicitSizeCannotExceedProfileCap(t *testing.T) {
+func TestDatasetExplicitSizeIgnoresLegacyProfileCap(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.TargetBytes = 100 << 30
 	cfg.Safety.ProfileCapGB = 64
-	_, err := PlanDataset(cfg, Capacity{TotalBytes: 1 << 40, FreeBytes: 1 << 40}, testDatasetEnvironment())
-	if err == nil || !strings.Contains(err.Error(), "profile cap") {
-		t.Fatalf("error=%v", err)
+	plan, err := PlanDataset(cfg, Capacity{TotalBytes: 1 << 40, FreeBytes: 1 << 40}, testDatasetEnvironment())
+	if err != nil || plan.EstimatedBytes != 100<<30 {
+		t.Fatalf("plan=%+v error=%v", plan, err)
 	}
 }
 
-func TestDatasetRejectsTargetAboveTwoTiB(t *testing.T) {
+func TestDatasetAllowsTargetAboveLegacyTwoTiBBoundary(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.TargetBytes = (2 << 40) + 1
-	if _, err := PlanDataset(cfg, Capacity{TotalBytes: 4 << 40, FreeBytes: 4 << 40}, testDatasetEnvironment()); err == nil {
-		t.Fatal("accepted dataset target above 2TiB")
+	plan, err := PlanDataset(cfg, Capacity{TotalBytes: 4 << 40, FreeBytes: 4 << 40}, testDatasetEnvironment())
+	if err != nil || plan.EstimatedBytes != (2<<40)+1 {
+		t.Fatalf("plan=%+v error=%v", plan, err)
 	}
 }
 
@@ -150,15 +151,16 @@ func TestDatasetReusePolicyRejectsExistingSchemaWithoutDroppingIt(t *testing.T) 
 	}
 }
 
-func TestDatasetRejectsTargetBelowOneGiB(t *testing.T) {
+func TestDatasetAllowsTargetBelowLegacyOneGiBBoundary(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.TargetBytes = (1 << 30) - 1
-	if _, err := PlanDataset(
+	plan, err := PlanDataset(
 		cfg,
 		Capacity{TotalBytes: 20 << 30, FreeBytes: 20 << 30},
 		Environment{Product: ProductOpenGauss, Topology: TopologyStandalone},
-	); err == nil {
-		t.Fatal("accepted dataset target below 1GiB")
+	)
+	if err != nil || plan.EstimatedBytes != (1<<30)-1 {
+		t.Fatalf("plan=%+v error=%v", plan, err)
 	}
 }
 
@@ -211,15 +213,13 @@ func TestDatasetPlanContainsNoIfNotExistsDDL(t *testing.T) {
 	}
 }
 
-func TestDatasetPlanFailsWhenSafeFreeSpaceIsTooSmall(t *testing.T) {
-	_, err := PlanDataset(datasetConfig("quick", 5), Capacity{TotalBytes: 100 << 30, FreeBytes: 15 << 30}, testDatasetEnvironment())
-	if err == nil {
-		t.Fatal("expected disk reserve error")
+func TestDatasetPlanReportsButDoesNotRejectInsufficientCapacity(t *testing.T) {
+	plan, err := PlanDataset(datasetConfig("quick", 5), Capacity{TotalBytes: 100 << 30, FreeBytes: 15 << 30}, testDatasetEnvironment())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, field := range []string{"target=", "free=", "reserved=", "safe_available="} {
-		if !strings.Contains(err.Error(), field) {
-			t.Errorf("capacity diagnostic missing %q: %v", field, err)
-		}
+	if plan.EstimatedBytes != 5<<30 || plan.AvailableForData >= plan.EstimatedBytes {
+		t.Fatalf("capacity facts lost from plan: %+v", plan)
 	}
 }
 

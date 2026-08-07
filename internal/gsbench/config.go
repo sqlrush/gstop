@@ -497,9 +497,6 @@ func validateLockOverrideCompatibility(
 	if sessions > 0 && sessions < 2 {
 		return fmt.Errorf("--sessions must be at least 2")
 	}
-	if chainDepth > 5 {
-		return fmt.Errorf("--chain-depth must be between 1 and 5")
-	}
 	if chainDepth > 0 && !has501 {
 		return fmt.Errorf("--chain-depth requires scenario 501")
 	}
@@ -601,19 +598,14 @@ func (c BenchConfig) Validate() error {
 		return fmt.Errorf("run.profile must be quick or stress")
 	}
 	if c.PoolTargets.ConnectionPercent < 1 ||
-		c.PoolTargets.ConnectionPercent > 100 ||
-		c.PoolTargets.ThreadPercent < 1 ||
-		c.PoolTargets.ThreadPercent > 100 {
-		return fmt.Errorf("pool target percentages must be between 1 and 100")
+		c.PoolTargets.ThreadPercent < 1 {
+		return fmt.Errorf("pool target percentages must be positive")
 	}
 	if len(c.Run.ScenarioCodes) == 0 {
 		return fmt.Errorf("at least one scenario is required")
 	}
 	catalog := DefaultScenarioCatalog()
 	seen := map[ScenarioCode]struct{}{}
-	planChangeCount := 0
-	fixedWorkerSelected := false
-	unbudgetedSelected := false
 	for _, code := range c.Run.ScenarioCodes {
 		definition, err := catalog.LookupCode(code)
 		if err != nil {
@@ -623,29 +615,9 @@ func (c BenchConfig) Validate() error {
 			return fmt.Errorf("duplicate scenario %q", definition.Name)
 		}
 		seen[code] = struct{}{}
-		if definition.Category == CategoryPlan && code >= 601 && code <= 606 {
-			planChangeCount++
-		}
-		switch code {
-		case 101, 102, 103, 201, 202:
-			fixedWorkerSelected = true
-		case 501, 502, 503:
-		default:
-			unbudgetedSelected = true
-		}
 	}
-	if fixedWorkerSelected && unbudgetedSelected {
-		return fmt.Errorf(
-			"fixed-worker scenarios 101-103 and 201-202 cannot be combined with other scenarios because their total concurrency cannot be bounded safely",
-		)
-	}
-	if planChangeCount > 1 {
-		return fmt.Errorf(
-			"plan-change scenarios 601-606 must be run individually and serially",
-		)
-	}
-	if c.Safety.MaxWorkers <= 0 || c.Safety.MaxConnections <= 0 || c.Data.MaxSizeGB <= 0 {
-		return fmt.Errorf("worker, connection, and data size limits must be positive")
+	if c.Data.MaxSizeGB <= 0 {
+		return fmt.Errorf("data size must be positive")
 	}
 	if c.FixedWorkers.TPWorkers <= 0 ||
 		c.FixedWorkers.APWorkers <= 0 ||
@@ -666,107 +638,14 @@ func (c BenchConfig) Validate() error {
 		c.LockWorkloads.DDLWaitSessions < 2 {
 		return fmt.Errorf("lock workload sessions must be at least 2")
 	}
-	if c.LockWorkloads.RowChainDepth < 1 ||
-		c.LockWorkloads.RowChainDepth > 5 {
-		return fmt.Errorf("lock row chain depth must be between 1 and 5")
+	if c.LockWorkloads.RowChainDepth < 1 {
+		return fmt.Errorf("lock row chain depth must be positive")
 	}
 	if c.LockWorkloads.RowChainSessions <
 		c.LockWorkloads.RowChainDepth+1 {
 		return fmt.Errorf(
 			"scenario 501 requires sessions >= chain_depth + 1",
 		)
-	}
-	if requiredRows := rowChainRequiredRows(
-		c.LockWorkloads.RowChainSessions,
-		c.LockWorkloads.RowChainDepth,
-	); requiredRows > lockTargetRows {
-		return fmt.Errorf(
-			"scenario 501 requires %d unique lock_targets rows but only 10,000 are available",
-			requiredRows,
-		)
-	}
-	selectedFixedWorkers := 0
-	selectedConnections := 0
-	addFixedWorkers := func(workers int) error {
-		if workers > c.Safety.MaxWorkers-selectedFixedWorkers {
-			return fmt.Errorf(
-				"selected fixed workers exceed safety.max_workers %d",
-				c.Safety.MaxWorkers,
-			)
-		}
-		if workers > c.Safety.MaxConnections-selectedConnections {
-			return fmt.Errorf(
-				"selected fixed workers exceed safety.max_connections %d",
-				c.Safety.MaxConnections,
-			)
-		}
-		selectedFixedWorkers += workers
-		selectedConnections += workers
-		return nil
-	}
-	addLockSessions := func(sessions int) error {
-		if sessions > c.Safety.MaxConnections-selectedConnections {
-			return fmt.Errorf(
-				"selected workload sessions exceed safety.max_connections %d",
-				c.Safety.MaxConnections,
-			)
-		}
-		selectedConnections += sessions
-		return nil
-	}
-	for _, code := range c.Run.ScenarioCodes {
-		switch code {
-		case 101:
-			if err := addFixedWorkers(c.FixedWorkers.TPWorkers); err != nil {
-				return err
-			}
-		case 102:
-			if err := addFixedWorkers(c.FixedWorkers.APWorkers); err != nil {
-				return err
-			}
-		case 103:
-			if err := addFixedWorkers(c.FixedWorkers.MixedTPWorkers); err != nil {
-				return err
-			}
-			if err := addFixedWorkers(c.FixedWorkers.MixedAPWorkers); err != nil {
-				return err
-			}
-		case 201:
-			if err := addFixedWorkers(c.MemoryWorkloads.SortWorkers); err != nil {
-				return err
-			}
-		case 202:
-			if err := addFixedWorkers(c.MemoryWorkloads.HashWorkers); err != nil {
-				return err
-			}
-		case 501:
-			if err := addLockSessions(c.LockWorkloads.RowChainSessions); err != nil {
-				return err
-			}
-		case 502:
-			if err := addLockSessions(c.LockWorkloads.TableExclusiveSessions); err != nil {
-				return err
-			}
-		case 503:
-			if err := addLockSessions(c.LockWorkloads.DDLWaitSessions); err != nil {
-				return err
-			}
-		}
-	}
-	if c.Safety.ProfileCapGB < 1 || c.Safety.ProfileCapGB > 2048 {
-		return fmt.Errorf("safety.profile_cap_gb must be between 1 and 2048")
-	}
-	if !c.Safety.RestoreOnExit {
-		return fmt.Errorf("safety.restore_on_exit=false is unsupported; restoration is mandatory")
-	}
-	if c.Safety.RestoreOriginalRole {
-		return fmt.Errorf("safety.restore_original_role=true is unsupported by the available provider")
-	}
-	if c.Data.MaxSizeGB > 2048 || c.Data.TargetBytes > maxDatasetBytes {
-		return fmt.Errorf("data size limit must not exceed 2TB")
-	}
-	if c.Data.MinFreeDiskPercent < 10 || c.Data.MinFreeDiskPercent > 90 {
-		return fmt.Errorf("min_free_disk_percent must be between 10 and 90")
 	}
 	if !stringInSet(
 		defaultDatasetProvider(c.Data.CapacityProvider),
