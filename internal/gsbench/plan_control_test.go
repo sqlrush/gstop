@@ -55,14 +55,9 @@ func TestPlanControlRejectsMissingRowsDuringFinalization(t *testing.T) {
 				context.Background(), "missing-run", OutcomeSuccess, "complete",
 			)
 		}},
-		{name: "set fault phase", call: func() error {
-			return store.SetFaultPhase(
-				context.Background(), "missing-run", PhaseStop, "complete",
-			)
-		}},
-		{name: "mark fault failed", call: func() error {
-			return store.MarkFaultFailed(
-				context.Background(), "missing-run", errors.New("failed"), false,
+		{name: "finish fault audit", call: func() error {
+			return store.RecordFaultFinish(
+				context.Background(), "missing-run", OutcomeFailed, "failed",
 			)
 		}},
 	}
@@ -231,76 +226,53 @@ func TestPlanControlDoesNotExposePreparingWorkloadToFault(t *testing.T) {
 	}
 }
 
-func TestPlanControlResolvesFaultByScenarioAndRejectsAmbiguity(t *testing.T) {
-	started := time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC)
+func TestDatabasePlanActionBackendRecordsFaultWithoutReadingHistoricalRows(t *testing.T) {
 	db := &planControlTestDB{rows: [][]any{
-		{"fault-1", "605", "hold", "running", started},
+		{"old-fault-601", "601", "hold", "running", time.Now()},
+		{"old-fault-602", "602", "hold", "running", time.Now()},
 	}}
 	store, err := newPlanControlStore(db, "gsbench")
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := store.ResolveFault(context.Background(), 605)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if run.RunID != "fault-1" || run.Code != 605 {
-		t.Fatalf("run=%+v", run)
-	}
-	db.rows = append(db.rows, []any{
-		"fault-2", "605", "ramp", "restore_failed", started.Add(time.Second),
-	})
-	if _, err := store.ResolveFault(context.Background(), 605); err == nil ||
-		!strings.Contains(err.Error(), "multiple") {
-		t.Fatalf("multiple fault error=%v", err)
-	}
-}
-
-func TestPlanControlMarksFaultFailureRecoverable(t *testing.T) {
-	db := &planControlTestDB{}
-	store, err := newPlanControlStore(db, "gsbench")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkFaultFailed(
-		context.Background(), "fault-1", errors.New("DDL failed"), false,
+	backend := &databasePlanActionBackend{control: store}
+	if err := backend.RecordFaultStart(
+		context.Background(), "new-fault-602", 602,
 	); err != nil {
 		t.Fatal(err)
 	}
-	for _, token := range []string{"fault_failed_recovery_pending", "DDL failed", "fault-1"} {
-		if !containsAnyString(db.execArgs, token) {
-			t.Fatalf("query=%q args=%v missing %q", db.execQuery, db.execArgs, token)
-		}
+	if len(db.queries) != 0 {
+		t.Fatalf("fault admission read historical rows: %q", db.queries)
+	}
+	if !strings.Contains(db.execQuery, "INSERT INTO") ||
+		!containsAnyString(db.execArgs, "new-fault-602") ||
+		!containsAnyString(db.execArgs, "602") {
+		t.Fatalf("query=%q args=%v", db.execQuery, db.execArgs)
 	}
 }
 
-func TestPlanControlMarksRejectedFaultRestoredAndInactive(t *testing.T) {
+func TestPlanControlRecordsTerminalFaultAudit(t *testing.T) {
 	db := &planControlTestDB{}
 	store, err := newPlanControlStore(db, "gsbench")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkFaultFailed(
+	if err := store.RecordFaultFinish(
 		context.Background(),
-		"fault-602",
-		errors.New("fault plan did not change"),
-		true,
+		"fault-601",
+		OutcomeCompletedWithWarnings,
+		"fault command completed; live catalog state is authoritative",
 	); err != nil {
 		t.Fatal(err)
 	}
 	for _, token := range []string{
-		string(PhaseRestore),
-		string(OutcomeFailed),
-		"fault plan did not change",
-		"fault-602",
+		string(PhaseHold),
+		string(OutcomeCompletedWithWarnings),
+		"live catalog state is authoritative",
+		"fault-601",
 	} {
 		if !containsAnyString(db.execArgs, token) {
-			t.Fatalf(
-				"query=%q args=%v missing %q",
-				db.execQuery,
-				db.execArgs,
-				token,
-			)
+			t.Fatalf("query=%q args=%v missing %q", db.execQuery, db.execArgs, token)
 		}
 	}
 	if !strings.Contains(db.execQuery, "phase=$1,status=$2") {

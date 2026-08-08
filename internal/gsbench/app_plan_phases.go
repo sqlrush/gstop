@@ -12,12 +12,16 @@ type planActionBackend interface {
 	Lock(context.Context) (func() error, error)
 	ResolveWorkload(context.Context, ScenarioCode) (planRunRecord, error)
 	WorkloadAlive(context.Context) (bool, error)
-	ResolveFault(context.Context, ScenarioCode) (planRunRecord, error)
-	StartFault(context.Context, string, ScenarioCode) error
+	InspectFaultState(context.Context, ScenarioCode) (PlanFaultInspection, error)
+	RecordFaultStart(context.Context, string, ScenarioCode) error
 	ApplyFault(context.Context, string, ScenarioCode) error
 	VerifyFault(context.Context, ScenarioCode) error
-	MarkFaultActive(context.Context, string) error
-	MarkFaultFailed(context.Context, string, error, bool) error
+	RecordFaultFinish(context.Context, string, Outcome, string) error
+}
+
+type planFaultReporters struct {
+	State   func(PlanFaultInspection)
+	Warning func(PrecheckWarning)
 }
 
 func executePlanFaultAction(
@@ -25,7 +29,7 @@ func executePlanFaultAction(
 	code ScenarioCode,
 	backend planActionBackend,
 	newID func() string,
-	reportWarning ...func(PrecheckWarning),
+	reporters planFaultReporters,
 ) (runID string, err error) {
 	if backend == nil || newID == nil {
 		return "", fmt.Errorf("plan fault backend and run ID generator are required")
@@ -49,15 +53,40 @@ func executePlanFaultAction(
 	if !alive {
 		return "", fmt.Errorf("plan workload for scenario %03d is not running", code)
 	}
-	if fault, faultErr := backend.ResolveFault(ctx, code); faultErr == nil {
-		return "", fmt.Errorf("plan fault %s is already active", fault.RunID)
-	} else if !errors.Is(faultErr, errPlanFaultNotFound) {
-		return "", fmt.Errorf("resolve existing plan fault: %w", faultErr)
+
+	hasWarnings := false
+	if code == ScenarioCode(601) || code == ScenarioCode(602) {
+		inspection, inspectErr := backend.InspectFaultState(ctx, code)
+		if inspectErr != nil {
+			inspection = PlanFaultInspection{
+				Code: code, State: PlanFaultUnavailable,
+				Object: "live_catalog",
+				Detail: journalSafeErrorText(inspectErr.Error()),
+			}
+		}
+		if reporters.State != nil {
+			reporters.State(inspection)
+		}
+		if inspection.State != PlanFaultRestored || inspectErr != nil {
+			hasWarnings = true
+			reportPlanFaultWarning(reporters, PrecheckWarning{
+				ScenarioCode: code,
+				Scenario:     DefaultScenarioCatalog().MustCode(code).Name,
+				Check:        "fault_state",
+				Object:       inspection.Object,
+				Actual:       string(inspection.State) + " " + inspection.Detail,
+				Expected:     string(PlanFaultRestored),
+				Impact:       "fault_execution_continues",
+			})
+		}
 	}
 
 	runID = newID()
-	if err := backend.StartFault(ctx, runID, code); err != nil {
-		return "", fmt.Errorf("record plan fault: %w", err)
+	if startErr := backend.RecordFaultStart(ctx, runID, code); startErr != nil {
+		hasWarnings = true
+		reportPlanFaultAuditWarning(
+			reporters, code, "start", startErr,
+		)
 	}
 	if applyErr := backend.ApplyFault(ctx, runID, code); applyErr != nil {
 		return runID, recordPlanFaultFailure(
@@ -65,11 +94,12 @@ func executePlanFaultAction(
 			backend,
 			runID,
 			code,
-			"apply plan fault",
 			applyErr,
+			reporters,
 		)
 	}
 	if verifyErr := backend.VerifyFault(ctx, code); verifyErr != nil {
+		hasWarnings = true
 		warning := PrecheckWarning{
 			ScenarioCode: code,
 			Scenario:     DefaultScenarioCatalog().MustCode(code).Name,
@@ -79,18 +109,23 @@ func executePlanFaultAction(
 			Expected:     "expected_fault_plan_shape",
 			Impact:       "fault_is_retained_for_manual_recovery",
 		}
-		if len(reportWarning) != 0 && reportWarning[0] != nil {
-			reportWarning[0](warning)
-		}
+		reportPlanFaultWarning(reporters, warning)
 	}
-	if err := backend.MarkFaultActive(ctx, runID); err != nil {
-		return runID, recordPlanFaultFailure(
-			ctx,
-			backend,
-			runID,
-			code,
-			"mark plan fault active",
-			err,
+	outcome := OutcomeSuccess
+	if hasWarnings {
+		outcome = OutcomeCompletedWithWarnings
+	}
+	finishCtx, cancel := planFaultFinalizationContext(ctx)
+	finishErr := backend.RecordFaultFinish(
+		finishCtx,
+		runID,
+		outcome,
+		"fault command completed; live catalog state is authoritative",
+	)
+	cancel()
+	if finishErr != nil {
+		reportPlanFaultAuditWarning(
+			reporters, code, "finish", finishErr,
 		)
 	}
 	return runID, nil
@@ -101,29 +136,59 @@ func recordPlanFaultFailure(
 	backend planActionBackend,
 	runID string,
 	code ScenarioCode,
-	operation string,
 	faultErr error,
+	reporters planFaultReporters,
 ) error {
-	finalizeCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		30*time.Second,
-	)
+	finalizeCtx, cancel := planFaultFinalizationContext(ctx)
 	defer cancel()
-	markErr := backend.MarkFaultFailed(
+	finishErr := backend.RecordFaultFinish(
 		finalizeCtx,
 		runID,
+		OutcomeFailed,
+		journalSafeErrorText(faultErr.Error()),
+	)
+	if finishErr != nil {
+		reportPlanFaultAuditWarning(
+			reporters, code, "finish_failed_command", finishErr,
+		)
+	}
+	return fmt.Errorf(
+		"apply plan fault: %w; recovery SQL is available with gsbench run %03d recover",
 		faultErr,
-		false,
+		code,
 	)
-	return errors.Join(
-		fmt.Errorf(
-			"%s: %w; recovery remains pending, inspect with gsbench run %03d recover",
-			operation,
-			faultErr,
-			code,
-		),
-		markErr,
-	)
+}
+
+func planFaultFinalizationContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+}
+
+func reportPlanFaultWarning(
+	reporters planFaultReporters,
+	warning PrecheckWarning,
+) {
+	if reporters.Warning != nil {
+		reporters.Warning(warning)
+	}
+}
+
+func reportPlanFaultAuditWarning(
+	reporters planFaultReporters,
+	code ScenarioCode,
+	operation string,
+	err error,
+) {
+	reportPlanFaultWarning(reporters, PrecheckWarning{
+		ScenarioCode: code,
+		Scenario:     DefaultScenarioCatalog().MustCode(code).Name,
+		Check:        "fault_audit",
+		Object:       "meta_runs_" + operation,
+		Actual:       journalSafeErrorText(err.Error()),
+		Expected:     "best_effort_audit_write",
+		Impact:       "fault_execution_continues",
+	})
 }
 
 type databasePlanActionBackend struct {
@@ -247,11 +312,25 @@ func newDatabasePlanActionBackend(
 func (b *databasePlanActionBackend) Lock(
 	ctx context.Context,
 ) (func() error, error) {
-	return AcquireDatabaseRunLock(
-		ctx,
-		b.db,
-		planDatabaseLockIdentity(b.cfg),
+	lockCtx, cancel := planMaintenanceContext(ctx, b.cfg)
+	release, err := acquirePlanFinalizationLock(
+		lockCtx,
+		func(attemptCtx context.Context) (func() error, error) {
+			return AcquireDatabaseRunLock(
+				attemptCtx,
+				b.db,
+				planDatabaseLockIdentity(b.cfg),
+			)
+		},
 	)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return func() error {
+		defer cancel()
+		return release()
+	}, nil
 }
 
 func (b *databasePlanActionBackend) ResolveWorkload(
@@ -271,6 +350,20 @@ func (b *databasePlanActionBackend) WorkloadAlive(
 	)
 }
 
+func (b *databasePlanActionBackend) InspectFaultState(
+	ctx context.Context,
+	code ScenarioCode,
+) (PlanFaultInspection, error) {
+	operationCtx, cancel := planMaintenanceContext(ctx, b.cfg)
+	defer cancel()
+	return InspectPlanFaultState(
+		operationCtx,
+		b.db,
+		b.cfg.Data.Schema,
+		code,
+	)
+}
+
 func (b *databasePlanActionBackend) ResolveFault(
 	ctx context.Context,
 	code ScenarioCode,
@@ -278,24 +371,11 @@ func (b *databasePlanActionBackend) ResolveFault(
 	return b.control.ResolveFault(ctx, code)
 }
 
-func (b *databasePlanActionBackend) StartFault(
+func (b *databasePlanActionBackend) RecordFaultStart(
 	ctx context.Context,
 	runID string,
 	code ScenarioCode,
 ) error {
-	for candidate := ScenarioCode(601); candidate <= 606; candidate++ {
-		fault, err := b.control.ResolveFault(ctx, candidate)
-		if err == nil {
-			return fmt.Errorf(
-				"plan fault %s for scenario %03d is already active",
-				fault.RunID,
-				fault.Code,
-			)
-		}
-		if !errors.Is(err, errPlanFaultNotFound) {
-			return err
-		}
-	}
 	return b.control.StartFault(ctx, runID, code)
 }
 
@@ -354,25 +434,13 @@ func (b *databasePlanActionBackend) VerifyFault(
 	)
 }
 
-func (b *databasePlanActionBackend) MarkFaultActive(
+func (b *databasePlanActionBackend) RecordFaultFinish(
 	ctx context.Context,
 	runID string,
+	outcome Outcome,
+	detail string,
 ) error {
-	return b.control.SetFaultPhase(
-		ctx,
-		runID,
-		PhaseHold,
-		"three_phase fault active",
-	)
-}
-
-func (b *databasePlanActionBackend) MarkFaultFailed(
-	ctx context.Context,
-	runID string,
-	faultErr error,
-	restored bool,
-) error {
-	return b.control.MarkFaultFailed(ctx, runID, faultErr, restored)
+	return b.control.RecordFaultFinish(ctx, runID, outcome, detail)
 }
 
 func planScenarioDefinitionForCode(
@@ -454,8 +522,20 @@ func commandPlanRunAction(
 			code,
 			backend,
 			newRunID,
-			func(warning PrecheckWarning) {
-				log.Warn("%s", warning.LogLine())
+			planFaultReporters{
+				State: func(inspection PlanFaultInspection) {
+					log.Info(
+						"PLAN_FAULT_STATE scenario=%03d state=%s "+
+							"object=%s detail=%s source=live_catalog action=continue",
+						inspection.Code,
+						inspection.State,
+						advisoryLogValue(inspection.Object),
+						advisoryLogValue(inspection.Detail),
+					)
+				},
+				Warning: func(warning PrecheckWarning) {
+					log.Warn("%s", warning.LogLine())
+				},
 			},
 		)
 		if err != nil {

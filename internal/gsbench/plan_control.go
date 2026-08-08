@@ -174,59 +174,28 @@ func (s *planControlStore) StartFault(
 	return requirePlanControlRow(result, err, runID, "start fault")
 }
 
-func (s *planControlStore) SetFaultPhase(
+func (s *planControlStore) RecordFaultFinish(
 	ctx context.Context,
 	runID string,
-	phase Phase,
+	outcome Outcome,
 	detail string,
 ) error {
+	switch outcome {
+	case OutcomeSuccess, OutcomeCompletedWithWarnings, OutcomeFailed:
+	default:
+		return fmt.Errorf("invalid terminal plan fault outcome %q", outcome)
+	}
 	result, err := s.db.Exec(
 		ctx,
 		"UPDATE "+s.schema+
-			".meta_runs SET phase=$1,detail=$2,updated_at=current_timestamp "+
-			"WHERE run_id=$3",
-		string(phase),
+			".meta_runs SET phase=$1,status=$2,detail=$3,"+
+			"updated_at=current_timestamp WHERE run_id=$4",
+		string(PhaseHold),
+		string(outcome),
 		detail,
 		runID,
 	)
-	return requirePlanControlRow(result, err, runID, "set fault phase")
-}
-
-func (s *planControlStore) MarkFaultFailed(
-	ctx context.Context,
-	runID string,
-	faultErr error,
-	restored bool,
-) error {
-	detail := "plan fault failed"
-	if faultErr != nil {
-		detail = journalSafeErrorText(faultErr.Error())
-	}
-	var result sql.Result
-	var err error
-	if restored {
-		result, err = s.db.Exec(
-			ctx,
-			"UPDATE "+s.schema+
-				".meta_runs SET phase=$1,status=$2,detail=$3,"+
-				"updated_at=current_timestamp WHERE run_id=$4",
-			string(PhaseRestore),
-			string(OutcomeFailed),
-			detail,
-			runID,
-		)
-	} else {
-		result, err = s.db.Exec(
-			ctx,
-			"UPDATE "+s.schema+
-				".meta_runs SET status=$1,detail=$2,"+
-				"updated_at=current_timestamp WHERE run_id=$3",
-			"fault_failed_recovery_pending",
-			detail,
-			runID,
-		)
-	}
-	return requirePlanControlRow(result, err, runID, "mark fault failed")
+	return requirePlanControlRow(result, err, runID, "finish fault audit")
 }
 
 func requirePlanControlRow(

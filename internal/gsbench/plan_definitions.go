@@ -118,7 +118,7 @@ func PlanMutationSet(runID, schema, scenario string) ([]Mutation, error) {
 		index := quotedSchema + "." + definition.Name
 		mutation := base(
 			"index_drop", index,
-			"DROP INDEX "+index,
+			"DROP INDEX IF EXISTS "+index,
 			createIndex,
 			verifyIndex, createIndex,
 		)

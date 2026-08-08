@@ -53,17 +53,20 @@ func TestPlanFinalizationWaitsForTransientControlLock(t *testing.T) {
 }
 
 type planActionBackendTest struct {
-	events           []string
-	workload         planRunRecord
-	workloadErr      error
-	workloadAlive    bool
-	workloadLiveErr  error
-	fault            planRunRecord
-	faultErr         error
-	applyErr         error
-	verifyErr        error
-	markActiveErr    error
-	markFailedCtxErr error
+	events              []string
+	workload            planRunRecord
+	workloadErr         error
+	workloadAlive       bool
+	workloadLiveErr     error
+	inspection          PlanFaultInspection
+	inspectionErr       error
+	recordStartErr      error
+	applyErr            error
+	verifyErr           error
+	recordFinishErr     error
+	recordFinishCtxErr  error
+	recordFinishOutcome Outcome
+	recordFinishDetail  string
 }
 
 func (b *planActionBackendTest) Lock(context.Context) (func() error, error) {
@@ -87,21 +90,21 @@ func (b *planActionBackendTest) WorkloadAlive(context.Context) (bool, error) {
 	return b.workloadAlive, b.workloadLiveErr
 }
 
-func (b *planActionBackendTest) ResolveFault(
-	context.Context,
-	ScenarioCode,
-) (planRunRecord, error) {
-	b.events = append(b.events, "resolve-fault")
-	return b.fault, b.faultErr
+func (b *planActionBackendTest) InspectFaultState(
+	_ context.Context,
+	code ScenarioCode,
+) (PlanFaultInspection, error) {
+	b.events = append(b.events, fmt.Sprintf("inspect-state:%03d", code))
+	return b.inspection, b.inspectionErr
 }
 
-func (b *planActionBackendTest) StartFault(
+func (b *planActionBackendTest) RecordFaultStart(
 	_ context.Context,
 	runID string,
 	_ ScenarioCode,
 ) error {
-	b.events = append(b.events, "start-fault:"+runID)
-	return nil
+	b.events = append(b.events, "record-start:"+runID)
+	return b.recordStartErr
 }
 
 func (b *planActionBackendTest) ApplyFault(
@@ -121,144 +124,140 @@ func (b *planActionBackendTest) VerifyFault(
 	return b.verifyErr
 }
 
-func (b *planActionBackendTest) MarkFaultActive(
-	_ context.Context,
-	runID string,
-) error {
-	b.events = append(b.events, "mark-active:"+runID)
-	return b.markActiveErr
-}
-
-func (b *planActionBackendTest) MarkFaultFailed(
+func (b *planActionBackendTest) RecordFaultFinish(
 	ctx context.Context,
 	runID string,
-	err error,
-	restored bool,
+	outcome Outcome,
+	detail string,
 ) error {
-	b.markFailedCtxErr = ctx.Err()
-	b.events = append(
-		b.events,
-		fmt.Sprintf(
-			"mark-failed:%s:restored=%t:%s",
-			runID,
-			restored,
-			err.Error(),
-		),
-	)
-	return nil
+	b.recordFinishCtxErr = ctx.Err()
+	b.recordFinishOutcome = outcome
+	b.recordFinishDetail = detail
+	b.events = append(b.events, "record-finish:"+runID+":"+string(outcome))
+	return b.recordFinishErr
 }
 
-func TestRecordPlanFaultFailureFinalizesAfterCallerCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	backend := &planActionBackendTest{}
+type planFaultReporterTest struct {
+	states   []PlanFaultInspection
+	warnings []PrecheckWarning
+}
 
-	err := recordPlanFaultFailure(
-		ctx, backend, "fault-601", 601, "apply plan fault", errors.New("apply failed"),
-	)
-	if err == nil || !strings.Contains(err.Error(), "apply failed") {
-		t.Fatalf("error=%v", err)
-	}
-	if backend.markFailedCtxErr != nil {
-		t.Fatalf("finalization context error=%v", backend.markFailedCtxErr)
+func (r *planFaultReporterTest) reporters() planFaultReporters {
+	return planFaultReporters{
+		State: func(inspection PlanFaultInspection) {
+			r.states = append(r.states, inspection)
+		},
+		Warning: func(warning PrecheckWarning) {
+			r.warnings = append(r.warnings, warning)
+		},
 	}
 }
 
-func TestExecutePlanFaultActionUsesLiveWorkloadAndOneShotFaultRun(t *testing.T) {
+func TestExecutePlanFaultActionAlwaysContinuesAfterLiveStateWarning(t *testing.T) {
+	for _, state := range []PlanFaultLiveState{
+		PlanFaultRestored,
+		PlanFaultPresent,
+		PlanFaultDrifted,
+		PlanFaultUnavailable,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			backend := &planActionBackendTest{
+				workload:      planRunRecord{RunID: "workload-1", Code: 601},
+				workloadAlive: true,
+				inspection: PlanFaultInspection{
+					Code: 601, State: state,
+					Object: `"gsbench".plan_data_lookup_idx`,
+				},
+			}
+			reporter := &planFaultReporterTest{}
+			runID, err := executePlanFaultAction(
+				context.Background(), 601, backend,
+				func() string { return "fault-1" }, reporter.reporters(),
+			)
+			if err != nil {
+				t.Fatalf("state=%s runID=%q error=%v", state, runID, err)
+			}
+			want := []string{
+				"lock",
+				"resolve-workload",
+				"workload-alive",
+				"inspect-state:601",
+				"record-start:fault-1",
+				"apply-fault:fault-1",
+				"verify-fault:601",
+			}
+			if state == PlanFaultRestored {
+				want = append(want, "record-finish:fault-1:SUCCESS")
+			} else {
+				want = append(want, "record-finish:fault-1:COMPLETED_WITH_WARNINGS")
+			}
+			want = append(want, "unlock")
+			if !reflect.DeepEqual(backend.events, want) {
+				t.Fatalf("state=%s events=%v want=%v", state, backend.events, want)
+			}
+			if len(reporter.states) != 1 || reporter.states[0].State != state {
+				t.Fatalf("reported states=%+v", reporter.states)
+			}
+			wantWarnings := 0
+			if state != PlanFaultRestored {
+				wantWarnings = 1
+			}
+			if len(reporter.warnings) != wantWarnings {
+				t.Fatalf("state=%s warnings=%+v want=%d", state, reporter.warnings, wantWarnings)
+			}
+		})
+	}
+}
+
+func TestExecutePlanFaultActionContinuesWhenLiveInspectionErrors(t *testing.T) {
 	backend := &planActionBackendTest{
-		workload:      planRunRecord{RunID: "workload-1", Code: 601},
+		workload:      planRunRecord{RunID: "workload-602", Code: 602},
 		workloadAlive: true,
-		faultErr:      errPlanFaultNotFound,
+		inspectionErr: errors.New("catalog connection failed"),
 	}
-	runID, err := executePlanFaultAction(
-		context.Background(),
-		601,
-		backend,
-		func() string { return "fault-1" },
+	reporter := &planFaultReporterTest{}
+	_, err := executePlanFaultAction(
+		context.Background(), 602, backend,
+		func() string { return "fault-602" }, reporter.reporters(),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runID != "fault-1" {
-		t.Fatalf("runID=%q", runID)
+	if !containsEventPrefix(backend.events, "apply-fault:fault-602") {
+		t.Fatalf("events=%v", backend.events)
 	}
-	want := []string{
-		"lock",
-		"resolve-workload",
-		"workload-alive",
-		"resolve-fault",
-		"start-fault:fault-1",
-		"apply-fault:fault-1",
-		"verify-fault:601",
-		"mark-active:fault-1",
-		"unlock",
+	if len(reporter.states) != 1 || reporter.states[0].State != PlanFaultUnavailable {
+		t.Fatalf("states=%+v", reporter.states)
 	}
-	if !reflect.DeepEqual(backend.events, want) {
-		t.Fatalf("events=%v want=%v", backend.events, want)
+	if len(reporter.warnings) != 1 || reporter.warnings[0].Check != "fault_state" {
+		t.Fatalf("warnings=%+v", reporter.warnings)
 	}
 }
 
-func TestExecutePlanFaultActionKeepsUnchanged602PlanWithWarning(t *testing.T) {
+func TestExecutePlanFaultActionIgnoresAuditWriteFailures(t *testing.T) {
 	backend := &planActionBackendTest{
-		workload:      planRunRecord{RunID: "workload-602", Code: 602},
-		workloadAlive: true,
-		faultErr:      errPlanFaultNotFound,
-		verifyErr:     errors.New("fault plan candidate 2 still uses index"),
+		workload:        planRunRecord{RunID: "workload-601", Code: 601},
+		workloadAlive:   true,
+		inspection:      PlanFaultInspection{Code: 601, State: PlanFaultRestored},
+		recordStartErr:  errors.New("audit start failed"),
+		recordFinishErr: errors.New("audit finish failed"),
 	}
-	var warnings []PrecheckWarning
+	reporter := &planFaultReporterTest{}
 	runID, err := executePlanFaultAction(
-		context.Background(),
-		602,
-		backend,
-		func() string { return "fault-602" },
-		func(warning PrecheckWarning) { warnings = append(warnings, warning) },
+		context.Background(), 601, backend,
+		func() string { return "fault-1" }, reporter.reporters(),
 	)
-	if err != nil {
+	if err != nil || runID != "fault-1" {
 		t.Fatalf("runID=%q error=%v", runID, err)
 	}
-	want := []string{
-		"lock",
-		"resolve-workload",
-		"workload-alive",
-		"resolve-fault",
-		"start-fault:fault-602",
-		"apply-fault:fault-602",
-		"verify-fault:602",
-		"mark-active:fault-602",
-		"unlock",
-	}
-	if !reflect.DeepEqual(backend.events, want) {
-		t.Fatalf("events=%v want=%v", backend.events, want)
-	}
-	if len(warnings) != 1 || warnings[0].Check != "fault_effect" {
-		t.Fatalf("warnings=%+v", warnings)
-	}
-}
-
-func TestExecutePlanFaultActionLeavesJournalWhenActivationCannotBeRecorded(
-	t *testing.T,
-) {
-	backend := &planActionBackendTest{
-		workload:      planRunRecord{RunID: "workload-602", Code: 602},
-		workloadAlive: true,
-		faultErr:      errPlanFaultNotFound,
-		markActiveErr: errors.New("record active phase failed"),
-	}
-	_, err := executePlanFaultAction(
-		context.Background(),
-		602,
-		backend,
-		func() string { return "fault-602" },
-	)
-	if err == nil || !strings.Contains(err.Error(), "record active phase failed") {
-		t.Fatalf("error=%v", err)
-	}
-	if containsEventPrefix(backend.events, "restore-fault:fault-602") ||
-		!containsEventPrefix(
-			backend.events,
-			"mark-failed:fault-602:restored=false",
-		) {
+	if !containsEventPrefix(backend.events, "apply-fault:fault-1") {
 		t.Fatalf("events=%v", backend.events)
+	}
+	if len(reporter.warnings) != 2 {
+		t.Fatalf("warnings=%+v", reporter.warnings)
+	}
+	if backend.recordFinishOutcome != OutcomeCompletedWithWarnings {
+		t.Fatalf("finish outcome=%s", backend.recordFinishOutcome)
 	}
 }
 
@@ -268,40 +267,81 @@ func TestExecutePlanFaultActionRejectsStoppedWorkload(t *testing.T) {
 		workloadAlive: false,
 	}
 	_, err := executePlanFaultAction(
-		context.Background(),
-		601,
-		backend,
-		func() string { return "fault-1" },
+		context.Background(), 601, backend,
+		func() string { return "fault-1" }, planFaultReporters{},
 	)
 	if err == nil || !strings.Contains(err.Error(), "not running") {
 		t.Fatalf("error=%v", err)
 	}
-	if containsEventPrefix(backend.events, "start-fault") {
+	if containsEventPrefix(backend.events, "record-start") {
 		t.Fatalf("events=%v", backend.events)
 	}
 }
 
-func TestExecutePlanFaultActionPersistsFailureForRecovery(t *testing.T) {
+func TestExecutePlanFaultActionFailsOnlyOnRealApplyError(t *testing.T) {
 	backend := &planActionBackendTest{
-		workload:      planRunRecord{RunID: "workload-1", Code: 606},
-		workloadAlive: true,
-		faultErr:      errPlanFaultNotFound,
-		applyErr:      errors.New("create bad index failed"),
+		workload:        planRunRecord{RunID: "workload-601", Code: 601},
+		workloadAlive:   true,
+		inspection:      PlanFaultInspection{Code: 601, State: PlanFaultPresent},
+		applyErr:        errors.New("DROP INDEX failed"),
+		recordFinishErr: errors.New("audit finish failed"),
 	}
+	reporter := &planFaultReporterTest{}
 	_, err := executePlanFaultAction(
-		context.Background(),
-		606,
-		backend,
-		func() string { return "fault-606" },
+		context.Background(), 601, backend,
+		func() string { return "fault-1" }, reporter.reporters(),
 	)
-	if err == nil || !strings.Contains(err.Error(), "create bad index failed") {
+	if err == nil || !strings.Contains(err.Error(), "DROP INDEX failed") ||
+		strings.Contains(err.Error(), "audit finish failed") {
 		t.Fatalf("error=%v", err)
 	}
-	if !containsEventPrefix(
-		backend.events,
-		"mark-failed:fault-606:restored=false",
-	) || containsEventPrefix(backend.events, "restore-fault:fault-606") {
+	if backend.recordFinishOutcome != OutcomeFailed ||
+		!containsEventPrefix(backend.events, "record-finish:fault-1:FAILED") {
 		t.Fatalf("events=%v", backend.events)
+	}
+	if len(reporter.warnings) != 2 {
+		t.Fatalf("warnings=%+v", reporter.warnings)
+	}
+}
+
+func TestExecutePlanFaultActionKeepsUnchanged602PlanWithWarning(t *testing.T) {
+	backend := &planActionBackendTest{
+		workload:      planRunRecord{RunID: "workload-602", Code: 602},
+		workloadAlive: true,
+		inspection:    PlanFaultInspection{Code: 602, State: PlanFaultRestored},
+		verifyErr:     errors.New("fault plan candidate 2 still uses index"),
+	}
+	reporter := &planFaultReporterTest{}
+	_, err := executePlanFaultAction(
+		context.Background(), 602, backend,
+		func() string { return "fault-602" }, reporter.reporters(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reporter.warnings) != 1 || reporter.warnings[0].Check != "fault_effect" {
+		t.Fatalf("warnings=%+v", reporter.warnings)
+	}
+	if backend.recordFinishOutcome != OutcomeCompletedWithWarnings {
+		t.Fatalf("finish outcome=%s", backend.recordFinishOutcome)
+	}
+}
+
+func TestRecordPlanFaultFailureFinalizesAfterCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	backend := &planActionBackendTest{}
+	reporter := &planFaultReporterTest{}
+
+	err := recordPlanFaultFailure(
+		ctx, backend, "fault-601", 601,
+		errors.New("apply failed"), reporter.reporters(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "apply failed") {
+		t.Fatalf("error=%v", err)
+	}
+	if backend.recordFinishCtxErr != nil {
+		t.Fatalf("finalization context error=%v", backend.recordFinishCtxErr)
 	}
 }
 

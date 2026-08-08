@@ -155,7 +155,7 @@ func TestPlanchangeStatsTargetDropsAndRecreatesCanonicalUniqueIndex(t *testing.T
 		t.Fatalf("601 mutations=%d want=1: %+v", len(mutations), mutations)
 	}
 	mutation := mutations[0]
-	if got, want := mutation.ForwardSQL, `DROP INDEX "Bench".plan_data_lookup_idx`; got != want {
+	if got, want := mutation.ForwardSQL, `DROP INDEX IF EXISTS "Bench".plan_data_lookup_idx`; got != want {
 		t.Fatalf("601 forward=%q want=%q", got, want)
 	}
 	wantCreate := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "Bench".plan_data (lookup_key,dist_key)`
