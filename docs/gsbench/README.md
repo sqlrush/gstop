@@ -87,7 +87,7 @@ gsbench run -s 621,624 -d 2m
 
 `run` 也接受完整名称和逗号组合，例如 `gsbench run -s io_sequential_read,network_client_egress -d 2m`；601–606 的三阶段语法除外。101–103、201–202 是可精确预算的固定 worker 场景，不能与其他并发模型的场景放在同一次运行中；201/202 使用命令行 worker/work_mem 覆盖时一次只能选择其中一个。
 
-201/202 会只读检查工作集、Sort/Hash 内存和落盘情况；不满足预期时记录告警并继续使用用户给定的 worker 与 `work_mem`，不自动调小数据或参数。第一次 Ctrl+C 会结束本地进程，数据库通过连接断开释放对应事务和游标。
+201/202 会只读检查工作集、Sort/Hash 内存和落盘情况；不满足预期时记录告警并继续使用用户给定的 worker 与 `work_mem`，不自动调小数据或参数。202 的标定 SQL 和正式压力游标都使用查询级 `leading/hashjoin` Hint，并仅对该 SQL 关闭 index-nestloop 路径，避免游标首行优化使正式计划偏离已标定的 Hash Join。第一次 Ctrl+C 会结束本地进程，数据库通过连接断开释放对应事务和游标。
 
 401/402 的 `--percent N` 接受正整数，并只覆盖本次选中的 401/402；同一命令选中两者时使用同一个值。401 的分母是 `max_connections - sysadmin_reserved_connections`，例如当前 80%、目标 90% 时只新建补足差值所需的连接；目标不高于基线、超过 100% 或物理余量不足时会告警，但不再因策略上限提前拒绝执行。
 

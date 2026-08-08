@@ -29,7 +29,7 @@
 - Consumes: `workMemCalibrationSQL(workMemKind, string, int64) (string, error)` and `workMemCursorSQL(workMemKind, string, int64) (string, error)`.
 - Produces: both `workMemHash` builders return SQL containing the canonical query-level Hint; `workMemSort` output is unchanged.
 
-- [ ] **Step 1: Write the failing SQL-shape tests**
+- [x] **Step 1: Write the failing SQL-shape tests**
 
 Add a focused test that calls both Hash builders and requires each SQL to contain exactly one:
 
@@ -40,7 +40,7 @@ SELECT /*+ leading((p h)) hashjoin(p h) set(enable_index_nestloop off) */
 Also call both Sort builders and fail if either contains `hashjoin(` or
 `enable_index_nestloop`.
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -50,7 +50,7 @@ go test ./internal/gsbench -run TestWorkMemHashSQLBindsCursorAndCalibrationToHas
 
 Expected: FAIL because the current Hash SQL starts with an unhinted `SELECT`.
 
-- [ ] **Step 3: Add the minimal canonical Hint**
+- [x] **Step 3: Add the minimal canonical Hint**
 
 Define:
 
@@ -61,7 +61,7 @@ const workMemHashPlanHint = "/*+ leading((p h)) hashjoin(p h) set(enable_index_n
 Insert `workMemHashPlanHint` immediately after `SELECT ` in the Hash branches of
 `workMemCalibrationSQL` and `workMemCursorSQL`. Do not modify the Sort branches.
 
-- [ ] **Step 4: Run focused and package tests and verify GREEN**
+- [x] **Step 4: Run focused and package tests and verify GREEN**
 
 Run:
 
@@ -73,13 +73,13 @@ go test ./internal/gsbench -count=1
 
 Expected: PASS.
 
-- [ ] **Step 5: Document the query-scoped binding**
+- [x] **Step 5: Document the query-scoped binding**
 
 Update the 201/202 README paragraph to state that 202 uses a query-level
 `leading/hashjoin` Hint and disables only the hinted SQL's index-nestloop path, so the
 formal cursor cannot drift away from the calibrated Hash plan.
 
-- [ ] **Step 6: Run minimum repository verification**
+- [x] **Step 6: Run minimum repository verification**
 
 Run:
 
@@ -90,7 +90,7 @@ go vet ./...
 
 Expected: PASS.
 
-- [ ] **Step 7: Build and perform a bounded live acceptance run**
+- [x] **Step 7: Build and perform a bounded live acceptance run**
 
 Build a Darwin ARM64 candidate, verify `gsbench version`, then run scenario 202 with one
 worker, `64MB`, and a short duration. While it is in hold, require the tagged worker's
@@ -98,10 +98,9 @@ statement-history plan to contain `Hash Left Join` and its session memory to con
 non-trivial `HashBatchContext`. After completion, require the tagged session count to be
 zero.
 
-- [ ] **Step 8: Commit the focused fix**
+- [x] **Step 8: Commit the focused fix**
 
 ```bash
 git add internal/gsbench/scenario_workmem.go internal/gsbench/scenario_workmem_test.go docs/gsbench/README.md docs/superpowers/specs/2026-08-08-gsbench-202-hash-cursor-hint-design.md docs/superpowers/plans/2026-08-08-gsbench-202-hash-cursor-hint.md
 git commit -m "fix(gsbench): bind scenario 202 cursor to hash join"
 ```
-

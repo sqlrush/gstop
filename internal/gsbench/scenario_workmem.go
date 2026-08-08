@@ -23,6 +23,7 @@ const (
 	workMemCalibrationUpperPercent = int64(97)
 	workMemPlanDiagnosticMaxRunes  = 512
 	workMemExplainNormal           = "normal"
+	workMemHashPlanHint            = "/*+ leading((p h)) hashjoin(p h) set(enable_index_nestloop off) */ "
 )
 
 type workMemObservation struct {
@@ -396,7 +397,8 @@ func workMemCalibrationSQL(
 			" WHERE dist_key BETWEEN 1 AND " + bound + ") AS gsbench_sorted", nil
 	case workMemHash:
 		return "EXPLAIN (ANALYZE, BUFFERS) " +
-			"SELECT count(*),sum(length(h.payload)) FROM (" +
+			"SELECT " + workMemHashPlanHint +
+			"count(*),sum(length(h.payload)) FROM (" +
 			"SELECT dist_key,id FROM " + table +
 			" WHERE dist_key BETWEEN 1 AND " + bound + ") AS p LEFT JOIN (" +
 			"SELECT dist_key,id,payload FROM " + table +
@@ -423,7 +425,8 @@ func workMemCursorSQL(
 			" WHERE dist_key BETWEEN 1 AND " + bound +
 			" ORDER BY payload,sort_key DESC,id", nil
 	case workMemHash:
-		return "SELECT p.id,h.payload FROM (SELECT dist_key,id FROM " + table +
+		return "SELECT " + workMemHashPlanHint +
+			"p.id,h.payload FROM (SELECT dist_key,id FROM " + table +
 			" WHERE dist_key BETWEEN 1 AND " + bound + ") AS p LEFT JOIN (" +
 			"SELECT dist_key,id,payload FROM " + table +
 			" WHERE dist_key BETWEEN 1 AND " + bound + ") AS h " +

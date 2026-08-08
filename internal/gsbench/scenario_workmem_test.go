@@ -630,6 +630,38 @@ func TestWorkMemWorkerHoldsOneCalibratedCursorUntilCancellation(t *testing.T) {
 	}
 }
 
+func TestWorkMemHashSQLBindsCursorAndCalibrationToHashJoin(t *testing.T) {
+	const hint = "SELECT /*+ leading((p h)) hashjoin(p h) set(enable_index_nestloop off) */"
+	builders := []struct {
+		name  string
+		kind  workMemKind
+		build func(workMemKind, string, int64) (string, error)
+	}{
+		{name: "hash calibration", kind: workMemHash, build: workMemCalibrationSQL},
+		{name: "hash cursor", kind: workMemHash, build: workMemCursorSQL},
+		{name: "sort calibration", kind: workMemSort, build: workMemCalibrationSQL},
+		{name: "sort cursor", kind: workMemSort, build: workMemCursorSQL},
+	}
+	for _, builder := range builders {
+		t.Run(builder.name, func(t *testing.T) {
+			statement, err := builder.build(builder.kind, "gsbench", 12000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if builder.kind == workMemHash {
+				if count := strings.Count(statement, hint); count != 1 {
+					t.Fatalf("Hash SQL hint count=%d want=1 statement=%q", count, statement)
+				}
+				return
+			}
+			if strings.Contains(statement, "hashjoin(") ||
+				strings.Contains(statement, "enable_index_nestloop") {
+				t.Fatalf("Sort SQL unexpectedly contains Hash hint: %q", statement)
+			}
+		})
+	}
+}
+
 func TestWorkMemHashWorkerForcesOneHashStrategy(t *testing.T) {
 	state := &resourceExecTestState{}
 	conn := openResourceExecTestConn(t, state)
