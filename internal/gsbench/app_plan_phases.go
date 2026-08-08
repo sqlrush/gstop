@@ -94,11 +94,24 @@ func executePlanFaultAction(
 			backend,
 			runID,
 			code,
+			"apply plan fault",
 			applyErr,
 			reporters,
 		)
 	}
 	if verifyErr := backend.VerifyFault(ctx, code); verifyErr != nil {
+		if errors.Is(verifyErr, context.Canceled) ||
+			errors.Is(verifyErr, context.DeadlineExceeded) {
+			return runID, recordPlanFaultFailure(
+				ctx,
+				backend,
+				runID,
+				code,
+				"verify plan fault",
+				verifyErr,
+				reporters,
+			)
+		}
 		hasWarnings = true
 		warning := PrecheckWarning{
 			ScenarioCode: code,
@@ -136,6 +149,7 @@ func recordPlanFaultFailure(
 	backend planActionBackend,
 	runID string,
 	code ScenarioCode,
+	operation string,
 	faultErr error,
 	reporters planFaultReporters,
 ) error {
@@ -153,7 +167,8 @@ func recordPlanFaultFailure(
 		)
 	}
 	return fmt.Errorf(
-		"apply plan fault: %w; recovery SQL is available with gsbench run %03d recover",
+		"%s: %w; recovery SQL is available with gsbench run %03d recover",
+		operation,
 		faultErr,
 		code,
 	)

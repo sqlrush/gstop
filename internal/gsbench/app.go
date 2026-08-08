@@ -2977,6 +2977,10 @@ func commandRecoveryPlan(
 	discoveryFallback := false
 	discovery, err := backend.DiscoverRestore(ctx, runID, true)
 	if err != nil {
+		if !recoveryDiscoveryErrorAllowsFallback(err) {
+			log.Error("discover recovery plan: %v", err)
+			return 1
+		}
 		liveFallback := scenarioCode != nil &&
 			planRecoveryDiscoveryCanUseLiveState(
 				*scenarioCode,
@@ -3006,7 +3010,9 @@ func commandRecoveryPlan(
 		discoveryFallback = true
 	}
 	filter := RecoveryPlanFilter{RunID: runID, ScenarioCode: scenarioCode}
-	verifier := newRecoveryActionVerifier(db, cfg)
+	verifier := recoveryVerifierWithPlanLiveAuthority(
+		newRecoveryActionVerifier(db, cfg),
+	)
 	plan, err := BuildRecoveryPlan(ctx, discovery, filter, verifier)
 	if err != nil {
 		log.Error("build recovery plan: %v", err)

@@ -75,6 +75,23 @@ func inspectPlanFault601(
 		Code:   code,
 		Object: quotedSchema + "." + definition.Name,
 	}
+	var tableCount int
+	err = db.ScanReadOnly(
+		ctx,
+		"SELECT count(*) FROM pg_tables WHERE schemaname=$1 AND tablename='plan_data'",
+		[]any{catalogSchema},
+		&tableCount,
+	)
+	if err != nil {
+		inspection.State = PlanFaultUnavailable
+		inspection.Detail = "parent table probe: " + journalSafeErrorText(err.Error())
+		return inspection, nil
+	}
+	if tableCount != 1 {
+		inspection.State = PlanFaultUnavailable
+		inspection.Detail = "parent plan_data table is missing"
+		return inspection, nil
+	}
 
 	var actual string
 	err = db.ScanReadOnly(

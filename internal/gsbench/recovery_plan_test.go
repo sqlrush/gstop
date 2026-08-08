@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -254,6 +255,65 @@ func TestScenarioRecoverySurvivesUnavailablePlanAuditDiscovery(t *testing.T) {
 		PlanFaultInspection{Code: 601, State: PlanFaultUnavailable},
 	) {
 		t.Fatal("unavailable 601 live state incorrectly ignored audit discovery failure")
+	}
+}
+
+func TestPlanRecoveryVerifierDefers601And602AuthorityToLiveCatalog(t *testing.T) {
+	actions := []Action{
+		recoverySQLAction(
+			"old-601", 1, 601, `"gsbench".plan_data_lookup_idx`,
+			`CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data (lookup_key,dist_key)`,
+		),
+		recoverySQLAction(
+			"old-602", 1, 602, `"gsbench".plan_data.lookup_key`,
+			`ALTER TABLE "gsbench".plan_data ALTER COLUMN lookup_key RESET (n_distinct)`,
+		),
+		recoverySQLAction(
+			"old-602", 2, 602, `"gsbench".plan_data.lookup_key analyze`,
+			`ANALYZE "gsbench".plan_data(lookup_key)`,
+		),
+	}
+	baseCalls := 0
+	verify := recoveryVerifierWithPlanLiveAuthority(
+		func(context.Context, Action) (bool, error) {
+			baseCalls++
+			return true, nil
+		},
+	)
+	plan, err := BuildRecoveryPlan(
+		context.Background(),
+		RestoreDiscovery{DatabaseActions: actions},
+		RecoveryPlanFilter{},
+		verify,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseCalls != 0 {
+		t.Fatalf("legacy verifier was called %d times", baseCalls)
+	}
+	if len(plan.Items) != 3 {
+		t.Fatalf("items=%+v", plan.Items)
+	}
+	for _, item := range plan.Items {
+		if item.State != RecoveryUnverified || len(item.Statements) != 1 {
+			t.Fatalf("plan fault audit item hid recovery SQL: %+v", item)
+		}
+	}
+}
+
+func TestRecoveryDiscoveryContextErrorsNeverAllowFallback(t *testing.T) {
+	for _, err := range []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		fmt.Errorf("wrapped cancellation: %w", context.Canceled),
+	} {
+		if recoveryDiscoveryErrorAllowsFallback(err) {
+			t.Fatalf("context error allowed fallback: %v", err)
+		}
+	}
+	if !recoveryDiscoveryErrorAllowsFallback(errors.New("audit table unavailable")) {
+		t.Fatal("ordinary audit discovery failure could not use live fallback")
 	}
 }
 

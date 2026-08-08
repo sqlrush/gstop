@@ -11,6 +11,8 @@ import (
 type planFaultCatalogFake struct {
 	definition    string
 	definitionErr error
+	tableMissing  bool
+	tableErr      error
 	usable        int
 	usableErr     error
 	options       string
@@ -28,6 +30,16 @@ func (d *planFaultCatalogFake) ScanReadOnly(
 	d.queries = append(d.queries, query)
 	d.args = append(d.args, append([]any(nil), args...))
 	switch {
+	case strings.Contains(query, "FROM pg_tables"):
+		if d.tableErr != nil {
+			return d.tableErr
+		}
+		count := 1
+		if d.tableMissing {
+			count = 0
+		}
+		*(dest[0].(*int)) = count
+		return nil
 	case strings.Contains(query, "pg_get_indexdef"):
 		if d.definitionErr != nil {
 			return d.definitionErr
@@ -56,6 +68,8 @@ func TestInspectPlanFaultState601UsesOnlyLiveIndexStructure(t *testing.T) {
 		name          string
 		definition    string
 		definitionErr error
+		tableMissing  bool
+		tableErr      error
 		usable        int
 		usableErr     error
 		want          PlanFaultLiveState
@@ -84,6 +98,16 @@ func TestInspectPlanFaultState601UsesOnlyLiveIndexStructure(t *testing.T) {
 			want:       PlanFaultDrifted,
 		},
 		{
+			name:         "parent table missing",
+			tableMissing: true,
+			want:         PlanFaultUnavailable,
+		},
+		{
+			name:     "parent table unavailable",
+			tableErr: errors.New("table catalog unavailable"),
+			want:     PlanFaultUnavailable,
+		},
+		{
 			name:          "definition unavailable",
 			definitionErr: errors.New("catalog unavailable\nprivate detail"),
 			want:          PlanFaultUnavailable,
@@ -101,6 +125,8 @@ func TestInspectPlanFaultState601UsesOnlyLiveIndexStructure(t *testing.T) {
 			db := &planFaultCatalogFake{
 				definition:    tt.definition,
 				definitionErr: tt.definitionErr,
+				tableMissing:  tt.tableMissing,
+				tableErr:      tt.tableErr,
 				usable:        tt.usable,
 				usableErr:     tt.usableErr,
 			}

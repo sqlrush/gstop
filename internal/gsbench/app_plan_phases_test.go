@@ -327,6 +327,31 @@ func TestExecutePlanFaultActionKeepsUnchanged602PlanWithWarning(t *testing.T) {
 	}
 }
 
+func TestExecutePlanFaultActionFailsWhenVerificationIsCanceled(t *testing.T) {
+	backend := &planActionBackendTest{
+		workload:      planRunRecord{RunID: "workload-602", Code: 602},
+		workloadAlive: true,
+		inspection:    PlanFaultInspection{Code: 602, State: PlanFaultRestored},
+		verifyErr:     fmt.Errorf("explain canceled: %w", context.Canceled),
+	}
+	reporter := &planFaultReporterTest{}
+	_, err := executePlanFaultAction(
+		context.Background(), 602, backend,
+		func() string { return "fault-602" }, reporter.reporters(),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	if backend.recordFinishOutcome != OutcomeFailed {
+		t.Fatalf("finish outcome=%s", backend.recordFinishOutcome)
+	}
+	for _, warning := range reporter.warnings {
+		if warning.Check == "fault_effect" {
+			t.Fatalf("cancellation was downgraded to fault-effect warning: %+v", warning)
+		}
+	}
+}
+
 func TestRecordPlanFaultFailureFinalizesAfterCallerCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -334,7 +359,7 @@ func TestRecordPlanFaultFailureFinalizesAfterCallerCancellation(t *testing.T) {
 	reporter := &planFaultReporterTest{}
 
 	err := recordPlanFaultFailure(
-		ctx, backend, "fault-601", 601,
+		ctx, backend, "fault-601", 601, "apply plan fault",
 		errors.New("apply failed"), reporter.reporters(),
 	)
 	if err == nil || !strings.Contains(err.Error(), "apply failed") {

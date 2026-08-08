@@ -2,6 +2,7 @@ package gsbench
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -38,6 +39,30 @@ type RecoveryPlanFilter struct {
 }
 
 type RecoveryVerifyFunc func(context.Context, Action) (bool, error)
+
+func recoveryVerifierWithPlanLiveAuthority(
+	base RecoveryVerifyFunc,
+) RecoveryVerifyFunc {
+	return func(ctx context.Context, action Action) (bool, error) {
+		if action.ScenarioCode == ScenarioCode(601) ||
+			action.ScenarioCode == ScenarioCode(602) {
+			return false, fmt.Errorf(
+				"scenario %03d recovery authority is the complete live catalog inspection",
+				action.ScenarioCode,
+			)
+		}
+		if base == nil {
+			return false, fmt.Errorf("recovery verifier is unavailable")
+		}
+		return base(ctx, action)
+	}
+}
+
+func recoveryDiscoveryErrorAllowsFallback(err error) bool {
+	return err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded)
+}
 
 type recoveryReadOnlyDatabase interface {
 	ScanReadOnly(context.Context, string, []any, ...any) error
