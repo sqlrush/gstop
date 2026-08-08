@@ -3020,6 +3020,10 @@ func commandRecoveryPlan(
 	}
 	findings, baselineErr := InspectPlanBaseline(ctx, db, cfg.Data.Schema)
 	if baselineErr != nil {
+		if !recoveryBaselineErrorAllowsFinding(baselineErr) {
+			log.Error("inspect plan baseline: %v", baselineErr)
+			return 1
+		}
 		findings = append(findings, PlanBaselineFinding{
 			ScenarioCodes: []ScenarioCode{601, 602, 603, 604, 605, 606},
 			Check:         "plan_baseline_probe", Target: cfg.Data.Schema + ".plan_data",

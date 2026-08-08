@@ -317,6 +317,21 @@ func TestRecoveryDiscoveryContextErrorsNeverAllowFallback(t *testing.T) {
 	}
 }
 
+func TestRecoveryBaselineContextErrorsNeverBecomeAdvisoryFindings(t *testing.T) {
+	for _, err := range []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		fmt.Errorf("wrapped deadline: %w", context.DeadlineExceeded),
+	} {
+		if recoveryBaselineErrorAllowsFinding(err) {
+			t.Fatalf("context error became a baseline finding: %v", err)
+		}
+	}
+	if !recoveryBaselineErrorAllowsFinding(errors.New("catalog probe denied")) {
+		t.Fatal("ordinary baseline probe failure could not become an advisory finding")
+	}
+}
+
 func recoveryItemForScenario(
 	t *testing.T,
 	plan RecoveryPlan,

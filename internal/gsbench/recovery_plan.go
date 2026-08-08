@@ -64,6 +64,10 @@ func recoveryDiscoveryErrorAllowsFallback(err error) bool {
 		!errors.Is(err, context.DeadlineExceeded)
 }
 
+func recoveryBaselineErrorAllowsFinding(err error) bool {
+	return recoveryDiscoveryErrorAllowsFallback(err)
+}
+
 type recoveryReadOnlyDatabase interface {
 	ScanReadOnly(context.Context, string, []any, ...any) error
 }
