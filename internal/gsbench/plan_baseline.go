@@ -238,6 +238,13 @@ func InspectPlanBaseline(
 			add(codes, "index_definition", definition.Name, "missing", expected, expected)
 			continue
 		case err != nil:
+			if planBaselineContextError(err) {
+				return nil, fmt.Errorf(
+					"inspect index definition %s: %w",
+					definition.Name,
+					err,
+				)
+			}
 			findings = append(findings, PlanBaselineFinding{
 				ScenarioCodes: codes, Check: "index_definition",
 				Target: definition.Name, Actual: "unavailable",
@@ -263,6 +270,13 @@ func InspectPlanBaseline(
 			nil,
 			&usable,
 		); err != nil {
+			if planBaselineContextError(err) {
+				return nil, fmt.Errorf(
+					"inspect index usability %s: %w",
+					definition.Name,
+					err,
+				)
+			}
 			findings = append(findings, PlanBaselineFinding{
 				ScenarioCodes: codes, Check: "index_usability",
 				Target: definition.Name, Actual: "unavailable", Expected: "usable",
@@ -280,14 +294,22 @@ func InspectPlanBaseline(
 		}
 	}
 
+	var probeErr error
 	countFinding := func(
 		codes []ScenarioCode,
 		check, target, query string,
 		want int,
 		statements ...string,
 	) {
+		if probeErr != nil {
+			return
+		}
 		var got int
 		if err := db.Scan(ctx, query, nil, &got); err != nil {
+			if planBaselineContextError(err) {
+				probeErr = fmt.Errorf("inspect %s: %w", target, err)
+				return
+			}
 			findings = append(findings, PlanBaselineFinding{
 				ScenarioCodes: codes, Check: check, Target: target,
 				Actual: "unavailable", Expected: fmt.Sprintf("count=%d", want),
@@ -342,7 +364,15 @@ func InspectPlanBaseline(
 		"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
 		"RESET default_statistics_target",
 	)
+	if probeErr != nil {
+		return nil, probeErr
+	}
 	return findings, nil
+}
+
+func planBaselineContextError(err error) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func planBaselineIndexScenarios(name string) []ScenarioCode {

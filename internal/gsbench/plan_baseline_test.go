@@ -208,6 +208,9 @@ type planBaselineCatalogState struct {
 	lookupNDistinctOverridden bool
 	executed                  []planBaselineExecutedSQL
 	nextConnID                int
+	queryCalls                int
+	queryErrorAt              int
+	queryError                error
 }
 
 type planBaselineExecutedSQL struct {
@@ -281,6 +284,15 @@ func (c *planBaselineCatalogConn) QueryContext(
 	query string,
 	args []driver.NamedValue,
 ) (driver.Rows, error) {
+	c.state.mu.Lock()
+	c.state.queryCalls++
+	queryCall := c.state.queryCalls
+	queryErrorAt := c.state.queryErrorAt
+	queryError := c.state.queryError
+	c.state.mu.Unlock()
+	if queryErrorAt > 0 && queryCall == queryErrorAt {
+		return nil, queryError
+	}
 	row := func(value driver.Value) driver.Rows {
 		return &planBaselineCatalogRows{
 			columns: []string{"value"},
@@ -547,6 +559,43 @@ func TestInspectPlanBaselineFindsWrongShapeWithoutExecuting(t *testing.T) {
 	defer state.mu.Unlock()
 	if len(state.executed) != 0 {
 		t.Fatalf("inspection executed SQL: %+v", state.executed)
+	}
+}
+
+func TestInspectPlanBaselinePropagatesContextErrorAfterTableProbe(t *testing.T) {
+	tests := []struct {
+		name         string
+		queryErrorAt int
+		queryError   error
+	}{
+		{
+			name: "index_definition", queryErrorAt: 2,
+			queryError: fmt.Errorf("index probe canceled: %w", context.Canceled),
+		},
+		{
+			name: "index_usability", queryErrorAt: 3,
+			queryError: fmt.Errorf("index probe timed out: %w", context.DeadlineExceeded),
+		},
+		{
+			name: "count_finding", queryErrorAt: 16,
+			queryError: fmt.Errorf("statistics probe canceled: %w", context.Canceled),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := &planBaselineCatalogState{
+				definitions:  planBaselineDefinitionsForTest(),
+				queryErrorAt: test.queryErrorAt,
+				queryError:   test.queryError,
+			}
+			db := newPlanBaselineCatalogDatabase(t, state)
+
+			findings, err := InspectPlanBaseline(context.Background(), db, "gsbench")
+			if !errors.Is(err, context.Canceled) &&
+				!errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("findings=%+v error=%v", findings, err)
+			}
+		})
 	}
 }
 
