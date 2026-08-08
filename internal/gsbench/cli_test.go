@@ -24,6 +24,7 @@ func TestReadOnlyCLICommandsDoNotCreateLogsOrDirectories(t *testing.T) {
 		dryRun  bool
 	}{
 		{name: "restore dry run", command: "restore", dryRun: true},
+		{name: "restore", command: "restore"},
 		{name: "cleanup dry run", command: "cleanup", dryRun: true},
 		{name: "doctor", command: "doctor"},
 		{name: "status", command: "status"},
@@ -78,7 +79,7 @@ func TestReadOnlyCLICommandsDoNotCreateLogsOrDirectories(t *testing.T) {
 	}
 }
 
-func TestRestoreCLIExecutesLocalInverseWhenInitialDatabaseIsUnreachable(
+func TestRestoreCLINeverExecutesLocalInverseWhenDatabaseIsUnreachable(
 	t *testing.T,
 ) {
 	t.Setenv("GSBENCH_TEST_PASSWORD", "test-only")
@@ -154,16 +155,15 @@ ledger_path = %s
 			stderr.String(),
 		)
 	}
-	if len(provider.restored) != 1 ||
-		provider.restored[0].Target != action.Target {
-		t.Fatalf("provider restores=%v want exactly once", provider.restored)
+	if len(provider.restored) != 0 {
+		t.Fatalf("read-only restore invoked provider: %v", provider.restored)
 	}
 	pending, err := ledger.Pending(context.Background(), action.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 0 {
-		t.Fatalf("local recovery did not converge: %+v", pending)
+	if len(pending) != 1 {
+		t.Fatalf("read-only restore changed ledger: %+v", pending)
 	}
 }
 
@@ -176,7 +176,7 @@ func TestCLIVersionPrintsAuthor(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Author: WangYingJie <sqlrush@gmail.com>") {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.7\n") {
+	if !strings.HasPrefix(stdout.String(), "gsbench v1.1.8\n") {
 		t.Fatalf("version=%q", stdout.String())
 	}
 }
@@ -229,6 +229,7 @@ func TestCLIHelpDocumentsIndependentPlanScenariosAndRestore(t *testing.T) {
 		"605=planchange_index_drop", "606=planchange_index_shape",
 		"gsbench run 601 init --worker N --duration DURATION",
 		"gsbench run 601 fault", "gsbench run 601 recover",
+		"display-only recovery DDL/DML", "does not execute recovery SQL",
 		"--worker N", "601-606 init", "--workers alias",
 	} {
 		if !strings.Contains(text, token) {
@@ -250,6 +251,83 @@ func TestParseCLIArgsSupportsScenarioDurationAndDryRun(t *testing.T) {
 		[]ScenarioCode{101, 501},
 	) {
 		t.Fatalf("codes=%v", options.ScenarioCodes)
+	}
+}
+
+func TestParseCLIArgsSupportsPoolTargetPercent(t *testing.T) {
+	for _, test := range []struct {
+		args  []string
+		codes []ScenarioCode
+		want  int
+	}{
+		{[]string{"run", "401", "--percent", "90"}, []ScenarioCode{401}, 90},
+		{[]string{"run", "402", "--percent=100"}, []ScenarioCode{402}, 100},
+		{[]string{"run", "301,401,402", "--percent", "1"}, []ScenarioCode{301, 401, 402}, 1},
+		{[]string{"run", "--percent", "90"}, nil, 90},
+	} {
+		options, err := ParseCLIArgs(test.args)
+		if err != nil {
+			t.Fatalf("ParseCLIArgs(%v): %v", test.args, err)
+		}
+		if options.PoolPercent != test.want ||
+			len(options.ScenarioCodes) != len(test.codes) ||
+			(len(test.codes) > 0 &&
+				!reflect.DeepEqual(options.ScenarioCodes, test.codes)) {
+			t.Fatalf("ParseCLIArgs(%v)=%+v", test.args, options)
+		}
+	}
+}
+
+func TestParseCLIArgsRejectsInvalidPoolTargetPercent(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "401", "--percent", "0"},
+		{"run", "401", "--percent", "-1"},
+		{"run", "401", "--percent", "1.5"},
+		{"run", "301", "--percent", "90"},
+		{"doctor", "--scenario", "401", "--percent", "90"},
+	} {
+		if _, err := ParseCLIArgs(args); err == nil {
+			t.Fatalf("ParseCLIArgs(%v) accepted invalid pool target", args)
+		}
+	}
+}
+
+func TestParseCLIArgsAllowsPoolTargetAboveOneHundred(t *testing.T) {
+	options, err := ParseCLIArgs([]string{"run", "401", "--percent", "125"})
+	if err != nil {
+		t.Fatalf("advisory pool target was rejected: %v", err)
+	}
+	if options.PoolPercent != 125 {
+		t.Fatalf("pool percent=%d want=125", options.PoolPercent)
+	}
+}
+
+func TestParseCLIArgsAllowsChainDepthAboveLegacyMaximum(t *testing.T) {
+	options, err := ParseCLIArgs([]string{
+		"run", "501", "--sessions", "8", "--chain-depth", "6",
+	})
+	if err != nil {
+		t.Fatalf("advisory chain depth was rejected: %v", err)
+	}
+	if options.ChainDepth != 6 || options.Sessions != 8 {
+		t.Fatalf("lock overrides=%+v", options)
+	}
+}
+
+func TestCLIHelpDocumentsPoolTargetPercent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := RunCLI(
+		context.Background(), []string{"help"}, &stdout, &stderr,
+	); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	for _, token := range []string{
+		"--percent N", "gsbench run 401 --percent",
+		"gsbench run 402 --percent",
+	} {
+		if !strings.Contains(stdout.String(), token) {
+			t.Errorf("help missing %q:\n%s", token, stdout.String())
+		}
 	}
 }
 
@@ -476,7 +554,6 @@ func TestParseCLIArgsRejectsInvalidLockWorkloadOverrides(t *testing.T) {
 		{name: "one session", args: []string{"run", "501", "--sessions=1"}},
 		{name: "depth exceeds sessions", args: []string{"run", "501", "--sessions=2", "--chain-depth=2"}},
 		{name: "zero depth", args: []string{"run", "501", "--chain-depth=0"}},
-		{name: "depth above five", args: []string{"run", "501", "--chain-depth=6"}},
 		{name: "depth on 502", args: []string{"run", "502", "--chain-depth=2"}},
 		{name: "sessions on CPU scenario", args: []string{"run", "101", "--sessions=2"}},
 		{name: "non-run command", args: []string{"doctor", "--sessions=2"}},
@@ -494,7 +571,6 @@ func TestParseCLIArgsRejectsInvalidMemoryWorkloadOverrides(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "below minimum", args: []string{"run", "201", "--work-mem=63kB"}},
 		{name: "zero", args: []string{"run", "201", "--work-mem=0kB"}},
 		{name: "negative", args: []string{"run", "201", "--work-mem=-1MB"}},
 		{name: "fractional", args: []string{"run", "201", "--work-mem=1.5MB"}},
@@ -517,6 +593,13 @@ func TestParseCLIArgsRejectsInvalidMemoryWorkloadOverrides(t *testing.T) {
 				t.Fatalf("ParseCLIArgs(%v) accepted invalid memory override", test.args)
 			}
 		})
+	}
+}
+
+func TestParseWorkMemAcceptsPositiveValueBelowLegacyMinimum(t *testing.T) {
+	got, err := ParseWorkMemKB("1kB")
+	if err != nil || got != 1 {
+		t.Fatalf("work_mem=%d error=%v", got, err)
 	}
 }
 
@@ -795,7 +878,7 @@ func TestExecuteCommandCreatesDefaultLogUnderConfigDirectory(t *testing.T) {
 	}
 }
 
-func TestPreparePlanRunBaselineAlwaysRepairsAndOnlyStrictlyVerifies(t *testing.T) {
+func TestPreparePlanRunBaselineInspectsWithoutRepairing(t *testing.T) {
 	for _, validationEnabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("validation_%v", validationEnabled), func(t *testing.T) {
 			var output bytes.Buffer
@@ -828,15 +911,11 @@ func TestPreparePlanRunBaselineAlwaysRepairsAndOnlyStrictlyVerifies(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantVerifyCalls := 0
-			if validationEnabled {
-				wantVerifyCalls = 1
+			if repairCalls != 0 || verifyCalls != 1 {
+				t.Fatalf("repair calls=%d verify calls=%d want=0/1", repairCalls, verifyCalls)
 			}
-			if repairCalls != 1 || verifyCalls != wantVerifyCalls {
-				t.Fatalf("repair calls=%d verify calls=%d want=1/%d", repairCalls, verifyCalls, wantVerifyCalls)
-			}
-			if !strings.Contains(output.String(), "target=plan_index status=RESTORED") {
-				t.Fatalf("baseline repair result was not logged: %q", output.String())
+			if strings.Contains(output.String(), "status=RESTORED") {
+				t.Fatalf("baseline repair result was logged: %q", output.String())
 			}
 		})
 	}
@@ -1034,9 +1113,21 @@ func TestParseDatasetSize(t *testing.T) {
 			t.Fatalf("%s: got=%d err=%v want=%d", input, got, err, want)
 		}
 	}
-	for _, input := range []string{"", "0GB", "512MB", "2.01TB", "2049GB", "1.234TB"} {
+	for _, input := range []string{"", "0GB", "512MB", "1.234TB"} {
 		if _, err := ParseDatasetSize(input); err == nil {
 			t.Fatalf("%s: expected error", input)
+		}
+	}
+}
+
+func TestParseDatasetSizeAllowsValuesOutsideLegacyPolicyRange(t *testing.T) {
+	for input, want := range map[string]int64{
+		"0.5GB": 1 << 29,
+		"4TB":   4 << 40,
+	} {
+		got, err := ParseDatasetSize(input)
+		if err != nil || got != want {
+			t.Fatalf("%s: got=%d err=%v want=%d", input, got, err, want)
 		}
 	}
 }
@@ -1059,10 +1150,13 @@ func TestCLIHelpDocumentsInitSize(t *testing.T) {
 	if code := RunCLI(context.Background(), []string{"help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	for _, token := range []string{"gsbench init --size 100GB", "--size VALUE", "maximum 2TB"} {
+	for _, token := range []string{"gsbench init --size 100GB", "--size VALUE", "positive size with unit"} {
 		if !strings.Contains(stdout.String(), token) {
 			t.Fatalf("help missing %q:\n%s", token, stdout.String())
 		}
+	}
+	if strings.Contains(stdout.String(), "maximum 2TB") {
+		t.Fatalf("help advertises removed size policy limit:\n%s", stdout.String())
 	}
 }
 

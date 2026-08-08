@@ -119,9 +119,10 @@ func NewDatasetManagerWithValidation(
 	validationEnabled bool,
 	progress ...DatasetProgress,
 ) *DatasetManager {
+	_ = validationEnabled // accepted for v1.1.7 config compatibility; advisory-only in v1.1.8
 	manager := &DatasetManager{
 		exec:              exec,
-		validationEnabled: validationEnabled,
+		validationEnabled: true,
 	}
 	if len(progress) > 0 {
 		manager.progress = progress[0]
@@ -135,15 +136,29 @@ func (m *DatasetManager) report(format string, args ...any) {
 	}
 }
 
+func (m *DatasetManager) reportAdvisory(
+	check string,
+	object string,
+	err error,
+) {
+	if err == nil {
+		return
+	}
+	m.report(
+		"PRECHECK_WARN scenario=000 name=dataset check=%s object=%s "+
+			"actual=%s expected=canonical_dataset_state impact=operation_continues",
+		advisoryLogValue(check),
+		advisoryLogValue(object),
+		advisoryLogValue(err.Error()),
+	)
+}
+
 func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPlan, error) {
 	if !identifierRE.MatchString(cfg.Data.Schema) {
 		return DatasetPlan{}, fmt.Errorf("unsafe schema %q", cfg.Data.Schema)
 	}
 	capacityValid := capacity.TotalBytes > 0 && capacity.FreeBytes > 0 &&
 		capacity.FreeBytes <= capacity.TotalBytes
-	if cfg.Run.ValidationEnabled && !capacityValid {
-		return DatasetPlan{}, fmt.Errorf("invalid disk capacity: %+v", capacity)
-	}
 	minFree := cfg.Data.MinFreeDiskPercent
 	if minFree == 0 {
 		minFree = 20
@@ -170,30 +185,6 @@ func PlanDataset(cfg BenchConfig, capacity Capacity, env Environment) (DatasetPl
 			}
 		}
 		target = requestedGB << 30
-	}
-	if target < 1<<30 {
-		return DatasetPlan{}, fmt.Errorf("dataset target %d is below 1GB", target)
-	}
-	if target > maxDatasetBytes {
-		return DatasetPlan{}, fmt.Errorf("dataset target %d exceeds 2TB", target)
-	}
-	profileCapGB := cfg.Safety.ProfileCapGB
-	if profileCapGB <= 0 {
-		profileCapGB = 256
-	}
-	profileCapBytes := int64(profileCapGB) << 30
-	if target > profileCapBytes {
-		return DatasetPlan{}, fmt.Errorf(
-			"dataset target %d exceeds safety profile cap %dGB",
-			target,
-			profileCapGB,
-		)
-	}
-	if cfg.Run.ValidationEnabled && target > available {
-		return DatasetPlan{}, fmt.Errorf(
-			"dataset capacity rejected: target=%d free=%d reserved=%d safe_available=%d",
-			target, capacity.FreeBytes, reserved, available,
-		)
 	}
 	plan := DatasetPlan{
 		Schema:            cfg.Data.Schema,
@@ -481,7 +472,7 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 	}
 	if m.validationEnabled {
 		if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectTable); err != nil {
-			return err
+			m.reportAdvisory("table_contract", plan.Schema, err)
 		}
 	}
 	inspector, inspectPhysical := m.exec.(DatasetPhysicalInspector)
@@ -490,20 +481,26 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 		var err error
 		physical, err = inspector.DatasetSize(ctx, plan.Schema)
 		if err != nil {
-			return fmt.Errorf("sample dataset physical size: %w", err)
+			m.reportAdvisory("physical_size", plan.Schema, err)
+			inspectPhysical = false
 		}
-		if m.validationEnabled && physical.Source == "" {
-			return fmt.Errorf("sample dataset physical size: empty size source")
+		if inspectPhysical && m.validationEnabled && physical.Source == "" {
+			m.reportAdvisory(
+				"physical_size_source", plan.Schema,
+				fmt.Errorf("sample dataset physical size: empty size source"),
+			)
 		}
-		if m.validationEnabled {
+		if inspectPhysical && m.validationEnabled {
 			if err := enforceDatasetHardTarget(
 				physical, plan.EstimatedBytes, "initial sample",
 			); err != nil {
-				return err
+				m.reportAdvisory("physical_size_target", plan.Schema, err)
 			}
 		}
-		m.report("dataset size_bytes=%d size_source=%s nodes=%d",
-			physical.TotalBytes, physical.Source, physical.NodeCount)
+		if inspectPhysical {
+			m.report("dataset size_bytes=%d size_source=%s nodes=%d",
+				physical.TotalBytes, physical.Source, physical.NodeCount)
+		}
 	}
 	stopOptional := inspectPhysical &&
 		physical.TotalBytes*100 >= plan.EstimatedBytes*95
@@ -580,28 +577,31 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 				changedTables[table.Table] = true
 			}
 			if inspectPhysical {
-				physical, err = inspector.DatasetSize(ctx, plan.Schema)
+				var sample DatasetSizeSample
+				sample, err = inspector.DatasetSize(ctx, plan.Schema)
 				if err != nil {
-					return fmt.Errorf("sample dataset size after %s batch: %w",
-						table.Table, err)
+					m.reportAdvisory("physical_size", table.Table, err)
+					inspectPhysical = false
+				} else {
+					physical = sample
 				}
-				if m.validationEnabled && physical.Source == "" {
-					return fmt.Errorf(
-						"sample dataset size after %s batch: empty size source",
-						table.Table,
+				if inspectPhysical && m.validationEnabled && physical.Source == "" {
+					m.reportAdvisory(
+						"physical_size_source", table.Table,
+						fmt.Errorf("empty size source after batch"),
 					)
 				}
-				if m.validationEnabled {
+				if inspectPhysical && m.validationEnabled {
 					if err := enforceDatasetHardTarget(
 						physical,
 						plan.EstimatedBytes,
 						"post-batch "+table.Table,
 					); err != nil {
-						return err
+						m.reportAdvisory("physical_size_target", table.Table, err)
 					}
 				}
-				if physical.TotalBytes >= plan.EstimatedBytes ||
-					physical.TotalBytes*100 >= plan.EstimatedBytes*95 {
+				if inspectPhysical && (physical.TotalBytes >= plan.EstimatedBytes ||
+					physical.TotalBytes*100 >= plan.EstimatedBytes*95) {
 					stopOptional = true
 				}
 			}
@@ -644,17 +644,19 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 				return fmt.Errorf("initialize %s %s: %w", group.detail, object.Name, err)
 			}
 			if inspectPhysical {
-				physical, err = inspector.DatasetSize(ctx, plan.Schema)
+				var sample DatasetSizeSample
+				sample, err = inspector.DatasetSize(ctx, plan.Schema)
 				if err != nil {
-					return fmt.Errorf(
-						"sample dataset size after index %s: %w", object.Name, err,
-					)
+					m.reportAdvisory("physical_size", object.Name, err)
+					inspectPhysical = false
+				} else {
+					physical = sample
 				}
-				if m.validationEnabled {
+				if inspectPhysical && m.validationEnabled {
 					if physical.Source == "" {
-						return fmt.Errorf(
-							"sample dataset size after index %s: empty size source",
-							object.Name,
+						m.reportAdvisory(
+							"physical_size_source", object.Name,
+							fmt.Errorf("empty size source after index"),
 						)
 					}
 					if err := enforceDatasetHardTarget(
@@ -662,7 +664,7 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 						plan.EstimatedBytes,
 						"post-index "+object.Name,
 					); err != nil {
-						return err
+						m.reportAdvisory("physical_size_target", object.Name, err)
 					}
 				}
 			}
@@ -674,12 +676,12 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 	}
 	if m.validationEnabled {
 		if err := m.validateDatasetObjects(ctx, plan.DDL, DatasetObjectIndex); err != nil {
-			return err
+			m.reportAdvisory("index_contract", plan.Schema, err)
 		}
 		if err := m.validateDatasetObjects(
 			ctx, plan.PostMigrationDDL, DatasetObjectIndex,
 		); err != nil {
-			return fmt.Errorf("validate post-migration DDL: %w", err)
+			m.reportAdvisory("post_migration_index_contract", plan.Schema, err)
 		}
 	}
 	if inspectPhysical {
@@ -688,13 +690,13 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 			ctx, plan, inspector, physical, changedTables,
 		)
 		if err != nil {
-			return err
+			m.reportAdvisory("physical_size_calibration", plan.Schema, err)
 		}
 		if m.validationEnabled {
 			if err := enforceDatasetHardTarget(
 				physical, plan.EstimatedBytes, "post-calibration",
 			); err != nil {
-				return err
+				m.reportAdvisory("physical_size_target", plan.Schema, err)
 			}
 		}
 	}
@@ -715,7 +717,7 @@ func (m *DatasetManager) Init(ctx context.Context, plan DatasetPlan) error {
 	if inspectPhysical {
 		if m.validationEnabled {
 			if err := inspector.ValidateDatasetLayout(ctx, plan); err != nil {
-				return fmt.Errorf("validate dataset physical layout: %w", err)
+				m.reportAdvisory("physical_layout", plan.Schema, err)
 			}
 		}
 		m.report("dataset final_size_bytes=%d target_bytes=%d size_source=%s",
@@ -935,14 +937,14 @@ func (m *DatasetManager) calibrateDataset(
 			}
 			physical, err = inspector.DatasetSize(ctx, plan.Schema)
 			if err != nil {
-				return physical, fmt.Errorf(
-					"sample dataset size in calibration round %d: %w", round, err)
+				m.reportAdvisory("physical_size", table.Table, err)
+				return physical, nil
 			}
 			if m.validationEnabled {
 				if physical.Source == "" {
-					return physical, fmt.Errorf(
-						"sample dataset size in calibration round %d: empty size source",
-						round,
+					m.reportAdvisory(
+						"physical_size_source", table.Table,
+						fmt.Errorf("empty size source in calibration round %d", round),
 					)
 				}
 				if err := enforceDatasetHardTarget(
@@ -950,7 +952,7 @@ func (m *DatasetManager) calibrateDataset(
 					plan.EstimatedBytes,
 					fmt.Sprintf("calibration round %d table %s", round, table.Table),
 				); err != nil {
-					return physical, err
+					m.reportAdvisory("physical_size_target", table.Table, err)
 				}
 			}
 			m.report(
@@ -1155,7 +1157,12 @@ func (m *DatasetManager) checkDatasetCapacity(ctx context.Context) error {
 		return nil
 	}
 	if err := checker.CheckCapacity(ctx); err != nil {
-		return fmt.Errorf("dataset disk safety check: %w", err)
+		m.report(
+			"PRECHECK_WARN scenario=000 name=dataset check=disk_capacity "+
+				"object=init actual=%s expected=sufficient_capacity "+
+				"impact=init_continues_without_target_reduction",
+			advisoryLogValue(err.Error()),
+		)
 	}
 	return nil
 }

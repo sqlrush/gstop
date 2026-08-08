@@ -153,6 +153,26 @@ func TestEnsureWorkloadPlansCachesEachUniqueSQLShape(t *testing.T) {
 	}
 }
 
+func TestInspectWorkloadPlansExplainsWithoutCaching(t *testing.T) {
+	first := "SELECT * FROM gsbench.accounts WHERE id=42"
+	second := "SELECT * FROM gsbench.accounts WHERE id=43"
+	store := &fakeWorkloadPlanStore{plans: map[string]string{
+		first:  "Index Scan  (cost=0.00..1.00 rows=1 width=8)",
+		second: "Seq Scan  (cost=0.00..2.00 rows=1 width=8)",
+	}}
+	if err := inspectWorkloadPlans(
+		context.Background(), store, ScenarioCode(101), []string{first, first, second},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(store.explained, []string{first, second}) {
+		t.Fatalf("explained=%v", store.explained)
+	}
+	if len(store.cached) != 0 {
+		t.Fatalf("inspection mutated plan cache: %+v", store.cached)
+	}
+}
+
 func TestEnsureWorkloadPlansRejectsEmptyOrUnparseablePlan(t *testing.T) {
 	for name, plan := range map[string]string{
 		"empty": "", "unparseable": "NOTICE: optimizer unavailable",

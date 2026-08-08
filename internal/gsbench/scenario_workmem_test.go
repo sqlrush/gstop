@@ -521,6 +521,25 @@ func TestCalibrateWorkMemRangeFailsWithoutNonSpillingObservation(t *testing.T) {
 	}
 }
 
+func TestWorkMemBuildersAcceptPositiveValueBelowLegacyMinimum(t *testing.T) {
+	statements, err := workMemSessionSetup(workMemSort, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statements) == 0 || !strings.Contains(statements[0], "1kB") {
+		t.Fatalf("statements=%v", statements)
+	}
+	calibration, err := calibrateWorkMemRange(
+		context.Background(), 1, workMemSort,
+		func(context.Context, int64) (workMemObservation, error) {
+			return workMemObservation{UsedKB: 1, OperatorCount: 1}, nil
+		},
+	)
+	if err != nil || calibration.RangeEnd <= 0 {
+		t.Fatalf("calibration=%+v error=%v", calibration, err)
+	}
+}
+
 func TestWorkMemCalibrationEvidenceReportsTargetMiss(t *testing.T) {
 	scenario := &workMemScenario{
 		kind:     workMemSort,

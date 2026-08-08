@@ -124,8 +124,68 @@ func replaceCachedWorkloadPlan(
 	return nil
 }
 
-// EnsureWorkloadPlans proves every workload statement is literal, explainable,
-// and durably cached before a scenario starts executing it.
+// InspectWorkloadPlans checks that every workload statement is literal and
+// explainable without mutating the gsbench plan cache or database metadata.
+func InspectWorkloadPlans(
+	ctx context.Context,
+	runtime *Runtime,
+	scenario string,
+	sqls []string,
+) error {
+	if runtime == nil || runtime.Database == nil {
+		return fmt.Errorf("scenario %s plan inspection database is unavailable", scenario)
+	}
+	catalog := runtime.Catalog
+	if catalog == nil {
+		catalog = DefaultScenarioCatalog()
+	}
+	definition, err := catalog.Resolve(scenario)
+	if err != nil {
+		return fmt.Errorf("resolve plan-inspection scenario %q: %w", scenario, err)
+	}
+	return inspectWorkloadPlans(
+		ctx,
+		databaseWorkloadPlanStore{runtime: runtime},
+		definition.Code,
+		sqls,
+	)
+}
+
+func inspectWorkloadPlans(
+	ctx context.Context,
+	store workloadPlanStore,
+	scenarioCode ScenarioCode,
+	sqls []string,
+) error {
+	for _, sqlText := range uniqueSQLTexts(sqls) {
+		if workloadBindMarkerRE.MatchString(sqlText) {
+			return fmt.Errorf(
+				"scenario %03d workload SQL contains bind marker: %s",
+				scenarioCode,
+				sqlText,
+			)
+		}
+		planText, err := store.Explain(ctx, sqlText)
+		if err != nil {
+			return fmt.Errorf(
+				"scenario %03d explain workload: %w",
+				scenarioCode,
+				err,
+			)
+		}
+		if !looksLikeWorkloadPlan(planText) {
+			return fmt.Errorf(
+				"scenario %03d returned empty or unparseable plan",
+				scenarioCode,
+			)
+		}
+	}
+	return nil
+}
+
+// EnsureWorkloadPlans is retained for compatibility with explicit callers
+// that intentionally persist plan snapshots. Scenario preflight uses the
+// read-only InspectWorkloadPlans path.
 func EnsureWorkloadPlans(
 	ctx context.Context,
 	runtime *Runtime,

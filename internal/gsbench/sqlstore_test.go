@@ -578,6 +578,32 @@ func TestDatasetIndexMatchesAcceptsSearchPathQualifiedEquivalent(t *testing.T) {
 	}
 }
 
+func TestDatasetIndexMatchesAcceptsImplicitDefaultUBTree(t *testing.T) {
+	expected := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data (lookup_key, dist_key)`
+	actual := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data USING ubtree (lookup_key, dist_key) TABLESPACE pg_default`
+
+	if !datasetIndexMatches(actual, expected) {
+		t.Fatalf(
+			"implicit database-default tree index rejected ubtree:\nactual:   %s\nexpected: %s",
+			actual,
+			expected,
+		)
+	}
+}
+
+func TestDatasetIndexMatchesKeepsExplicitAccessMethodStrict(t *testing.T) {
+	expected := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data USING btree (lookup_key, dist_key)`
+	actual := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data USING ubtree (lookup_key, dist_key)`
+
+	if datasetIndexMatches(actual, expected) {
+		t.Fatalf(
+			"explicitly different access method was accepted:\nactual:   %s\nexpected: %s",
+			actual,
+			expected,
+		)
+	}
+}
+
 func TestSQLActionExecutorRejectsNonSQLActionKind(t *testing.T) {
 	db := &fakeSQLActionDatabase{}
 	executor := dbActionExecutor{db: db}

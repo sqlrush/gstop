@@ -75,7 +75,7 @@ func CleanupPlan(schema string, withData bool) ([]string, error) {
 	if !identifierRE.MatchString(schema) {
 		return nil, fmt.Errorf("unsafe schema %q", schema)
 	}
-	steps := []string{"stop tagged workload sessions", "restore unresolved mutation journal entries"}
+	steps := []string{"stop tagged workload sessions", "report unresolved recovery plan entries"}
 	if withData {
 		steps = append(steps, "DROP SCHEMA "+schema+" CASCADE")
 	}

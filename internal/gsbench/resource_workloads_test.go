@@ -175,6 +175,38 @@ func TestObserveRequiredStreamSupportsMultiColumnExplainRows(t *testing.T) {
 	}
 }
 
+func TestResourcePrepareKeepsMissingStreamAdvisory(t *testing.T) {
+	pool := sql.OpenDB(&explainRowsTestConnector{rows: &explainRowsTestRows{
+		columns: []string{"QUERY PLAN"},
+		values:  [][]driver.Value{{"Seq Scan on fact_sales"}},
+	}})
+	t.Cleanup(func() { _ = pool.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	database := &Database{
+		pool: pool, ctx: ctx, cancel: cancel,
+		tagged: map[*TaggedConn]struct{}{},
+	}
+	var warnings []PrecheckWarning
+	scenario := newResourceScenario(332, "network_distributed_shuffle")
+	if err := scenario.Prepare(ctx, &Runtime{
+		Config:   BenchConfig{Data: DataConfig{Schema: "gsbench"}},
+		Database: database,
+		Environment: Environment{
+			Product: ProductOpenGauss, Topology: TopologyDistributed,
+			Nodes: []Node{{Name: "dn_1", Role: NodeRoleDNPrimary}},
+		},
+		ReportWarning: func(warning PrecheckWarning) {
+			warnings = append(warnings, warning)
+		},
+	}); err != nil {
+		t.Fatalf("missing stream evidence blocked workload: %v", err)
+	}
+	if len(warnings) != 1 || warnings[0].Check != "required_stream" {
+		t.Fatalf("warnings=%+v", warnings)
+	}
+}
+
 func TestResourceFactoriesBuildApprovedCodesAndKeepDeferredCodesAbsent(t *testing.T) {
 	factories := ResourceScenarioFactories()
 	for _, code := range []ScenarioCode{
@@ -428,7 +460,7 @@ func TestTotalMemoryScenarioUsesBoundedWorkerStrategy(t *testing.T) {
 	}
 }
 
-func TestTotalMemoryScenarioUsesConfiguredWorkerBudgetAndRejectsUnsafeTarget(t *testing.T) {
+func TestTotalMemoryScenarioUsesConfiguredWorkerBudgetWithoutLegacyCap(t *testing.T) {
 	defaults, err := LoadConfig(writeTestConfig(t, minimalConfig()), Overrides{})
 	if err != nil {
 		t.Fatal(err)
@@ -475,8 +507,15 @@ max_workers = 2
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := newTotalMemoryScenario("memory_total_pressure").Prepare(context.Background(), &Runtime{Config: unsafe, Database: &Database{}}); err == nil {
-		t.Fatal("memory worker target exceeding the safety maximum was accepted")
+	uncapped := newTotalMemoryScenario("memory_total_pressure")
+	if err := uncapped.Prepare(context.Background(), &Runtime{Config: unsafe, Database: &Database{}}); err != nil {
+		t.Fatalf("legacy safety maximum blocked target: %v", err)
+	}
+	if uncapped.target != 3 {
+		t.Fatalf("uncapped memory workers=%d want=3", uncapped.target)
+	}
+	if err := uncapped.Stop(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

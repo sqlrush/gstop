@@ -23,8 +23,9 @@ type RestoreRequest struct {
 }
 
 type RestoreRun struct {
-	RunID     string
-	StartedAt time.Time
+	RunID         string
+	StartedAt     time.Time
+	ScenarioCodes []ScenarioCode
 }
 
 type RestoreDiscovery struct {
@@ -187,11 +188,15 @@ type RestoreCoordinator struct {
 }
 
 type RestoreSummary struct {
-	RunIDs         []string
-	PlannedActions []Action
-	Outcome        Outcome
-	Failed         bool
-	Err            error
+	Runs                  []RestoreRun
+	RunIDs                []string
+	PlannedActions        []Action
+	DiscoveryComplete     bool
+	RestoreLockReleased   bool
+	AfterSuccessAttempted bool
+	Outcome               Outcome
+	Failed                bool
+	Err                   error
 }
 
 func NewRestoreCoordinator(backend RestoreCoordinatorBackend) *RestoreCoordinator {
@@ -234,9 +239,11 @@ func (r *RestoreCoordinator) Restore(
 			return failedRestoreSummary(runs, actions, err)
 		}
 		return RestoreSummary{
-			RunIDs:         runs,
-			PlannedActions: actions,
-			Outcome:        OutcomeSuccess,
+			Runs:              runs,
+			RunIDs:            restoreRunIDs(runs),
+			PlannedActions:    actions,
+			DiscoveryComplete: true,
+			Outcome:           OutcomeSuccess,
 		}
 	}
 
@@ -287,17 +294,18 @@ func (r *RestoreCoordinator) Restore(
 			errors.Join(err, wrapRestoreError("release restore mutex", releaseErr)),
 		)
 	}
+	runIDs := restoreRunIDs(runs)
 
 	var errs []error
 	var actionErrs []error
-	for _, runID := range runs {
+	for _, runID := range runIDs {
 		if err := r.backend.MarkRestoreRequested(ctx, runID); err != nil {
 			errs = append(errs, fmt.Errorf(
 				"mark run %s restore requested: %w", runID, err,
 			))
 		}
 	}
-	for _, runID := range runs {
+	for _, runID := range runIDs {
 		if err := r.backend.StopTaggedSessions(ctx, runID); err != nil {
 			errs = append(errs, fmt.Errorf(
 				"stop tagged sessions for run %s: %w", runID, err,
@@ -306,7 +314,7 @@ func (r *RestoreCoordinator) Restore(
 	}
 
 	for stage := restoreStageSessions; stage <= restoreStageDatabase; stage++ {
-		for _, runID := range runs {
+		for _, runID := range runIDs {
 			group := restoreActionGroup(actions, runID, stage)
 			if len(group) == 0 {
 				continue
@@ -341,7 +349,7 @@ func (r *RestoreCoordinator) Restore(
 	if err := r.backend.RedetectTopology(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("re-detect topology: %w", err))
 	}
-	verifyErr := r.backend.VerifyRestore(ctx, runs, actions)
+	verifyErr := r.backend.VerifyRestore(ctx, runIDs, actions)
 	if verifyErr != nil {
 		errs = append(errs, actionErrs...)
 		errs = append(errs, fmt.Errorf("verify restored state: %w", verifyErr))
@@ -371,12 +379,14 @@ func (r *RestoreCoordinator) Restore(
 		errs,
 		r.markTerminalRestoreOutcomes(
 			finalizationCtx,
-			runs,
+			runIDs,
 			persistedOutcome,
 		)...,
 	)
 	cancelFinalization()
+	afterSuccessAttempted := false
 	if len(errs) == 0 && request.afterSuccess != nil {
+		afterSuccessAttempted = true
 		if err := request.afterSuccess(ctx, lock); err != nil {
 			errs = append(errs, fmt.Errorf(
 				"complete restore-protected operation: %w",
@@ -384,8 +394,12 @@ func (r *RestoreCoordinator) Restore(
 			))
 		}
 	}
-	if err := lock.Release(); err != nil {
-		errs = append(errs, fmt.Errorf("release restore mutex: %w", err))
+	releaseErr := lock.Release()
+	if releaseErr != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("release restore mutex: %w", releaseErr),
+		)
 	}
 
 	err = errors.Join(errs...)
@@ -393,11 +407,15 @@ func (r *RestoreCoordinator) Restore(
 		outcome = OutcomeRestoreFailed
 	}
 	return RestoreSummary{
-		RunIDs:         runs,
-		PlannedActions: actions,
-		Outcome:        outcome,
-		Failed:         err != nil,
-		Err:            err,
+		Runs:                  runs,
+		RunIDs:                runIDs,
+		PlannedActions:        actions,
+		DiscoveryComplete:     true,
+		RestoreLockReleased:   releaseErr == nil,
+		AfterSuccessAttempted: afterSuccessAttempted,
+		Outcome:               outcome,
+		Failed:                err != nil,
+		Err:                   err,
 	}
 }
 
@@ -471,12 +489,13 @@ func successfulRestoreRunOutcome(request RestoreRequest) Outcome {
 }
 
 func failedRestoreSummary(
-	runs []string,
+	runs []RestoreRun,
 	actions []Action,
 	err error,
 ) RestoreSummary {
 	return RestoreSummary{
-		RunIDs:         runs,
+		Runs:           runs,
+		RunIDs:         restoreRunIDs(runs),
 		PlannedActions: actions,
 		Outcome:        OutcomeRestoreFailed,
 		Failed:         true,
@@ -518,7 +537,7 @@ func (stage restoreStage) String() string {
 func prepareRestorePlan(
 	discovery RestoreDiscovery,
 	requestedRunID string,
-) ([]string, []Action, error) {
+) ([]RestoreRun, []Action, error) {
 	runByID := make(map[string]RestoreRun)
 	for _, run := range discovery.Runs {
 		run.RunID = strings.TrimSpace(run.RunID)
@@ -560,10 +579,8 @@ func prepareRestorePlan(
 		}
 		return runs[i].RunID > runs[j].RunID
 	})
-	runIDs := make([]string, len(runs))
 	runOrder := make(map[string]int, len(runs))
 	for index, run := range runs {
-		runIDs[index] = run.RunID
 		runOrder[run.RunID] = index
 	}
 	sort.SliceStable(actions, func(i, j int) bool {
@@ -586,7 +603,15 @@ func prepareRestorePlan(
 		}
 		return actions[i].Kind < actions[j].Kind
 	})
-	return runIDs, actions, err
+	return runs, actions, err
+}
+
+func restoreRunIDs(runs []RestoreRun) []string {
+	ids := make([]string, len(runs))
+	for index, run := range runs {
+		ids[index] = run.RunID
+	}
+	return ids
 }
 
 type restoreActionIdentity struct {

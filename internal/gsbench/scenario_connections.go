@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-func connectionTarget(instanceMax, targetPercent, safetyMax int) int {
-	budget, err := calculateConnectionBudget(instanceMax, 0, 0, targetPercent, safetyMax)
+func connectionTarget(instanceMax, targetPercent int) int {
+	budget, err := calculateConnectionBudget(instanceMax, 0, 0, targetPercent)
 	if err != nil {
 		return 0
 	}
@@ -21,18 +21,19 @@ func connectionTarget(instanceMax, targetPercent, safetyMax int) int {
 }
 
 type ConnectionBudget struct {
-	InstanceMax    int
-	Reserved       int
-	Existing       int
-	UsableCapacity int
-	DesiredTotal   int
-	WorkloadTarget int
-	ReachableTotal int
-	CeilingPercent float64
-	Limited        bool
+	InstanceMax     int
+	Reserved        int
+	Existing        int
+	UsableCapacity  int
+	DesiredTotal    int
+	WorkloadTarget  int
+	ReachableTotal  int
+	BaselinePercent float64
+	CeilingPercent  float64
+	Limited         bool
 }
 
-func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, safetyMax int) (ConnectionBudget, error) {
+func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent int) (ConnectionBudget, error) {
 	if instanceMax <= 0 {
 		return ConnectionBudget{}, fmt.Errorf("max_connections must be positive")
 	}
@@ -42,29 +43,24 @@ func calculateConnectionBudget(instanceMax, reserved, existing, targetPercent, s
 	if existing < 0 {
 		return ConnectionBudget{}, fmt.Errorf("existing connections must not be negative")
 	}
-	if targetPercent < 1 || targetPercent > 100 {
-		return ConnectionBudget{}, fmt.Errorf("connection target percent must be between 1 and 100")
-	}
-	if safetyMax < 1 {
-		return ConnectionBudget{}, fmt.Errorf("connection safety maximum must be positive")
+	if targetPercent < 1 {
+		return ConnectionBudget{}, fmt.Errorf("connection target percent must be positive")
 	}
 	usable := instanceMax - reserved
+	baselinePercent := float64(existing) / float64(usable) * 100
 	desired := int(math.Ceil(float64(usable) * float64(targetPercent) / 100))
 	needed := max(0, desired-existing)
 	headroom := max(0, usable-existing)
-	workloadTarget := min(needed, headroom, safetyMax)
+	workloadTarget := min(needed, headroom)
 	reachable := min(usable, existing+workloadTarget)
 	ceilingPercent := float64(reachable) / float64(usable) * 100
 	return ConnectionBudget{
 		InstanceMax: instanceMax, Reserved: reserved, Existing: existing,
 		UsableCapacity: usable, DesiredTotal: desired,
 		WorkloadTarget: workloadTarget, ReachableTotal: reachable,
-		CeilingPercent: ceilingPercent, Limited: reachable < desired,
+		BaselinePercent: baselinePercent,
+		CeilingPercent:  ceilingPercent, Limited: reachable < desired,
 	}, nil
-}
-
-func connectionTopUp(usableCapacity, observedTotal, observedTagged, workloadLimit int) int {
-	return max(0, min(usableCapacity-observedTotal, workloadLimit-observedTagged))
 }
 
 type connectionCapacityFacts struct {
@@ -126,6 +122,7 @@ type ConnectionScenario struct {
 	actualPercent  float64
 	reachableMax   float64
 	liveTagged     int
+	targetReached  bool
 	nextID         int
 	operations     atomic.Int64
 	errors         atomic.Int64
@@ -142,17 +139,57 @@ func (s *ConnectionScenario) Strategy() string {
 	return "capacity_aware_tagged_connection_state_mix"
 }
 func (s *ConnectionScenario) Prepare(ctx context.Context, rt *Runtime) error {
+	s.targetPercent = rt.Config.PoolTargets.ConnectionPercent
 	facts, err := probeConnectionCapacity(ctx, rt)
 	if err != nil {
-		return err
+		fallbackCapacity := max(1, rt.Config.Safety.MaxConnections)
+		facts = connectionCapacityFacts{InstanceMax: fallbackCapacity}
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity_probe", Object: "connection_pool",
+			Actual: err.Error(), Expected: "database_capacity_visible",
+			Impact: fmt.Sprintf(
+				"workload_continues_with_advisory_denominator=%d",
+				fallbackCapacity,
+			),
+		})
 	}
-	s.targetPercent = runtimeInt(rt, "scenario.connection_pool.target_percent", 95)
 	s.budget, err = calculateConnectionBudget(
 		facts.InstanceMax, facts.Reserved, facts.Existing,
-		s.targetPercent, rt.Config.Safety.MaxConnections,
+		s.targetPercent,
 	)
 	if err != nil {
-		return err
+		fallbackCapacity := max(1, rt.Config.Safety.MaxConnections)
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity_shape", Object: "connection_pool",
+			Actual: err.Error(), Expected: "consistent_capacity_metadata",
+			Impact: fmt.Sprintf(
+				"workload_continues_with_advisory_denominator=%d",
+				fallbackCapacity,
+			),
+		})
+		s.budget, _ = calculateConnectionBudget(
+			fallbackCapacity, 0, 0, max(1, s.targetPercent),
+		)
+	}
+	if float64(s.targetPercent) <= s.budget.BaselinePercent {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_pool_target",
+			Actual:   fmt.Sprintf("baseline=%.1f%% target=%d%%", s.budget.BaselinePercent, s.targetPercent),
+			Expected: "target_above_baseline",
+			Impact:   "no_additional_sessions_requested",
+		})
+	}
+	if s.budget.Limited {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_pool_target",
+			Actual:   fmt.Sprintf("reachable=%.1f%% target=%d%%", s.budget.CeilingPercent, s.targetPercent),
+			Expected: fmt.Sprintf("%d%%", s.targetPercent),
+			Impact:   "target_may_not_be_reached",
+		})
 	}
 	s.idlePercent = runtimeInt(rt, "scenario.connection_pool.idle_percent", 60)
 	s.idleTxnPercent = runtimeInt(rt, "scenario.connection_pool.idle_in_transaction_percent", 20)
@@ -162,29 +199,24 @@ func (s *ConnectionScenario) Prepare(ctx context.Context, rt *Runtime) error {
 func (s *ConnectionScenario) Ramp(ctx context.Context, rt *Runtime) error {
 	activeCtx, cancel := context.WithCancel(ctx)
 	s.activeCancel = cancel
-	return s.reconcile(activeCtx, rt)
-}
-
-func (s *ConnectionScenario) reconcile(ctx context.Context, rt *Runtime) error {
-	select {
-	case err := <-s.activeErrors:
-		return err
-	default:
-	}
-	total, tagged, err := s.sampleConnections(ctx, rt)
-	if err != nil {
-		return err
-	}
-	s.updateConnectionSample(total, tagged)
-	for range connectionTopUp(s.budget.UsableCapacity, total, tagged, s.budget.WorkloadTarget) {
-		if err := s.openConnection(ctx, rt); err != nil {
-			return err
+	for range s.budget.WorkloadTarget {
+		if err := s.openConnection(activeCtx, rt); err != nil {
+			return connectionTargetRampError(
+				err,
+				len(s.connections),
+				s.budget.WorkloadTarget,
+			)
 		}
-		total++
-		tagged++
 	}
-	s.updateConnectionSample(total, tagged)
-	return nil
+	total, tagged, err := s.sampleConnections(activeCtx, rt)
+	if err != nil {
+		return connectionTargetRampError(
+			err,
+			len(s.connections),
+			s.budget.WorkloadTarget,
+		)
+	}
+	return s.acceptRampSample(total, tagged)
 }
 
 func (s *ConnectionScenario) sampleConnections(ctx context.Context, rt *Runtime) (total, tagged int, err error) {
@@ -213,6 +245,37 @@ func (s *ConnectionScenario) updateConnectionSample(total, tagged int) {
 	if s.actualPercent > s.reachableMax {
 		s.reachableMax = s.actualPercent
 	}
+}
+
+func (s *ConnectionScenario) acceptFrozenSample(total, tagged int) error {
+	s.updateConnectionSample(total, tagged)
+	if tagged != s.budget.WorkloadTarget {
+		return fmt.Errorf(
+			"connection_pool injected sessions changed: actual=%d target=%d",
+			tagged,
+			s.budget.WorkloadTarget,
+		)
+	}
+	return nil
+}
+
+func (s *ConnectionScenario) acceptRampSample(total, tagged int) error {
+	if err := s.acceptFrozenSample(total, tagged); err != nil {
+		return err
+	}
+	s.targetReached = total >= s.budget.DesiredTotal
+	return nil
+}
+
+func connectionTargetRampError(err error, opened, target int) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf(
+			"connection_pool target was not reached before --duration: opened=%d target=%d",
+			opened,
+			target,
+		)
+	}
+	return err
 }
 
 func (s *ConnectionScenario) openConnection(ctx context.Context, rt *Runtime) error {
@@ -272,12 +335,6 @@ func (s *ConnectionScenario) Hold(ctx context.Context, rt *Runtime) error {
 	timer := time.NewTimer(rt.Config.Run.Duration)
 	defer timer.Stop()
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := s.reconcile(ctx, rt); err != nil {
-			return err
-		}
 		select {
 		case err := <-s.activeErrors:
 			return err
@@ -286,13 +343,20 @@ func (s *ConnectionScenario) Hold(ctx context.Context, rt *Runtime) error {
 		case <-timer.C:
 			return nil
 		case <-ticker.C:
+			total, tagged, err := s.sampleConnections(ctx, rt)
+			if err != nil {
+				return err
+			}
+			if err := s.acceptFrozenSample(total, tagged); err != nil {
+				return err
+			}
 		}
 	}
 }
 func (s *ConnectionScenario) Verify(context.Context, *Runtime) (Result, error) {
 	control := ControlResult{
 		Actual: s.actualPercent, ReachableMax: s.reachableMax,
-		Reached: s.actualPercent >= float64(s.targetPercent),
+		Reached: s.targetReached,
 		Ceiling: s.budget.Limited,
 	}
 	result := verifyControlledCapacityResult(s.Name(), float64(s.targetPercent), true, control, int64(s.liveTagged))

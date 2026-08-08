@@ -105,8 +105,9 @@ func TestDatasetInitCalibratesAtMostThreeRoundsBelowNinetyPercent(t *testing.T) 
 	}
 }
 
-func TestDatasetInitFailsWhenPhysicalLayoutValidationFails(t *testing.T) {
+func TestDatasetInitReportsPhysicalLayoutValidationFailure(t *testing.T) {
 	plan := physicalTestPlan()
+	var progress []string
 	exec := &physicalDatasetExecutor{
 		atomicDatasetExecutor: atomicDatasetExecutor{
 			recordingDatasetExecutor: recordingDatasetExecutor{
@@ -117,13 +118,18 @@ func TestDatasetInitFailsWhenPhysicalLayoutValidationFails(t *testing.T) {
 		sizes:       []DatasetSizeSample{{TotalBytes: 960_000, Source: "catalog"}},
 		layoutError: errors.New("fact_sales DN row imbalance exceeds 10%"),
 	}
-	err := NewDatasetManager(exec).Init(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "row imbalance") {
-		t.Fatalf("err=%v", err)
+	err := NewDatasetManager(exec, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	}).Init(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(progress, "\n"), "row_imbalance") {
+		t.Fatalf("progress=%v", progress)
 	}
 }
 
-func TestDatasetInitKeepsPhysicalSizingAndCapacitySafetyWhenValidationDisabled(t *testing.T) {
+func TestDatasetInitKeepsAdvisoryInspectionWhenLegacyValidationFlagDisabled(t *testing.T) {
 	plan := physicalTestPlan()
 	var progress []string
 	exec := &physicalDatasetExecutor{
@@ -151,7 +157,7 @@ func TestDatasetInitKeepsPhysicalSizingAndCapacitySafetyWhenValidationDisabled(t
 	); err != nil {
 		t.Fatal(err)
 	}
-	if exec.capacityChecks != 1 || exec.layoutCalls != 0 {
+	if exec.capacityChecks != 1 || exec.layoutCalls != 1 {
 		t.Fatalf(
 			"validation calls capacity=%d layout=%d",
 			exec.capacityChecks,
@@ -167,10 +173,14 @@ func TestDatasetInitKeepsPhysicalSizingAndCapacitySafetyWhenValidationDisabled(t
 	if !strings.Contains(strings.Join(progress, "\n"), "size_bytes=") {
 		t.Fatalf("physical progress=%v", progress)
 	}
+	if !strings.Contains(strings.Join(progress, "\n"), "physical_layout") {
+		t.Fatalf("advisory inspection progress=%v", progress)
+	}
 }
 
-func TestDatasetInitKeepsCapacityFailureMandatoryWhenValidationDisabled(t *testing.T) {
+func TestDatasetInitReportsCapacityFailureWhenValidationDisabled(t *testing.T) {
 	plan := physicalTestPlan()
+	var progress []string
 	exec := &physicalDatasetExecutor{
 		atomicDatasetExecutor: atomicDatasetExecutor{
 			recordingDatasetExecutor: recordingDatasetExecutor{
@@ -181,15 +191,20 @@ func TestDatasetInitKeepsCapacityFailureMandatoryWhenValidationDisabled(t *testi
 		sizes:         []DatasetSizeSample{{TotalBytes: 800_000, Source: "catalog"}},
 		capacityError: errors.New("capacity safety threshold reached"),
 	}
-	err := NewDatasetManagerWithValidation(exec, false).Init(
+	err := NewDatasetManagerWithValidation(exec, false, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	}).Init(
 		context.Background(),
 		plan,
 	)
-	if err == nil || !strings.Contains(err.Error(), "capacity safety threshold") {
-		t.Fatalf("err=%v", err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if exec.capacityChecks != 1 {
+	if exec.capacityChecks < 1 {
 		t.Fatalf("capacity checks=%d", exec.capacityChecks)
+	}
+	if !strings.Contains(strings.Join(progress, "\n"), "PRECHECK_WARN") {
+		t.Fatalf("progress=%v", progress)
 	}
 }
 
@@ -218,8 +233,9 @@ func TestDatasetInitSkipsOvershootModelRejectionWhenValidationDisabled(t *testin
 	}
 }
 
-func TestDatasetInitFailsLoudlyWhenCommittedBatchMeasuresAboveHardTarget(t *testing.T) {
+func TestDatasetInitReportsCommittedBatchAboveTarget(t *testing.T) {
 	plan := physicalTestPlan()
+	var progress []string
 	exec := &physicalDatasetExecutor{
 		atomicDatasetExecutor: atomicDatasetExecutor{
 			recordingDatasetExecutor: recordingDatasetExecutor{
@@ -232,20 +248,23 @@ func TestDatasetInitFailsLoudlyWhenCommittedBatchMeasuresAboveHardTarget(t *test
 			{TotalBytes: 1_050_000, Source: "catalog"},
 		},
 	}
-	err := NewDatasetManager(exec).Init(context.Background(), plan)
-	if err == nil ||
-		!strings.Contains(err.Error(), "measured dataset overshoot") ||
-		!strings.Contains(err.Error(), "1050000") ||
-		!strings.Contains(err.Error(), "1000000") {
-		t.Fatalf("err=%v", err)
+	err := NewDatasetManager(exec, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	}).Init(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if exec.layoutCalls != 0 {
-		t.Fatalf("oversized dataset was finalized")
+	joined := strings.Join(progress, "\n")
+	if !strings.Contains(joined, "measured_dataset_overshoot") ||
+		!strings.Contains(joined, "1050000") ||
+		!strings.Contains(joined, "1000000") {
+		t.Fatalf("progress=%v", progress)
 	}
 }
 
-func TestDatasetCalibrationFailsLoudlyWhenMeasuredAboveHardTarget(t *testing.T) {
+func TestDatasetCalibrationReportsMeasuredAboveTarget(t *testing.T) {
 	plan := physicalTestPlan()
+	var progress []string
 	exec := &physicalDatasetExecutor{
 		atomicDatasetExecutor: atomicDatasetExecutor{
 			recordingDatasetExecutor: recordingDatasetExecutor{
@@ -258,11 +277,16 @@ func TestDatasetCalibrationFailsLoudlyWhenMeasuredAboveHardTarget(t *testing.T) 
 			{TotalBytes: 1_100_000, Source: "catalog"},
 		},
 	}
-	err := NewDatasetManager(exec).Init(context.Background(), plan)
-	if err == nil ||
-		!strings.Contains(err.Error(), "calibration") ||
-		!strings.Contains(err.Error(), "measured dataset overshoot") {
-		t.Fatalf("err=%v", err)
+	err := NewDatasetManager(exec, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	}).Init(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(progress, "\n")
+	if !strings.Contains(joined, "calibration") ||
+		!strings.Contains(joined, "measured_dataset_overshoot") {
+		t.Fatalf("progress=%v", progress)
 	}
 }
 

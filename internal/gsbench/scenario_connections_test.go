@@ -123,3 +123,86 @@ func TestConnectionScenarioStopCleansResourcesAfterJoinTimeout(t *testing.T) {
 			scenario.transactions, scenario.connections)
 	}
 }
+
+func TestConnectionFrozenSampleNeverRequestsTopUp(t *testing.T) {
+	scenario := &ConnectionScenario{budget: ConnectionBudget{
+		UsableCapacity: 100,
+		DesiredTotal:   90,
+		WorkloadTarget: 10,
+	}}
+	if err := scenario.acceptRampSample(90, 10); err != nil {
+		t.Fatal(err)
+	}
+	if scenario.liveTagged != 10 {
+		t.Fatalf("live tagged=%d", scenario.liveTagged)
+	}
+	if err := scenario.acceptFrozenSample(75, 10); err != nil {
+		t.Fatalf("external connection loss changed frozen injection: %v", err)
+	}
+	if !scenario.targetReached {
+		t.Fatal("a later external loss erased successful target evidence")
+	}
+}
+
+func TestConnectionFrozenSampleFailsWhenInjectedSessionIsLost(t *testing.T) {
+	scenario := &ConnectionScenario{budget: ConnectionBudget{
+		UsableCapacity: 100,
+		WorkloadTarget: 10,
+	}}
+	if err := scenario.acceptFrozenSample(89, 9); err == nil {
+		t.Fatal("lost tagged session was accepted")
+	}
+}
+
+func TestConnectionRampSampleKeepsUnreachedTargetAdvisory(t *testing.T) {
+	scenario := &ConnectionScenario{budget: ConnectionBudget{
+		UsableCapacity: 100,
+		DesiredTotal:   90,
+		WorkloadTarget: 10,
+	}}
+	if err := scenario.acceptRampSample(89, 10); err != nil {
+		t.Fatalf("unreached target blocked ramp: %v", err)
+	}
+	if scenario.targetReached {
+		t.Fatal("unreached target was recorded as reached")
+	}
+}
+
+func TestConnectionPrepareKeepsCapacityProbeFailureAdvisory(t *testing.T) {
+	state := &resourceExecTestState{}
+	pool := sql.OpenDB(&resourceExecTestConnector{state: state})
+	t.Cleanup(func() { _ = pool.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var warnings []PrecheckWarning
+	scenario := NewConnectionScenario()
+	err := scenario.Prepare(ctx, &Runtime{
+		Config: BenchConfig{
+			Safety:      SafetyConfig{MaxConnections: 5},
+			PoolTargets: PoolTargetConfig{ConnectionPercent: 90},
+		},
+		Database: &Database{
+			pool: pool, ctx: ctx, cancel: cancel,
+			tagged: map[*TaggedConn]struct{}{},
+		},
+		ReportWarning: func(warning PrecheckWarning) {
+			warnings = append(warnings, warning)
+		},
+	})
+	if err != nil {
+		t.Fatalf("capacity probe blocked prepare: %v", err)
+	}
+	if scenario.budget.WorkloadTarget == 0 || len(warnings) == 0 ||
+		warnings[0].Check != "capacity_probe" {
+		t.Fatalf("budget=%+v warnings=%+v", scenario.budget, warnings)
+	}
+}
+
+func TestConnectionRampDeadlineRemainsFailureWithoutWrappingDeadline(
+	t *testing.T,
+) {
+	err := connectionTargetRampError(context.DeadlineExceeded, 7, 10)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline target error=%v", err)
+	}
+}

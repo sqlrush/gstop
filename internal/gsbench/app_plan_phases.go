@@ -18,7 +18,6 @@ type planActionBackend interface {
 	VerifyFault(context.Context, ScenarioCode) error
 	MarkFaultActive(context.Context, string) error
 	MarkFaultFailed(context.Context, string, error, bool) error
-	RestoreFault(context.Context, string) error
 }
 
 func executePlanFaultAction(
@@ -26,6 +25,7 @@ func executePlanFaultAction(
 	code ScenarioCode,
 	backend planActionBackend,
 	newID func() string,
+	reportWarning ...func(PrecheckWarning),
 ) (runID string, err error) {
 	if backend == nil || newID == nil {
 		return "", fmt.Errorf("plan fault backend and run ID generator are required")
@@ -60,28 +60,35 @@ func executePlanFaultAction(
 		return "", fmt.Errorf("record plan fault: %w", err)
 	}
 	if applyErr := backend.ApplyFault(ctx, runID, code); applyErr != nil {
-		return runID, rejectPlanFault(
+		return runID, recordPlanFaultFailure(
 			ctx,
 			backend,
 			runID,
+			code,
 			"apply plan fault",
 			applyErr,
 		)
 	}
 	if verifyErr := backend.VerifyFault(ctx, code); verifyErr != nil {
-		return runID, rejectPlanFault(
-			ctx,
-			backend,
-			runID,
-			"verify fault plan",
-			verifyErr,
-		)
+		warning := PrecheckWarning{
+			ScenarioCode: code,
+			Scenario:     DefaultScenarioCatalog().MustCode(code).Name,
+			Check:        "fault_effect",
+			Object:       "changed_plan",
+			Actual:       verifyErr.Error(),
+			Expected:     "expected_fault_plan_shape",
+			Impact:       "fault_is_retained_for_manual_recovery",
+		}
+		if len(reportWarning) != 0 && reportWarning[0] != nil {
+			reportWarning[0](warning)
+		}
 	}
 	if err := backend.MarkFaultActive(ctx, runID); err != nil {
-		return runID, rejectPlanFault(
+		return runID, recordPlanFaultFailure(
 			ctx,
 			backend,
 			runID,
+			code,
 			"mark plan fault active",
 			err,
 		)
@@ -89,62 +96,34 @@ func executePlanFaultAction(
 	return runID, nil
 }
 
-func rejectPlanFault(
+func recordPlanFaultFailure(
 	ctx context.Context,
 	backend planActionBackend,
 	runID string,
+	code ScenarioCode,
 	operation string,
 	faultErr error,
 ) error {
-	restoreErr := backend.RestoreFault(ctx, runID)
-	restored := restoreErr == nil
+	finalizeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		30*time.Second,
+	)
+	defer cancel()
 	markErr := backend.MarkFaultFailed(
-		ctx,
+		finalizeCtx,
 		runID,
 		faultErr,
-		restored,
+		false,
 	)
-	if restoreErr != nil {
-		restoreErr = fmt.Errorf(
-			"automatically restore rejected plan fault: %w",
-			restoreErr,
-		)
-	}
 	return errors.Join(
-		fmt.Errorf("%s: %w", operation, faultErr),
-		restoreErr,
+		fmt.Errorf(
+			"%s: %w; recovery remains pending, inspect with gsbench run %03d recover",
+			operation,
+			faultErr,
+			code,
+		),
 		markErr,
 	)
-}
-
-func executePlanRecoverAction(
-	ctx context.Context,
-	code ScenarioCode,
-	backend planActionBackend,
-) (runID string, restored bool, err error) {
-	if backend == nil {
-		return "", false, fmt.Errorf("plan recover backend is required")
-	}
-	release, err := backend.Lock(ctx)
-	if err != nil {
-		return "", false, err
-	}
-	if release == nil {
-		return "", false, fmt.Errorf("plan recover control lock release is unavailable")
-	}
-	defer func() { err = errors.Join(err, release()) }()
-
-	fault, err := backend.ResolveFault(ctx, code)
-	if errors.Is(err, errPlanFaultNotFound) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("resolve plan fault: %w", err)
-	}
-	if err := backend.RestoreFault(ctx, fault.RunID); err != nil {
-		return fault.RunID, false, fmt.Errorf("restore plan fault: %w", err)
-	}
-	return fault.RunID, true, nil
 }
 
 type databasePlanActionBackend struct {
@@ -396,32 +375,6 @@ func (b *databasePlanActionBackend) MarkFaultFailed(
 	return b.control.MarkFaultFailed(ctx, runID, faultErr, restored)
 }
 
-func (b *databasePlanActionBackend) RestoreFault(
-	ctx context.Context,
-	runID string,
-) error {
-	backend := newDatabaseRestoreBackend(
-		b.db,
-		b.cfg,
-		b.log,
-		DefaultFaultProviderRegistry(),
-	)
-	// The caller already holds the plan mutation lock. Reacquiring it inside
-	// restore would self-deadlock; the remaining restore locks stay enabled.
-	backend.requirePlanLock = false
-	backend.executor.database = dbActionExecutor{
-		db: planMaintenanceActionDatabase{db: b.db},
-	}
-	summary := NewRestoreCoordinatorWithValidation(
-		backend,
-		b.cfg.Run.ValidationEnabled,
-	).Restore(ctx, RestoreRequest{RunID: runID})
-	if summary.Failed {
-		return summary.Err
-	}
-	return nil
-}
-
 func planScenarioDefinitionForCode(
 	schema string,
 	code ScenarioCode,
@@ -463,8 +416,18 @@ func commandPlanRunAction(
 		return 1
 	}
 	if err := validatePlanCapability(definition.Name, caps); err != nil {
-		log.Error("plan scenario capability: %v", err)
-		return 1
+		log.Warn("%s", (PrecheckWarning{
+			ScenarioCode: definition.Code,
+			Scenario:     definition.Name,
+			Check:        "capability",
+			Object:       "plan_scenario",
+			Actual:       err.Error(),
+			Expected:     "catalog_capability_available",
+			Impact:       "plan_action_will_attempt_execution",
+		}).LogLine())
+	}
+	if options.PlanAction == PlanRunRecover {
+		return commandRecoveryPlan(ctx, db, cfg, log, "", &code)
 	}
 	backend, err := newDatabasePlanActionBackend(db, cfg, log)
 	if err != nil {
@@ -491,24 +454,15 @@ func commandPlanRunAction(
 			code,
 			backend,
 			newRunID,
+			func(warning PrecheckWarning) {
+				log.Warn("%s", warning.LogLine())
+			},
 		)
 		if err != nil {
 			log.Error("plan fault scenario=%03d run_id=%s: %v", code, faultRunID, err)
 			return 1
 		}
 		log.Info("plan fault SUCCESS scenario=%03d fault_run_id=%s", code, faultRunID)
-		return 0
-	case PlanRunRecover:
-		faultRunID, restored, err := executePlanRecoverAction(ctx, code, backend)
-		if err != nil {
-			log.Error("plan recover scenario=%03d run_id=%s: %v", code, faultRunID, err)
-			return 1
-		}
-		if !restored {
-			log.Info("plan recover ALREADY_RECOVERED scenario=%03d", code)
-			return 0
-		}
-		log.Info("plan recover SUCCESS scenario=%03d fault_run_id=%s", code, faultRunID)
 		return 0
 	default:
 		log.Error("unknown plan action %q", options.PlanAction)
@@ -530,18 +484,6 @@ func runPlanInit(
 ) int {
 	if workers <= 0 {
 		log.Error("plan init workers must be positive")
-		return 1
-	}
-	if maximum := cfg.Safety.MaxWorkers; maximum > 0 && workers > maximum {
-		log.Error("plan init workers=%d exceed safety.max_workers=%d", workers, maximum)
-		return 1
-	}
-	if maximum := cfg.Safety.MaxConnections; maximum > 0 && workers > maximum {
-		log.Error(
-			"plan init workers=%d exceed safety.max_connections=%d",
-			workers,
-			maximum,
-		)
 		return 1
 	}
 	if cfg.Run.Duration <= 0 {
@@ -571,21 +513,20 @@ func runPlanInit(
 			return 1
 		}
 		if alive {
-			log.Error(
+			log.Warn(
 				"plan workload %s scenario=%03d is already running",
 				active.RunID,
 				active.Code,
 			)
-			return 1
-		}
-		if err := backend.control.FinishWorkload(
-			ctx,
-			active.RunID,
-			OutcomeUnverified,
-			"stale workload process ended",
-		); err != nil {
-			log.Error("finalize stale plan workload: %v", err)
-			return 1
+		} else {
+			log.Warn(
+				"stale plan workload %s scenario=%03d action=report_only",
+				active.RunID,
+				active.Code,
+			)
+			if markErr := backend.control.MarkWorkloadsStale(ctx); markErr != nil {
+				log.Warn("mark stale plan workloads report-only: %v", markErr)
+			}
 		}
 	} else if !errors.Is(activeErr, errPlanWorkloadNotFound) {
 		log.Error("resolve active plan workload: %v", activeErr)
@@ -593,17 +534,15 @@ func runPlanInit(
 	}
 	for candidate := ScenarioCode(601); candidate <= 606; candidate++ {
 		if fault, faultErr := backend.ResolveFault(ctx, candidate); faultErr == nil {
-			log.Error(
-				"plan fault %s scenario=%03d requires recovery first: "+
+			log.Warn(
+				"plan fault %s scenario=%03d remains active; review recovery SQL: "+
 					"gsbench run %03d recover",
 				fault.RunID,
 				fault.Code,
 				fault.Code,
 			)
-			return 1
 		} else if !errors.Is(faultErr, errPlanFaultNotFound) {
-			log.Error("resolve active plan fault: %v", faultErr)
-			return 1
+			log.Warn("inspect active plan fault scenario=%03d: %v", candidate, faultErr)
 		}
 	}
 	prepareCtx, cancelPrepare := planMaintenanceContext(ctx, cfg)
@@ -612,24 +551,25 @@ func runPlanInit(
 		db,
 		cfg,
 		log,
-		RepairPlanBaseline,
+		nil,
 		VerifyPlanBaseline,
 	)
-	if prepareErr == nil && strictPlanInitVerificationRequired(
-		cfg.Run.ValidationEnabled,
-		definition.Code,
-	) {
+	if definition.Code == 602 {
 		if err := VerifyPlanBaselineScenarios(
 			prepareCtx,
 			db,
 			cfg.Data.Schema,
 			[]ScenarioCode{definition.Code},
 		); err != nil {
-			prepareErr = fmt.Errorf(
-				"verify strict scenario %03d baseline: %w",
-				definition.Code,
-				err,
-			)
+			log.Warn("%s", (PrecheckWarning{
+				ScenarioCode: definition.Code,
+				Scenario:     definition.Name,
+				Check:        "plan_baseline",
+				Object:       "scenario_baseline",
+				Actual:       err.Error(),
+				Expected:     "expected_baseline_plan",
+				Impact:       "plan_workload_will_still_start",
+			}).LogLine())
 		}
 	}
 	cancelPrepare()

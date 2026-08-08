@@ -18,23 +18,25 @@ const (
 type Outcome string
 
 const (
-	OutcomeSuccess        Outcome = "SUCCESS"
-	OutcomeUnverified     Outcome = "UNVERIFIED"
-	OutcomeNotApplicable  Outcome = "NOT_APPLICABLE"
-	OutcomeDegraded       Outcome = "DEGRADED"
-	OutcomeNotImplemented Outcome = "NOT_IMPLEMENTED"
-	OutcomeFailed         Outcome = "FAILED"
-	OutcomeRestoreFailed  Outcome = "RESTORE_FAILED"
+	OutcomeSuccess               Outcome = "SUCCESS"
+	OutcomeCompletedWithWarnings Outcome = "COMPLETED_WITH_WARNINGS"
+	OutcomeUnverified            Outcome = "UNVERIFIED"
+	OutcomeNotApplicable         Outcome = "NOT_APPLICABLE"
+	OutcomeDegraded              Outcome = "DEGRADED"
+	OutcomeNotImplemented        Outcome = "NOT_IMPLEMENTED"
+	OutcomeFailed                Outcome = "FAILED"
+	OutcomeRestoreFailed         Outcome = "RESTORE_FAILED"
 )
 
 var outcomeRank = map[Outcome]int{
-	OutcomeSuccess:        0,
-	OutcomeNotApplicable:  0,
-	OutcomeUnverified:     1,
-	OutcomeDegraded:       2,
-	OutcomeNotImplemented: 3,
-	OutcomeFailed:         4,
-	OutcomeRestoreFailed:  5,
+	OutcomeSuccess:               0,
+	OutcomeCompletedWithWarnings: 1,
+	OutcomeNotApplicable:         0,
+	OutcomeUnverified:            1,
+	OutcomeDegraded:              2,
+	OutcomeNotImplemented:        3,
+	OutcomeFailed:                4,
+	OutcomeRestoreFailed:         5,
 }
 
 type Evidence struct {

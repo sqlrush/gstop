@@ -42,6 +42,70 @@ func TestControllerRampsGraduallyAndHoldsTarget(t *testing.T) {
 	}
 }
 
+func TestControllerRunToMinimumStopsAddingAtTarget(t *testing.T) {
+	actuator := &fakeActuator{}
+	values := []float64{80, 86, 90, 91, 90}
+	index := 0
+	result := (Controller{
+		Config: ControllerConfig{
+			Target: 90, MinWorkers: 1, MaxWorkers: 20,
+			Step: 2, RequiredSamples: 3, Interval: time.Millisecond,
+		},
+		Actuator: actuator,
+		Sample: func(context.Context) Sample {
+			valueIndex := min(index, len(values)-1)
+			index++
+			return Sample{Available: true, Value: values[valueIndex]}
+		},
+	}).RunToMinimum(context.Background())
+	if !result.Reached || result.Actual < 90 {
+		t.Fatalf("result=%+v", result)
+	}
+	if actuator.Target() != result.Workers {
+		t.Fatalf(
+			"actuator target=%d result workers=%d",
+			actuator.Target(),
+			result.Workers,
+		)
+	}
+	if index != 5 {
+		t.Fatalf("samples=%d want=5", index)
+	}
+}
+
+func TestControllerRunToMinimumFailsAtCeiling(t *testing.T) {
+	actuator := &fakeActuator{}
+	result := (Controller{
+		Config: ControllerConfig{
+			Target: 90, MinWorkers: 1, MaxWorkers: 2,
+			Step: 1, RequiredSamples: 2, Interval: time.Millisecond,
+		},
+		Actuator: actuator,
+		Sample: func(context.Context) Sample {
+			return Sample{Available: true, Value: 50}
+		},
+	}).RunToMinimum(context.Background())
+	if !result.Ceiling || result.Reached {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestControllerRunToMinimumRequiresAvailableMetric(t *testing.T) {
+	result := (Controller{
+		Config: ControllerConfig{
+			Target: 90, MinWorkers: 1, MaxWorkers: 2,
+			Interval: time.Millisecond,
+		},
+		Actuator: &fakeActuator{},
+		Sample: func(context.Context) Sample {
+			return Sample{Available: false}
+		},
+	}).RunToMinimum(context.Background())
+	if result.Err == nil || result.Samples != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestControllerDoesNotReplaceLastSampleOnTimeout(t *testing.T) {
 	a := &fakeActuator{}
 	calls := 0

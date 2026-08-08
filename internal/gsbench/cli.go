@@ -15,17 +15,14 @@ import (
 	"time"
 )
 
-const Version = "v1.1.7"
+const Version = "v1.1.8"
 
 const ConfigEnv = "GSBENCH_CONFIG"
-
-const maxDatasetBytes int64 = 2 << 40
 
 var datasetSizeRE = regexp.MustCompile(`(?i)^([0-9]+(?:\.[0-9]{1,2})?)(GB|TB)$`)
 
 var workMemSizeRE = regexp.MustCompile(`(?i)^([1-9][0-9]*)(kB|MB|GB)$`)
 
-const minWorkMemKB int64 = 64
 const defaultWorkMemKB int64 = 256 * 1024
 
 var lifecycleCommands = map[string]struct{}{
@@ -52,6 +49,7 @@ type CLIOptions struct {
 	TPWorkers     int
 	APWorkers     int
 	WorkMemKB     int64
+	PoolPercent   int
 	Sessions      int
 	ChainDepth    int
 	Profile       string
@@ -75,9 +73,13 @@ func ParseDatasetSize(value string) (int64, error) {
 	if strings.EqualFold(match[2], "TB") {
 		unit = float64(int64(1 << 40))
 	}
-	bytes := int64(math.Round(number * unit))
-	if bytes < 1<<30 || bytes > maxDatasetBytes {
-		return 0, fmt.Errorf("size must be between 1GB and 2TB")
+	requested := number * unit
+	if requested > float64(math.MaxInt64) {
+		return 0, fmt.Errorf("size is out of range")
+	}
+	bytes := int64(math.Round(requested))
+	if bytes <= 0 {
+		return 0, fmt.Errorf("size must be positive")
 	}
 	return bytes, nil
 }
@@ -102,8 +104,8 @@ func ParseWorkMemKB(value string) (int64, error) {
 		return 0, fmt.Errorf("work_mem value is out of range")
 	}
 	workMemKB := int64(quantity * multiplier)
-	if workMemKB < minWorkMemKB {
-		return 0, fmt.Errorf("work_mem must be at least %dkB", minWorkMemKB)
+	if workMemKB <= 0 {
+		return 0, fmt.Errorf("work_mem must be positive")
 	}
 	if workMemKB > math.MaxInt64/1024 {
 		return 0, fmt.Errorf("work_mem value is out of range")
@@ -138,13 +140,14 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	flags.IntVar(&options.TPWorkers, "tp-workers", 0, "fixed TP workers for scenario 103")
 	flags.IntVar(&options.APWorkers, "ap-workers", 0, "fixed AP workers for scenario 103")
 	flags.StringVar(&workMemText, "work-mem", "", "work_mem for scenarios 201/202 (kB, MB, or GB)")
+	flags.IntVar(&options.PoolPercent, "percent", 0, "positive target percent for scenarios 401/402")
 	flags.IntVar(&options.Sessions, "sessions", 0, "total holder plus waiter sessions for scenarios 501-503")
-	flags.IntVar(&options.ChainDepth, "chain-depth", 0, "row wait chain depth for scenario 501 (1-5)")
+	flags.IntVar(&options.ChainDepth, "chain-depth", 0, "positive row wait chain depth for scenario 501")
 	flags.StringVar(&options.Profile, "profile", "", "data profile")
 	flags.BoolVar(&options.DryRun, "dry-run", false, "show actions without mutation")
 	flags.BoolVar(&options.WithData, "data", false, "include benchmark data")
 	flags.StringVar(&options.RunID, "run-id", "", "specific run id")
-	flags.StringVar(&sizeText, "size", "", "target init data size (1GB-2TB)")
+	flags.StringVar(&sizeText, "size", "", "positive init data size with unit")
 	flags.StringVar(&allowRiskText, "allow-risk", "", "explicit maximum risk authorization (A, B, or C)")
 	parseArgs := append([]string(nil), args[1:]...)
 	if command == "run" && len(parseArgs) > 0 &&
@@ -168,6 +171,7 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	tpWorkersSet := false
 	apWorkersSet := false
 	workMemSet := false
+	percentSet := false
 	sessionsSet := false
 	chainDepthSet := false
 	flags.Visit(func(value *flag.Flag) {
@@ -188,6 +192,8 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 			apWorkersSet = true
 		case "work-mem":
 			workMemSet = true
+		case "percent":
+			percentSet = true
 		case "sessions":
 			sessionsSet = true
 		case "chain-depth":
@@ -196,6 +202,12 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	})
 	workerOverrideSet := workersSet || tpWorkersSet || apWorkersSet
 	lockOverrideSet := sessionsSet || chainDepthSet
+	if percentSet && command != "run" {
+		return CLIOptions{}, fmt.Errorf("--percent is only valid with run")
+	}
+	if percentSet && options.PoolPercent < 1 {
+		return CLIOptions{}, fmt.Errorf("--percent must be positive")
+	}
 	if (workerOverrideSet || planWorkersSet || workMemSet || lockOverrideSet) && command != "run" {
 		return CLIOptions{}, fmt.Errorf("workload overrides are only valid with run")
 	}
@@ -214,8 +226,8 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	if sessionsSet && options.Sessions < 2 {
 		return CLIOptions{}, fmt.Errorf("--sessions must be at least 2")
 	}
-	if chainDepthSet && (options.ChainDepth < 1 || options.ChainDepth > 5) {
-		return CLIOptions{}, fmt.Errorf("--chain-depth must be between 1 and 5")
+	if chainDepthSet && options.ChainDepth < 1 {
+		return CLIOptions{}, fmt.Errorf("--chain-depth must be positive")
 	}
 	if workMemSet {
 		workMemKB, err := ParseWorkMemKB(workMemText)
@@ -305,6 +317,14 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 	for i, definition := range definitions {
 		options.ScenarioCodes[i] = definition.Code
 	}
+	if percentSet && len(options.ScenarioCodes) > 0 {
+		if err := validatePoolPercentOverride(
+			options.ScenarioCodes,
+			options.PoolPercent,
+		); err != nil {
+			return CLIOptions{}, err
+		}
+	}
 	if err := applyPlanRunCLI(
 		&options,
 		planWorkers,
@@ -339,6 +359,21 @@ func ParseCLIArgs(args []string) (CLIOptions, error) {
 		}
 	}
 	return options, nil
+}
+
+func validatePoolPercentOverride(
+	codes []ScenarioCode,
+	percent int,
+) error {
+	if percent < 1 {
+		return fmt.Errorf("pool target percent must be positive")
+	}
+	for _, code := range codes {
+		if code == 401 || code == 402 {
+			return nil
+		}
+	}
+	return fmt.Errorf("--percent requires scenario 401 or 402")
 }
 
 func isPlanChangeCode(code ScenarioCode) bool {
@@ -563,14 +598,16 @@ func printUsage(w io.Writer) {
   gsbench run 103 --tp-workers N --ap-workers N --duration DURATION
   gsbench run 201 --workers N --work-mem VALUE --duration DURATION
   gsbench run 202 --workers N --work-mem VALUE --duration DURATION
+  gsbench run 401 --percent N --duration DURATION
+  gsbench run 402 --percent N --duration DURATION
   gsbench run 501 --sessions N --chain-depth N --duration DURATION
   gsbench run 502 --sessions N --duration DURATION
   gsbench run 503 --sessions N --duration DURATION
   gsbench run 601 init --worker N --duration DURATION
   gsbench run 601 fault
-  gsbench run 601 recover
-  gsbench restore [--run-id RUN_ID]
-	gsbench cleanup [--data]
+  gsbench run 601 recover              display-only recovery DDL/DML for scenario 601
+  gsbench restore [--run-id RUN_ID]    display all recovery DDL/DML; does not execute recovery SQL
+  gsbench cleanup [--data]
   gsbench init --size 100GB
 
 Options:
@@ -581,14 +618,15 @@ Options:
       --workers N        fixed workers for scenarios 101/102 or 201/202
       --tp-workers N     fixed TP workers for scenario 103 (use with --ap-workers)
       --ap-workers N     fixed AP workers for scenario 103 (use with --tp-workers)
-      --work-mem VALUE   work_mem for scenarios 201/202: integer kB, MB, or GB (minimum 64kB)
+      --work-mem VALUE   work_mem for scenarios 201/202: positive integer kB, MB, or GB
+      --percent N        positive target percentage for selected scenarios 401/402
       --sessions N       total holder plus waiter sessions for scenarios 501-503
-      --chain-depth N    row wait chain depth for scenario 501 (1-5, default 1)
+      --chain-depth N    positive row wait chain depth for scenario 501 (default 1)
       --profile VALUE    data profile: quick or stress
       --dry-run          validate and show actions without workload mutation
-      --run-id ID        select one run for status, stop, or restore; cannot combine with cleanup --data
+      --run-id ID        select one run for status, stop, or restore display; cannot combine with cleanup --data
       --data             also remove benchmark data during cleanup
-      --size VALUE       init target data size, for example 100GB or 1.5TB (maximum 2TB)
+      --size VALUE       positive size with unit, for example 100GB or 4TB
       --allow-risk A|B|C explicitly authorize the maximum permitted scenario risk
 
 Configuration:

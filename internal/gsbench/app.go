@@ -3,7 +3,6 @@ package gsbench
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -53,7 +52,8 @@ func configOverridesFromCLI(options CLIOptions) Overrides {
 		ScenarioCodes: options.ScenarioCodes, Duration: options.Duration,
 		Workers: options.Workers, TPWorkers: options.TPWorkers,
 		APWorkers: options.APWorkers, WorkMemKB: options.WorkMemKB,
-		Sessions: options.Sessions, ChainDepth: options.ChainDepth,
+		PoolPercent: options.PoolPercent,
+		Sessions:    options.Sessions, ChainDepth: options.ChainDepth,
 		Profile: options.Profile, DatasetBytes: options.DatasetBytes,
 		DatasetSize: options.DatasetSize,
 	}
@@ -125,7 +125,7 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 		logger.Info("command=%s run_id=%s config=%s", options.Command, runID, cfg.Path)
 	}
 	logger.Info("database=%s", cfg.Redacted())
-	logger.Info("runtime_validation_enabled=%v", cfg.Run.ValidationEnabled)
+	logDeprecatedConfigWarnings(cfg, logger)
 	openDatabase := OpenDatabase
 	if options.Command == "restore" || options.Command == "stop" {
 		openDatabase = OpenRestoreDatabase
@@ -152,53 +152,81 @@ func executeCommand(ctx context.Context, options CLIOptions, stdout, stderr io.W
 			return 1
 		}
 	}
-	switch options.Command {
-	case "doctor":
-		return commandDoctor(ctx, db, cfg, environment, logger)
-	case "init":
-		return commandInit(ctx, db, cfg, environment, caps, logger)
-	case "run":
-		if options.PlanAction != "" {
-			return commandPlanRunAction(
+	executeCommand := func() int {
+		switch options.Command {
+		case "doctor":
+			return commandDoctor(ctx, db, cfg, environment, logger)
+		case "init":
+			return commandInit(ctx, db, cfg, environment, caps, logger)
+		case "run":
+			if options.PlanAction != "" {
+				return commandPlanRunAction(
+					ctx,
+					db,
+					cfg,
+					environment,
+					caps,
+					logger,
+					options,
+					runID,
+				)
+			}
+			return commandRun(
 				ctx,
 				db,
 				cfg,
 				environment,
 				caps,
+				options.AllowRisk,
 				logger,
-				options,
 				runID,
 			)
+		case "status":
+			return commandStatus(ctx, db, cfg, logger, runID)
+		case "stop":
+			return commandStop(ctx, db, cfg, logger, runID)
+		case "restore":
+			return commandRestore(ctx, db, cfg, logger, runID)
+		case "cleanup":
+			return commandCleanup(ctx, db, cfg, logger, runID, options.WithData)
+		default:
+			logger.Error("unknown command %s", options.Command)
+			return 2
 		}
-		return commandRun(
+	}
+	if commandNeedsDatasetExecutionLease(options) && !cfg.Run.DryRun {
+		exitCode, leaseErr := withDatasetExecutionDatabaseLease(
 			ctx,
 			db,
 			cfg,
-			environment,
-			caps,
-			options.AllowRisk,
-			logger,
-			runID,
+			AcquireDatabaseSharedRunLock,
+			executeCommand,
 		)
-	case "status":
-		return commandStatus(ctx, db, cfg, logger, runID)
-	case "stop":
-		return commandStop(ctx, db, cfg, logger, runID)
-	case "restore":
-		return commandRestore(ctx, db, cfg, logger, runID)
-	case "cleanup":
-		return commandCleanup(ctx, db, cfg, logger, runID, options.WithData)
+		if leaseErr != nil {
+			logger.Error("dataset execution lease: %v", leaseErr)
+			return 1
+		}
+		return exitCode
+	}
+	return executeCommand()
+}
+
+func commandNeedsDatasetExecutionLease(options CLIOptions) bool {
+	switch options.Command {
+	case "init":
+		return true
+	case "run":
+		return options.PlanAction != PlanRunRecover
 	default:
-		logger.Error("unknown command %s", options.Command)
-		return 2
+		return false
 	}
 }
 
 func commandIsReadOnly(command string, dryRun bool) bool {
 	return command == "doctor" ||
 		command == "status" ||
-		(dryRun && (command == "restore" ||
-			command == "stop" ||
+		command == "restore" ||
+		(dryRun && (command == "stop" ||
 			command == "cleanup"))
 }
 
@@ -217,23 +245,19 @@ func commandDoctor(ctx context.Context, db *Database, cfg BenchConfig, env Envir
 			log,
 			DefaultFaultProviderRegistry(),
 		)
-		summary := NewRestoreCoordinatorWithValidation(
-			backend,
-			cfg.Run.ValidationEnabled,
-		).Restore(
-			ctx,
-			RestoreRequest{DryRun: true},
-		)
+		discovery, discoverErr := backend.DiscoverRestore(ctx, "", true)
+		runs, actions, planErr := prepareRestorePlan(discovery, "")
+		readErr := errors.Join(discoverErr, planErr)
 		log.Info(
 			"stale recovery runs=%d pending_actions=%d action=report_only",
-			len(summary.RunIDs),
-			len(summary.PlannedActions),
+			len(runs),
+			len(actions),
 		)
-		for _, runID := range summary.RunIDs {
+		for _, runID := range restoreRunIDs(runs) {
 			log.Info("stale run_id=%s action=report_only", runID)
 		}
-		if summary.Failed {
-			log.Error("read stale recovery state: %v", summary.Err)
+		if readErr != nil {
+			log.Error("read stale recovery state: %v", readErr)
 			return 1
 		}
 	}
@@ -640,10 +664,7 @@ func commandRun(
 	if cfg.Run.DryRun {
 		for _, code := range cfg.Run.ScenarioCodes {
 			definition := DefaultScenarioCatalog().MustCode(code)
-			lifecycle := "preflight,prepare,ramp,hold,stop,restore"
-			if cfg.Run.ValidationEnabled {
-				lifecycle = "preflight,prepare,ramp,hold,verify,stop,restore,verify_restore"
-			}
+			lifecycle := "preflight,prepare,ramp,hold,verify,stop"
 			log.Info(
 				"DRY-RUN scenario=%03d name=%s lifecycle=%s",
 				code,
@@ -654,27 +675,43 @@ func commandRun(
 		log.Info("run SUCCESS (dry run, no database mutations)")
 		return 0
 	}
-	exitCode, lockErr := withPlanScenarioDatabaseLock(
+	var planLockErr error
+	exitCode, runLockErr := withRunExecutionDatabaseLock(
 		parent,
 		db,
 		cfg,
+		runID,
 		AcquireDatabaseRunLock,
 		func() int {
-			return commandRunCore(
+			var code int
+			code, planLockErr = withPlanScenarioDatabaseLock(
 				parent,
 				db,
 				cfg,
-				environment,
-				caps,
-				allowRisk,
-				log,
-				runID,
-				quotedSchema,
+				AcquireDatabaseRunLock,
+				func() int {
+					return commandRunCore(
+						parent,
+						db,
+						cfg,
+						environment,
+						caps,
+						allowRisk,
+						log,
+						runID,
+						quotedSchema,
+					)
+				},
 			)
+			return code
 		},
 	)
-	if lockErr != nil {
-		log.Error("plan-change session lock: %v", lockErr)
+	if runLockErr != nil {
+		log.Error("run execution session lock: %v", runLockErr)
+		return 1
+	}
+	if planLockErr != nil {
+		log.Error("plan-change session lock: %v", planLockErr)
 		return 1
 	}
 	return exitCode
@@ -779,114 +816,93 @@ func commandRunCore(
 		log,
 		DefaultFaultProviderRegistry(),
 	)
-	// Run preparation always executes under the outer plan/schema lock.
-	// The restore backend must not try to reacquire that session lock.
-	backend.requirePlanLock = false
-	var staleSummary RestoreSummary
-	prepareRun := func() int {
-		staleSummary = NewRestoreCoordinatorWithValidation(
-			backend,
-			cfg.Run.ValidationEnabled,
-		).Restore(
-			parent,
-			RestoreRequest{afterSuccess: func(
-				ctx context.Context,
-				_ RestoreLock,
-			) error {
-				if scenarioCodesContainPlanChange(
-					cfg.Run.ScenarioCodes,
-				) {
-					activeRunID, err := findActivePlanRun(
-						ctx,
-						db,
-						cfg.Data.Schema,
-					)
-					if err != nil {
-						return fmt.Errorf(
-							"check active plan-change run: %w",
-							err,
-						)
-					}
-					if activeRunID != "" {
-						return fmt.Errorf(
-							"plan-change run %s is already active; "+
-								"stop or restore it first",
-							activeRunID,
-						)
-					}
-					if err := preparePlanRunBaseline(
-						ctx,
-						db,
-						cfg,
-						log,
-						RepairPlanBaseline,
-						VerifyPlanBaseline,
-					); err != nil {
-						return err
-					}
-				}
-				return startRun(ctx, db, cfg, runID)
-			}},
-		)
-		if staleSummary.Failed {
-			log.Error("recover stale state and record run: %v", staleSummary.Err)
-			return 1
+	stale, staleErr := ReadStaleRecoveryStatus(
+		parent,
+		journal,
+		backend.ledger,
+	)
+	if len(stale.RunIDs) != 0 || staleErr != nil {
+		warning := PrecheckWarning{
+			Check:  "stale_recovery",
+			Object: "journal_and_ledger",
+			Actual: fmt.Sprintf(
+				"runs=%d database_runs=%d local_actions=%d error=%v",
+				len(stale.RunIDs),
+				stale.DatabaseRunCount,
+				stale.LocalActionCount,
+				staleErr,
+			),
+			Expected: "no_pending_recovery",
+			Impact:   "run_continues; review gsbench restore",
 		}
-		if len(staleSummary.RunIDs) != 0 {
-			log.Info(
-				"stale recovery SUCCESS runs=%d actions=%d",
-				len(staleSummary.RunIDs),
-				len(staleSummary.PlannedActions),
+		log.Warn("%s", warning.LogLine())
+		for _, staleRunID := range stale.RunIDs {
+			log.Warn(
+				"stale run_id=%s action=report_only hint=gsbench_restore",
+				staleRunID,
 			)
 		}
-		return 0
 	}
-	prepareCode, prepareLockErr := withPlanRunPreparationDatabaseLock(
-		parent,
-		db,
-		cfg,
-		scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes),
-		AcquireDatabaseRunLock,
-		prepareRun,
-	)
-	if prepareLockErr != nil {
-		log.Error("plan baseline lock for stale recovery: %v", prepareLockErr)
+	planChangeRun := scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes)
+	startPreparedRun := func(ctx context.Context) error {
+		if planChangeRun {
+			activeRunID, err := findActivePlanRun(
+				ctx,
+				db,
+				cfg.Data.Schema,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"check active plan-change run: %w",
+					err,
+				)
+			}
+			if activeRunID != "" {
+				warning := PrecheckWarning{
+					Check:    "active_plan_run",
+					Object:   activeRunID,
+					Actual:   "recorded_active",
+					Expected: "no_active_plan_run",
+					Impact:   "run_continues_under_current_plan_lock",
+				}
+				log.Warn("%s", warning.LogLine())
+			}
+			if err := preparePlanRunBaseline(
+				ctx,
+				db,
+				cfg,
+				log,
+				nil,
+				VerifyPlanBaseline,
+			); err != nil {
+				return err
+			}
+		}
+		return startRunWithMetadataPolicy(
+			planChangeRun,
+			log,
+			func() error { return startRun(ctx, db, cfg, runID) },
+		)
+	}
+	if err := startPreparedRun(parent); err != nil {
+		log.Error("prepare and record run: %v", err)
 		return 1
-	}
-	if prepareCode != 0 {
-		return prepareCode
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	go watchStop(ctx, db, cfg.Data.Schema, runID, cancel)
-	restoreBackend := newDatabaseRestoreBackend(
-		db,
-		cfg,
-		log,
-		DefaultFaultProviderRegistry(),
-	)
-	// Plan scenarios keep the outer plan/schema lock through Runner restore.
-	// A non-plan run cannot journal plan baseline actions, so requiring the
-	// plan lock here would only make unrelated cleanup conflict with a plan run.
-	restoreBackend.requirePlanLock = false
 	runtime := &Runtime{
 		Config: cfg, Database: db, Capabilities: caps, Journal: journal,
 		Environment: environment, Catalog: DefaultScenarioCatalog(),
-		Provider: restoreBackend.provider, Ledger: restoreBackend.ledger,
+		Provider: backend.provider, Ledger: backend.ledger,
 		Log: log, RunID: runID, AllowRisk: allowRisk,
 	}
-	runtime.RestoreService = NewRestoreCoordinatorWithValidation(
-		restoreBackend,
-		cfg.Run.ValidationEnabled,
-	)
-	if cfg.Run.ValidationEnabled {
-		runtime.PlanPreflight = func(
-			preflightCtx context.Context,
-			scenario string,
-			statements []string,
-		) error {
-			return EnsureWorkloadPlans(preflightCtx, runtime, scenario, statements)
-		}
+	runtime.PlanPreflight = func(
+		preflightCtx context.Context,
+		scenario string,
+		statements []string,
+	) error {
+		return InspectWorkloadPlans(preflightCtx, runtime, scenario, statements)
 	}
 	runtime.ReportPhase = func(phaseCtx context.Context, scenario string, phase Phase) {
 		_, _ = db.Exec(phaseCtx, "UPDATE "+quotedSchema+".meta_runs SET phase=$1,detail=$2,updated_at=current_timestamp WHERE run_id=$3", string(phase), scenario+":"+string(phase), runID)
@@ -896,6 +912,22 @@ func commandRunCore(
 		runtime.Catalog,
 		DefaultScenarioFactories(),
 	).Run(ctx, cfg.Run.ScenarioCodes)
+	if err := recordRunOutcome(
+		context.WithoutCancel(parent),
+		db,
+		cfg.Data.Schema,
+		runID,
+		summary.Outcome,
+		"run completed; recovery is manual",
+	); err != nil {
+		log.Warn("%s", (PrecheckWarning{
+			Check:    "run_metadata",
+			Object:   runID,
+			Actual:   err.Error(),
+			Expected: "final_status_recorded",
+			Impact:   "run_result_is_unchanged; status_may_show_stale",
+		}).LogLine())
+	}
 	for _, result := range summary.Results {
 		if err := log.Evidence(
 			NewEvidenceEnvelope(summary.RunID, result),
@@ -911,6 +943,76 @@ func commandRunCore(
 	return exitCodeForOutcome(summary.Outcome)
 }
 
+func startRunWithMetadataPolicy(
+	persistentMutation bool,
+	log *RunLog,
+	start func() error,
+) error {
+	if start == nil {
+		return fmt.Errorf("run metadata recorder is unavailable")
+	}
+	if err := start(); err != nil {
+		if persistentMutation {
+			return err
+		}
+		warning := PrecheckWarning{
+			Check:    "run_metadata",
+			Object:   "meta_runs",
+			Actual:   err.Error(),
+			Expected: "run_row_recorded",
+			Impact:   "status_and_stop_tracking_may_be_unavailable",
+		}
+		if log != nil {
+			log.Warn("%s", warning.LogLine())
+		}
+	}
+	return nil
+}
+
+func canContinueAfterPoolOnlyRecoveryFailure(
+	summary RestoreSummary,
+) bool {
+	if !summary.Failed || summary.Err == nil ||
+		!summary.DiscoveryComplete || !summary.RestoreLockReleased ||
+		summary.AfterSuccessAttempted || len(summary.Runs) == 0 ||
+		len(summary.PlannedActions) != 0 {
+		return false
+	}
+	for _, run := range summary.Runs {
+		if len(run.ScenarioCodes) == 0 {
+			return false
+		}
+		for _, code := range run.ScenarioCodes {
+			if code != 401 && code != 402 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func continueAfterPoolOnlyRecoveryFailure(
+	summary RestoreSummary,
+	log *RunLog,
+	start func() error,
+) error {
+	if !canContinueAfterPoolOnlyRecoveryFailure(summary) {
+		if summary.Err != nil {
+			return summary.Err
+		}
+		return fmt.Errorf("stale recovery failed without a recorded cause")
+	}
+	log.Warn(
+		"stale pool-only recovery FAILED but will not block later tests: runs=%d error=%v",
+		len(summary.Runs),
+		summary.Err,
+	)
+	if start == nil {
+		return fmt.Errorf("new run recorder is unavailable")
+	}
+	return start()
+}
+
 type planBaselineRepairFunc func(
 	context.Context,
 	*Database,
@@ -924,38 +1026,31 @@ func preparePlanRunBaseline(
 	db *Database,
 	cfg BenchConfig,
 	log *RunLog,
-	repair planBaselineRepairFunc,
+	_ planBaselineRepairFunc,
 	verify planBaselineVerifyFunc,
 ) error {
-	if repair == nil {
-		return fmt.Errorf("plan baseline repair is unavailable")
-	}
-	results, err := repair(ctx, db, cfg.Data.Schema)
-	for _, result := range results {
-		log.Info(
-			"pre-run plan baseline target=%s status=%s",
-			result.Target,
-			result.Status,
-		)
-	}
-	if err != nil {
-		return fmt.Errorf("repair pre-run plan baseline: %w", err)
-	}
-	if !cfg.Run.ValidationEnabled {
+	if verify == nil {
+		log.Warn("%s", (PrecheckWarning{
+			Check: "plan_baseline", Object: "baseline_inspector",
+			Actual: "unavailable", Expected: "read_only_inspector",
+			Impact: "run_continues_without_baseline_inspection",
+		}).LogLine())
 		return nil
 	}
-	if verify == nil {
-		return fmt.Errorf("plan baseline verification is unavailable")
-	}
 	if err := verify(ctx, db, cfg.Data.Schema); err != nil {
-		return fmt.Errorf("verify pre-run plan baseline: %w", err)
+		log.Warn("%s", (PrecheckWarning{
+			Check: "plan_baseline", Object: cfg.Data.Schema,
+			Actual: err.Error(), Expected: "expected_baseline_metadata",
+			Impact: "run_continues; review gsbench restore",
+		}).LogLine())
 	}
 	return nil
 }
 
 func exitCodeForOutcome(outcome Outcome) int {
 	switch outcome {
-	case OutcomeSuccess, OutcomeUnverified, OutcomeNotApplicable:
+	case OutcomeSuccess, OutcomeCompletedWithWarnings,
+		OutcomeUnverified, OutcomeNotApplicable:
 		return 0
 	case OutcomeDegraded:
 		return 3
@@ -1052,6 +1147,9 @@ func commandStatus(ctx context.Context, db *Database, cfg BenchConfig, log *RunL
 	for _, staleRunID := range stale.RunIDs {
 		log.Info("stale run_id=%s", staleRunID)
 	}
+	if len(stale.RunIDs) != 0 {
+		log.Info("recovery_hint=gsbench restore display_only=true")
+	}
 	if staleErr != nil {
 		log.Error("read stale recovery state: %v", staleErr)
 		return 1
@@ -1060,64 +1158,37 @@ func commandStatus(ctx context.Context, db *Database, cfg BenchConfig, log *RunL
 }
 
 func commandStop(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string) int {
-	return commandRestoreOperation(ctx, db, cfg, log, runID, "stop", true, nil)
-}
-
-func commandRestoreOperation(
-	ctx context.Context,
-	db *Database,
-	cfg BenchConfig,
-	log *RunLog,
-	runID string,
-	commandName string,
-	requirePlanLock bool,
-	afterSuccess func(context.Context, RestoreLock) error,
-) int {
+	if cfg.Run.DryRun {
+		log.Info("stop SUCCESS (dry run, tagged sessions only)")
+		return 0
+	}
+	if err := requestRunsStop(
+		ctx,
+		dbDatasetExecutor{db: db, schema: cfg.Data.Schema},
+		cfg.Data.Schema,
+		runID,
+	); err != nil {
+		log.Warn("stop request metadata update: %v", err)
+	}
 	backend := newDatabaseRestoreBackend(
 		db,
 		cfg,
 		log,
 		DefaultFaultProviderRegistry(),
 	)
-	backend.requirePlanLock = requirePlanLock
-	if requirePlanLock && !cfg.Run.DryRun {
-		requestStop := func(requestCtx context.Context) error {
-			return requestRestoreRunsStop(
-				requestCtx,
-				dbDatasetExecutor{db: db, schema: cfg.Data.Schema},
-				cfg.Data.Schema,
-				runID,
-			)
-		}
-		backend.requestPlanLockOwnerStop = requestStop
-		if err := requestStop(ctx); err != nil {
-			log.Info(
-				"%s: initial stop request deferred until database recovery: %v",
-				commandName,
-				err,
-			)
-		}
+	if err := backend.StopTaggedSessions(ctx, runID); err != nil {
+		log.Error("stop tagged sessions: %v", err)
+		return 1
 	}
-	return executeRestoreService(
-		ctx,
-		NewRestoreCoordinatorWithValidation(
-			backend,
-			cfg.Run.ValidationEnabled,
-		),
-		RestoreRequest{
-			RunID: runID, DryRun: cfg.Run.DryRun,
-			afterSuccess: afterSuccess,
-		},
-		commandName,
-		log,
-	)
+	log.Info("stop SUCCESS tagged_sessions_only=true")
+	return 0
 }
 
 type restoreStopRequestExecutor interface {
 	Exec(context.Context, string, ...any) error
 }
 
-func requestRestoreRunsStop(
+func requestRunsStop(
 	ctx context.Context,
 	executor restoreStopRequestExecutor,
 	schema string,
@@ -1169,6 +1240,9 @@ type databaseRestoreBackend struct {
 	requestPlanLockOwnerStop func(context.Context) error
 	acquirePlanRunLock       databaseRunLockAcquirer
 	acquireLocalRestoreLock  func(context.Context, string) (RestoreLock, error)
+	openAdvisorySession      advisoryLockSessionOpener
+	runExecutionLeaseHeld    func(context.Context, string) (bool, error)
+	skipLiveExecutionRuns    bool
 
 	databaseActions []Action
 	localActions    []Action
@@ -1202,11 +1276,55 @@ func (b *databaseRestoreBackend) ValidateRestoreOwnership(
 		// constructing a SQL pool. Production backends always carry b.db.
 		return nil
 	}
-	return validateDatasetOwnership(
-		ctx,
-		dbDatasetExecutor{db: b.db, schema: b.cfg.Data.Schema},
-		b.cfg.Data.Schema,
-	)
+	openSession := b.openAdvisorySession
+	if openSession == nil {
+		openSession = openAdvisoryLockSession
+	}
+	interval := b.restorePollInterval
+	if interval <= 0 {
+		interval = 200 * time.Millisecond
+	}
+	for {
+		session, err := openSession(
+			ctx,
+			b.db,
+			b.cfg.Database.ApplicationName+"/restore-ownership",
+		)
+		if err != nil {
+			err = fmt.Errorf("open restore ownership session: %w", err)
+		} else {
+			err = validateDatasetOwnership(
+				ctx,
+				&databaseRestoreLock{session: session},
+				b.cfg.Data.Schema,
+			)
+			if err == nil {
+				return wrapRestoreError(
+					"close restore ownership session",
+					session.Close(),
+				)
+			}
+			err = errors.Join(
+				err,
+				wrapRestoreError(
+					"discard failed restore ownership session",
+					session.Discard(),
+				),
+			)
+		}
+		if !isRetryableAdvisoryLockError(err) {
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 var errRestoreBusy = errors.New("restore is busy")
@@ -1515,6 +1633,7 @@ func newDatabaseRestoreBackend(
 		terminateTagged:     db.TerminateTagged,
 		taggedSessionState:  db.TaggedSessionState,
 		restorePollInterval: 200 * time.Millisecond,
+		openAdvisorySession: db.openAdvisorySession,
 		waitForDatabaseFn: func(ctx context.Context) error {
 			return waitForRestoreDatabase(
 				ctx,
@@ -1527,35 +1646,60 @@ func newDatabaseRestoreBackend(
 	}
 }
 
+type runRestoreDatabaseOpener func(
+	context.Context,
+	BenchConfig,
+) (*Database, error)
+
+func newIsolatedRunRestoreBackend(
+	ctx context.Context,
+	cfg BenchConfig,
+	log *RunLog,
+	registry *FaultProviderRegistry,
+	open runRestoreDatabaseOpener,
+) (*databaseRestoreBackend, func() error, error) {
+	if open == nil {
+		open = OpenRestoreDatabase
+	}
+	db, err := open(context.WithoutCancel(ctx), cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if db == nil {
+		return nil, nil, fmt.Errorf(
+			"restore database opener returned no database",
+		)
+	}
+	return newDatabaseRestoreBackend(db, cfg, log, registry), db.Close, nil
+}
+
 type databaseRestoreLock struct {
-	once  sync.Once
-	db    *Database
-	conn  *sql.Conn
-	keys  []string
-	local RestoreLock
-	err   error
+	once    sync.Once
+	session advisoryLockSession
+	keys    []string
+	local   RestoreLock
+	err     error
 }
 
 func (l *databaseRestoreLock) DatasetVersion(
 	ctx context.Context,
 	schema string,
 ) (string, error) {
-	if l == nil || l.db == nil || l.conn == nil {
+	if l == nil || l.session == nil {
 		return "", fmt.Errorf("protected restore database session is unavailable")
 	}
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {
 		return "", fmt.Errorf("unsafe dataset schema %q", schema)
 	}
-	opCtx, cancel := l.db.operationContext(ctx)
-	defer cancel()
 	var version string
-	err := l.conn.QueryRowContext(
-		opCtx,
+	err := l.session.Scan(
+		ctx,
 		"SELECT value FROM "+quotedSchema+
-			".meta_dataset WHERE key=$1",
-		"dataset_version",
-	).Scan(&version)
+			".meta_dataset WHERE key='dataset_version'",
+		nil,
+		&version,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -1567,13 +1711,10 @@ func (l *databaseRestoreLock) Exec(
 	query string,
 	args ...any,
 ) error {
-	if l == nil || l.db == nil || l.conn == nil {
+	if l == nil || l.session == nil {
 		return fmt.Errorf("protected restore database session is unavailable")
 	}
-	opCtx, cancel := l.db.operationContext(ctx)
-	defer cancel()
-	_, err := l.conn.ExecContext(opCtx, query, args...)
-	return err
+	return l.session.Exec(ctx, query, args...)
 }
 
 func (l *databaseRestoreLock) Release() error {
@@ -1582,17 +1723,21 @@ func (l *databaseRestoreLock) Release() error {
 	}
 	l.once.Do(func() {
 		var errs []error
-		if l.conn != nil {
-			errs = append(
-				errs,
-				releaseDatabaseAdvisoryKeys(l.db, l.conn, l.keys),
-			)
-			if err := l.conn.Close(); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"close restore lock connection: %w", err,
+		if l.session != nil {
+			releaseErr := releaseDatabaseAdvisoryKeys(l.session, l.keys)
+			errs = append(errs, releaseErr)
+			if releaseErr != nil {
+				errs = append(errs, wrapRestoreError(
+					"discard uncertain database advisory-lock session",
+					l.session.Discard(),
+				))
+			} else {
+				errs = append(errs, wrapRestoreError(
+					"close database restore lock session",
+					l.session.Close(),
 				))
 			}
-			l.conn = nil
+			l.session = nil
 		}
 		if l.local != nil {
 			if err := l.local.Release(); err != nil {
@@ -1606,55 +1751,27 @@ func (l *databaseRestoreLock) Release() error {
 }
 
 func releaseDatabaseAdvisoryKeys(
-	db *Database,
-	conn *sql.Conn,
+	session advisoryLockSession,
 	keys []string,
 ) error {
 	var errs []error
-	discard := false
 	for index := len(keys) - 1; index >= 0; index-- {
 		key := keys[index]
-		ctx, cancel := db.operationContext(context.Background())
-		var unlocked bool
-		err := conn.QueryRowContext(
-			ctx,
-			"SELECT pg_advisory_unlock(hashtext($1))",
-			key,
-		).Scan(&unlocked)
-		cancel()
+		unlocked, err := session.Unlock(context.Background(), key)
 		if err != nil {
-			discard = true
 			errs = append(errs, fmt.Errorf(
 				"release database advisory lock %q: %w",
 				key,
 				err,
 			))
 		} else if !unlocked {
-			discard = true
 			errs = append(errs, fmt.Errorf(
 				"database advisory lock %q was not held",
 				key,
 			))
 		}
 	}
-	if discard {
-		if err := discardDatabaseAdvisoryConnection(conn); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	return errors.Join(errs...)
-}
-
-func discardDatabaseAdvisoryConnection(conn *sql.Conn) error {
-	if conn == nil {
-		return fmt.Errorf("discard advisory-lock connection: connection is unavailable")
-	}
-	err := conn.Raw(func(any) error { return driver.ErrBadConn })
-	if err == nil || errors.Is(err, driver.ErrBadConn) ||
-		errors.Is(err, sql.ErrConnDone) {
-		return nil
-	}
-	return fmt.Errorf("discard advisory-lock connection: %w", err)
 }
 
 func (b *databaseRestoreBackend) AcquireRestoreLock(
@@ -1810,9 +1927,15 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 			return nil, requestErr
 		}
 	}
-	openCtx, cancelOpen := b.db.operationContext(ctx)
-	conn, err := b.db.pool.Conn(openCtx)
-	cancelOpen()
+	openSession := b.openAdvisorySession
+	if openSession == nil {
+		openSession = openAdvisoryLockSession
+	}
+	session, err := openSession(
+		ctx,
+		b.db,
+		b.cfg.Database.ApplicationName+"/restore-lock",
+	)
 	if err != nil {
 		sessionErr := fmt.Errorf(
 			"open database restore lock session: %w",
@@ -1821,47 +1944,53 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 		if ctx.Err() != nil {
 			return nil, sessionErr
 		}
-		return nil, newRestoreDatabaseConnectivityError(sessionErr)
+		if isRetryableAdvisoryLockError(err) {
+			return nil, newRestoreDatabaseConnectivityError(sessionErr)
+		}
+		return nil, sessionErr
 	}
 	keys := restoreDatabaseAdvisoryKeys(b.cfg, requirePlanLock)
 	acquiredKeys := make([]string, 0, len(keys))
+	cleanupSession := func(discard bool) error {
+		releaseErr := releaseDatabaseAdvisoryKeys(session, acquiredKeys)
+		if releaseErr != nil {
+			discard = true
+		}
+		var finishErr error
+		if discard {
+			finishErr = session.Discard()
+		} else {
+			finishErr = session.Close()
+		}
+		return errors.Join(
+			wrapRestoreError(
+				"release partially acquired database advisory locks",
+				releaseErr,
+			),
+			wrapRestoreError(
+				"finish database restore lock session",
+				finishErr,
+			),
+		)
+	}
 	for _, key := range keys {
 		for {
-			queryCtx, cancelQuery := b.db.operationContext(ctx)
 			var acquired bool
-			err = conn.QueryRowContext(
-				queryCtx,
-				"SELECT pg_try_advisory_lock(hashtext($1))",
-				key,
-			).Scan(&acquired)
-			cancelQuery()
+			acquired, err = session.TryLock(ctx, key)
 			if err != nil {
 				acquireErr := fmt.Errorf(
 					"acquire database advisory lock %q: %w",
 					key,
 					err,
 				)
-				releaseErr := releaseDatabaseAdvisoryKeys(
-					b.db,
-					conn,
-					acquiredKeys,
-				)
-				discardErr := discardDatabaseAdvisoryConnection(conn)
-				return nil, errors.Join(
+				resultErr := errors.Join(
 					acquireErr,
-					wrapRestoreError(
-						"release partially acquired database advisory locks",
-						releaseErr,
-					),
-					wrapRestoreError(
-						"discard uncertain database advisory-lock session",
-						discardErr,
-					),
-					wrapRestoreError(
-						"close database restore lock session",
-						conn.Close(),
-					),
+					cleanupSession(true),
 				)
+				if isRetryableAdvisoryLockError(err) {
+					return nil, newRestoreDatabaseConnectivityError(resultErr)
+				}
+				return nil, resultErr
 			}
 			if acquired {
 				break
@@ -1877,18 +2006,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 			if !requirePlanLock || key != planDatabaseLockIdentity(b.cfg) {
 				return nil, errors.Join(
 					busyErr,
-					wrapRestoreError(
-						"release partially acquired database advisory locks",
-						releaseDatabaseAdvisoryKeys(
-							b.db,
-							conn,
-							acquiredKeys,
-						),
-					),
-					wrapRestoreError(
-						"close database restore lock session",
-						conn.Close(),
-					),
+					cleanupSession(false),
 				)
 			}
 			// The plan owner can insert meta_runs after the initial stop request
@@ -1901,18 +2019,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 							"repeat stop request while plan lock is busy: %w",
 							requestErr,
 						),
-						wrapRestoreError(
-							"release partially acquired database advisory locks",
-							releaseDatabaseAdvisoryKeys(
-								b.db,
-								conn,
-								acquiredKeys,
-							),
-						),
-						wrapRestoreError(
-							"close database restore lock session",
-							conn.Close(),
-						),
+						cleanupSession(false),
 					)
 				}
 			}
@@ -1929,18 +2036,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 				return nil, errors.Join(
 					busyErr,
 					ctx.Err(),
-					wrapRestoreError(
-						"release partially acquired database advisory locks",
-						releaseDatabaseAdvisoryKeys(
-							b.db,
-							conn,
-							acquiredKeys,
-						),
-					),
-					wrapRestoreError(
-						"close database restore lock session",
-						conn.Close(),
-					),
+					cleanupSession(false),
 				)
 			case <-timer.C:
 			}
@@ -1948,7 +2044,7 @@ func (b *databaseRestoreBackend) acquireDatabaseLockWithPlanRequirement(
 		acquiredKeys = append(acquiredKeys, key)
 	}
 	return &databaseRestoreLock{
-		db: b.db, conn: conn, keys: keys, local: local,
+		session: session, keys: acquiredKeys, local: local,
 	}, nil
 }
 
@@ -2005,7 +2101,7 @@ func (b *databaseRestoreBackend) restoreLocalControlPlane(
 		b.cfg.Run.ValidationEnabled,
 	)
 	var errs []error
-	for _, runID := range runs {
+	for _, runID := range restoreRunIDs(runs) {
 		group := restoreActionGroup(
 			actions,
 			runID,
@@ -2095,18 +2191,6 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 			actions...,
 		)
 	}
-	if b.mutating && !readOnly {
-		var err error
-		discovery.DatabaseActions, err = b.syncRestoredLocalMirrors(
-			ctx,
-			discovery.DatabaseActions,
-			allLocal,
-		)
-		if err != nil {
-			return discovery, err
-		}
-	}
-
 	runs, err := b.discoverMetaRuns(ctx, requested)
 	if err != nil {
 		return discovery, err
@@ -2123,6 +2207,39 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 		return discovery, err
 	}
 	discovery.Runs = runs
+	if requested == "" && b.skipLiveExecutionRuns {
+		probeDiscovery := discovery
+		probeDiscovery.LocalActions = allLocal
+		probeDiscovery, err = b.excludeLiveExecutionRuns(
+			ctx,
+			probeDiscovery,
+		)
+		if err != nil {
+			return discovery, err
+		}
+		allLocal = probeDiscovery.LocalActions
+		discovery.Runs = probeDiscovery.Runs
+		discovery.DatabaseActions = probeDiscovery.DatabaseActions
+		discovery.LocalActions = discovery.LocalActions[:0]
+		for _, action := range allLocal {
+			if action.State != MutationRestored {
+				discovery.LocalActions = append(
+					discovery.LocalActions,
+					action,
+				)
+			}
+		}
+	}
+	if b.mutating && !readOnly {
+		discovery.DatabaseActions, err = b.syncRestoredLocalMirrors(
+			ctx,
+			discovery.DatabaseActions,
+			allLocal,
+		)
+		if err != nil {
+			return discovery, err
+		}
+	}
 	environment := DetectEnvironment(ctx, b.db)
 	b.environment = environment
 	b.executor.environment = environment
@@ -2141,6 +2258,78 @@ func (b *databaseRestoreBackend) DiscoverRestore(
 		b.cfg.Run.ValidationEnabled,
 	)
 	return discovery, nil
+}
+
+func (b *databaseRestoreBackend) excludeLiveExecutionRuns(
+	ctx context.Context,
+	discovery RestoreDiscovery,
+) (RestoreDiscovery, error) {
+	runIDs := make([]string, 0, len(discovery.Runs))
+	seen := make(map[string]bool)
+	addRunID := func(runID string) {
+		runID = strings.TrimSpace(runID)
+		if runID == "" || seen[runID] {
+			return
+		}
+		seen[runID] = true
+		runIDs = append(runIDs, runID)
+	}
+	for _, run := range discovery.Runs {
+		addRunID(run.RunID)
+	}
+	for _, action := range discovery.DatabaseActions {
+		addRunID(action.RunID)
+	}
+	for _, action := range discovery.LocalActions {
+		addRunID(action.RunID)
+	}
+
+	live := make(map[string]bool)
+	leaseHeld := b.runExecutionLeaseHeld
+	if leaseHeld == nil {
+		leaseHeld = func(
+			probeCtx context.Context,
+			runID string,
+		) (bool, error) {
+			identity, err := runExecutionLockIdentity(b.cfg, runID)
+			if err != nil {
+				return false, err
+			}
+			return DatabaseRunLockHeld(probeCtx, b.db, identity)
+		}
+	}
+	for _, runID := range runIDs {
+		held, err := leaseHeld(ctx, runID)
+		if err != nil {
+			return discovery, fmt.Errorf(
+				"check run %s execution lease: %w",
+				runID,
+				err,
+			)
+		}
+		live[runID] = held
+	}
+
+	filtered := RestoreDiscovery{}
+	for _, run := range discovery.Runs {
+		if !live[run.RunID] {
+			filtered.Runs = append(filtered.Runs, run)
+		}
+	}
+	for _, action := range discovery.DatabaseActions {
+		if !live[action.RunID] {
+			filtered.DatabaseActions = append(
+				filtered.DatabaseActions,
+				action,
+			)
+		}
+	}
+	for _, action := range discovery.LocalActions {
+		if !live[action.RunID] {
+			filtered.LocalActions = append(filtered.LocalActions, action)
+		}
+	}
+	return filtered, nil
 }
 
 type recoveryLedgerSnapshotter interface {
@@ -2228,12 +2417,14 @@ func (b *databaseRestoreBackend) addPendingRunMetadata(
 			continue
 		}
 		seen[action.RunID] = true
+		var scenarios string
 		var startedAt time.Time
 		err := b.db.Scan(
 			ctx,
-			"SELECT started_at FROM "+quotedSchema+
+			"SELECT scenarios,started_at FROM "+quotedSchema+
 				".meta_runs WHERE run_id=$1",
 			[]any{action.RunID},
+			&scenarios,
 			&startedAt,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2247,8 +2438,18 @@ func (b *databaseRestoreBackend) addPendingRunMetadata(
 				err,
 			)
 		}
+		codes, err := parseStoredScenarioCodes(scenarios)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"discover pending run %s scenarios: %w",
+				action.RunID,
+				err,
+			)
+		}
 		runs = append(runs, RestoreRun{
-			RunID: action.RunID, StartedAt: startedAt,
+			RunID:         action.RunID,
+			StartedAt:     startedAt,
+			ScenarioCodes: codes,
 		})
 	}
 	return runs, nil
@@ -2263,12 +2464,14 @@ func (b *databaseRestoreBackend) discoverMetaRuns(
 		return nil, fmt.Errorf("unsafe dataset schema %q", b.cfg.Data.Schema)
 	}
 	if requested != "" {
+		var scenarios string
 		var startedAt time.Time
 		err := b.db.Scan(
 			ctx,
-			"SELECT started_at FROM "+quotedSchema+
+			"SELECT scenarios,started_at FROM "+quotedSchema+
 				".meta_runs WHERE run_id=$1",
 			[]any{requested},
+			&scenarios,
 			&startedAt,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2277,11 +2480,22 @@ func (b *databaseRestoreBackend) discoverMetaRuns(
 		if err != nil {
 			return nil, fmt.Errorf("discover requested meta run: %w", err)
 		}
-		return []RestoreRun{{RunID: requested, StartedAt: startedAt}}, nil
+		codes, err := parseStoredScenarioCodes(scenarios)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"discover requested meta run scenarios: %w",
+				err,
+			)
+		}
+		return []RestoreRun{{
+			RunID:         requested,
+			StartedAt:     startedAt,
+			ScenarioCodes: codes,
+		}}, nil
 	}
 	rows, err := b.db.Query(
 		ctx,
-		"SELECT run_id,started_at FROM "+quotedSchema+
+		"SELECT run_id,scenarios,started_at FROM "+quotedSchema+
 			".meta_runs WHERE status IN ("+
 			"'running','stop_requested','restore_requested',"+
 			"'restore_failed','RESTORE_FAILED') "+
@@ -2294,12 +2508,58 @@ func (b *databaseRestoreBackend) discoverMetaRuns(
 	var runs []RestoreRun
 	for rows.Next() {
 		var run RestoreRun
-		if err := rows.Scan(&run.RunID, &run.StartedAt); err != nil {
+		var scenarios string
+		if err := rows.Scan(
+			&run.RunID,
+			&scenarios,
+			&run.StartedAt,
+		); err != nil {
 			return nil, fmt.Errorf("scan active meta run: %w", err)
 		}
+		codes, err := parseStoredScenarioCodes(scenarios)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"parse active meta run %s scenarios: %w",
+				run.RunID,
+				err,
+			)
+		}
+		run.ScenarioCodes = codes
 		runs = append(runs, run)
 	}
 	return runs, rows.Err()
+}
+
+func parseStoredScenarioCodes(value string) ([]ScenarioCode, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, fmt.Errorf("stored scenario list is empty")
+	}
+	parts := strings.Split(value, ",")
+	codes := make([]ScenarioCode, 0, len(parts))
+	seen := make(map[ScenarioCode]bool, len(parts))
+	for _, raw := range parts {
+		part := strings.TrimSpace(raw)
+		if part == "" {
+			return nil, fmt.Errorf(
+				"stored scenario list contains an empty item",
+			)
+		}
+		number, err := strconv.ParseUint(part, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid stored scenario %q", part)
+		}
+		code := ScenarioCode(number)
+		if _, err := DefaultScenarioCatalog().LookupCode(code); err != nil {
+			return nil, err
+		}
+		if seen[code] {
+			return nil, fmt.Errorf("duplicate stored scenario %03d", code)
+		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	return codes, nil
 }
 
 func (b *databaseRestoreBackend) MarkRestoreRequested(
@@ -2690,9 +2950,105 @@ func (b *databaseRestoreBackend) MarkRestoreOutcome(
 }
 
 func commandRestore(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string) int {
-	return commandRestoreOperation(
-		ctx, db, cfg, log, runID, "restore", true, nil,
+	return commandRecoveryPlan(ctx, db, cfg, log, runID, nil)
+}
+
+func commandRecoveryPlan(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	log *RunLog,
+	runID string,
+	scenarioCode *ScenarioCode,
+) int {
+	backend := newDatabaseRestoreBackend(
+		db,
+		cfg,
+		log,
+		DefaultFaultProviderRegistry(),
 	)
+	datasetBaselineScope := scenarioCode == nil
+	var datasetFindings []PlanBaselineFinding
+	if datasetBaselineScope {
+		baselineEnvironment := DetectEnvironment(ctx, db)
+		var baselineErr error
+		datasetFindings, baselineErr = InspectDatasetBaseline(
+			ctx,
+			cfg,
+			baselineEnvironment,
+			dbDatasetExecutor{
+				db: db, schema: cfg.Data.Schema, env: baselineEnvironment,
+			},
+		)
+		if baselineErr != nil {
+			log.Error("inspect shared gsbench baseline: %v", baselineErr)
+			return 1
+		}
+	}
+	discoveryFallback := false
+	discovery, err := backend.DiscoverRestore(ctx, runID, true)
+	if err != nil {
+		if !datasetBaselineScope ||
+			!recoveryDiscoveryCanFallBackToBaseline(datasetFindings, cfg.Data.Schema) {
+			log.Error("discover recovery plan: %v", err)
+			return 1
+		}
+		datasetFindings = append(datasetFindings, PlanBaselineFinding{
+			Check: "journal_discovery", Target: "meta_journal",
+			Actual: "unavailable", Expected: "readable_pending_actions",
+			Detail: journalSafeErrorText(err.Error()),
+		})
+		discovery = RestoreDiscovery{}
+		discoveryFallback = true
+	}
+	filter := RecoveryPlanFilter{RunID: runID, ScenarioCode: scenarioCode}
+	verifier := newRecoveryActionVerifier(db, cfg)
+	plan, err := BuildRecoveryPlan(ctx, discovery, filter, verifier)
+	if err != nil {
+		log.Error("build recovery plan: %v", err)
+		return 1
+	}
+	findings, baselineErr := InspectPlanBaseline(ctx, db, cfg.Data.Schema)
+	if baselineErr != nil {
+		findings = append(findings, PlanBaselineFinding{
+			ScenarioCodes: []ScenarioCode{601, 602, 603, 604, 605, 606},
+			Check:         "plan_baseline_probe", Target: cfg.Data.Schema + ".plan_data",
+			Actual: "unavailable", Expected: "readable_metadata",
+			Detail: journalSafeErrorText(baselineErr.Error()),
+		})
+	}
+	findings = append(findings, datasetFindings...)
+	mergeFilter := filter
+	if discoveryFallback {
+		mergeFilter = RecoveryPlanFilter{}
+	}
+	plan = MergePlanBaselineFindings(plan, findings, mergeFilter)
+	if scenarioCode != nil {
+		log.Info(
+			"PLAN_RECOVER_DISPLAY_ONLY scenario=%03d execution=operator_controlled",
+			*scenarioCode,
+		)
+	}
+	for _, line := range RecoveryPlanLines(plan) {
+		log.Info("%s", line)
+	}
+	return 0
+}
+
+func recoveryDiscoveryCanFallBackToBaseline(
+	findings []PlanBaselineFinding,
+	schema string,
+) bool {
+	for _, finding := range findings {
+		if finding.Actual != "missing" {
+			continue
+		}
+		if (finding.Check == "schema_presence" && finding.Target == schema) ||
+			(finding.Check == "object_presence" && finding.Target == "meta_journal") {
+			return true
+		}
+	}
+	return false
 }
 
 func commandCleanup(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string, withData bool) int {
@@ -2708,37 +3064,85 @@ func commandCleanup(ctx context.Context, db *Database, cfg BenchConfig, log *Run
 		return 0
 	}
 	if cfg.Run.DryRun {
-		if code := commandRestoreOperation(
-			ctx, db, cfg, log, runID, "stop", true, nil,
-		); code != 0 {
-			return code
-		}
 		if code := cleanupData(ctx, db, cfg, log); code != 0 {
 			return code
 		}
 		log.Info("cleanup SUCCESS")
 		return 0
 	}
-	// RestoreCoordinator invokes afterSuccess before releasing restore/local/
-	// plan locks. Keeping ownership verification and DROP in this callback
-	// closes the gap in which a new run could otherwise start.
-	afterSuccess := func(
-		callbackCtx context.Context,
-		lock RestoreLock,
-	) error {
-		if err := ensureNoPlanWorkload(callbackCtx, db, cfg); err != nil {
-			return err
-		}
-		return cleanupDataAfterRestore(callbackCtx, lock, cfg, log)
-	}
-	code := commandRestoreOperation(
-		ctx, db, cfg, log, runID, "stop", true, afterSuccess,
+	code := 1
+	err := withDatasetLifecycleDatabaseLock(
+		ctx,
+		db,
+		cfg,
+		AcquireDatabaseRunLock,
+		func() error {
+			code = commandCleanupDataProtected(ctx, db, cfg, log, runID)
+			if code != 0 {
+				return fmt.Errorf("protected data cleanup failed")
+			}
+			return nil
+		},
 	)
-	if code != 0 {
+	if err != nil {
+		log.Error("cleanup --data lifecycle lock: %v", err)
+		return 1
+	}
+	return code
+}
+
+func commandCleanupDataProtected(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+	log *RunLog,
+	runID string,
+) int {
+	if code := commandStop(ctx, db, cfg, log, runID); code != 0 {
+		return code
+	}
+	if err := ensureNoPlanWorkload(ctx, db, cfg); err != nil {
+		log.Error("cleanup --data: %v", err)
+		return 1
+	}
+	if err := ensureNoActiveRunExecutionLeases(ctx, db, cfg); err != nil {
+		log.Error("cleanup --data: %v", err)
+		return 1
+	}
+	if code := cleanupData(ctx, db, cfg, log); code != 0 {
 		return code
 	}
 	log.Info("cleanup SUCCESS")
 	return 0
+}
+
+func ensureNoActiveRunExecutionLeases(
+	ctx context.Context,
+	db *Database,
+	cfg BenchConfig,
+) error {
+	backend := &databaseRestoreBackend{db: db, cfg: cfg}
+	runs, err := backend.discoverMetaRuns(ctx, "")
+	if err != nil {
+		return fmt.Errorf("discover active runs before schema cleanup: %w", err)
+	}
+	for _, run := range runs {
+		identity, err := runExecutionLockIdentity(cfg, run.RunID)
+		if err != nil {
+			return err
+		}
+		held, err := DatabaseRunLockHeld(ctx, db, identity)
+		if err != nil {
+			return fmt.Errorf("inspect run %s execution lease: %w", run.RunID, err)
+		}
+		if held {
+			return fmt.Errorf(
+				"run %s is still shutting down; retry cleanup --data after it exits",
+				run.RunID,
+			)
+		}
+	}
+	return nil
 }
 
 func ensureNoPlanWorkload(
@@ -2891,6 +3295,50 @@ func formatScenarioCodes(codes []ScenarioCode) string {
 	}
 	return strings.Join(values, ",")
 }
+
+type runOutcomeExecutor interface {
+	Exec(context.Context, string, ...any) (sql.Result, error)
+}
+
+func recordRunOutcome(
+	ctx context.Context,
+	executor runOutcomeExecutor,
+	schema string,
+	runID string,
+	outcome Outcome,
+	detail string,
+) error {
+	if executor == nil {
+		return fmt.Errorf("run outcome recorder is unavailable")
+	}
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+	result, err := executor.Exec(
+		ctx,
+		"UPDATE "+quotedSchema+".meta_runs "+
+			"SET phase=$1,status=$2,detail=$3,updated_at=current_timestamp "+
+			"WHERE run_id=$4",
+		string(PhaseStop), string(outcome), detail, runID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read run outcome update count: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf(
+			"record run outcome for %s updated %d rows, expected 1",
+			runID,
+			affected,
+		)
+	}
+	return nil
+}
+
 func finishRun(ctx context.Context, db *Database, schema, runID string, outcome Outcome, detail string) error {
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {

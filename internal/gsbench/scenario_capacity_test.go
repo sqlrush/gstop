@@ -6,20 +6,32 @@ import (
 	"testing"
 )
 
-func TestConnectionTargetHonorsInstanceAndSafetyCeilings(t *testing.T) {
-	if got := connectionTarget(200, 95, 500); got != 190 {
+func TestConnectionTargetUsesPhysicalCapacity(t *testing.T) {
+	if got := connectionTarget(200, 95); got != 190 {
 		t.Fatalf("target=%d", got)
 	}
-	if got := connectionTarget(1000, 95, 500); got != 500 {
-		t.Fatalf("safety-capped target=%d", got)
+	if got := connectionTarget(1000, 95); got != 950 {
+		t.Fatalf("physical target=%d", got)
 	}
-	if got := connectionTarget(101, 95, 500); got != 96 {
+	if got := connectionTarget(101, 95); got != 96 {
 		t.Fatalf("fractional target was not rounded up: %d", got)
 	}
 }
 
+func TestConnectionBudgetIgnoresArtificialSafetyCap(t *testing.T) {
+	budget, err := calculateConnectionBudget(103, 3, 20, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.UsableCapacity != 100 || budget.DesiredTotal != 90 ||
+		budget.WorkloadTarget != 70 || budget.ReachableTotal != 90 ||
+		budget.Limited {
+		t.Fatalf("budget=%+v", budget)
+	}
+}
+
 func TestConnectionBudgetSubtractsReservedAndExistingSessions(t *testing.T) {
-	budget, err := calculateConnectionBudget(101, 3, 7, 95, 100)
+	budget, err := calculateConnectionBudget(101, 3, 7, 95)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,27 +43,51 @@ func TestConnectionBudgetSubtractsReservedAndExistingSessions(t *testing.T) {
 		t.Fatalf("unnecessarily limited budget=%+v", budget)
 	}
 
-	limited, err := calculateConnectionBudget(1000, 10, 100, 95, 500)
+	physical, err := calculateConnectionBudget(1000, 10, 100, 95)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !limited.Limited || limited.WorkloadTarget != 500 || limited.ReachableTotal != 600 {
-		t.Fatalf("limited budget=%+v", limited)
+	if physical.Limited || physical.WorkloadTarget != 841 || physical.ReachableTotal != 941 {
+		t.Fatalf("physical budget=%+v", physical)
 	}
-	if math.Abs(limited.CeilingPercent-600.0/990.0*100) > 0.001 {
-		t.Fatalf("ceiling percent=%f budget=%+v", limited.CeilingPercent, limited)
+	if math.Abs(physical.CeilingPercent-941.0/990.0*100) > 0.001 {
+		t.Fatalf("ceiling percent=%f budget=%+v", physical.CeilingPercent, physical)
 	}
 }
 
-func TestConnectionTopUpUsesObservedLiveSessions(t *testing.T) {
-	if got := connectionTopUp(94, 91, 84, 87); got != 3 {
-		t.Fatalf("top-up=%d", got)
+func TestConnectionBudgetInjectsOnlyBaselineDelta(t *testing.T) {
+	budget, err := calculateConnectionBudget(103, 3, 80, 90)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := connectionTopUp(94, 91, 87, 87); got != 0 {
-		t.Fatalf("top-up exceeded workload safety limit: %d", got)
+	if budget.UsableCapacity != 100 || budget.DesiredTotal != 90 ||
+		budget.WorkloadTarget != 10 || budget.BaselinePercent != 80 {
+		t.Fatalf("budget=%+v", budget)
 	}
-	if got := connectionTopUp(98, 94, 86, 87); got != 1 {
-		t.Fatalf("closed tagged session was not replenished: %d", got)
+}
+
+func TestConnectionBudgetAllowsAdvisoryTargets(t *testing.T) {
+	for _, target := range []int{79, 80} {
+		budget, err := calculateConnectionBudget(
+			103, 3, 80, target,
+		)
+		if err != nil || budget.WorkloadTarget != 0 {
+			t.Fatalf("target=%d budget=%+v err=%v", target, budget, err)
+		}
+	}
+	budget, err := calculateConnectionBudget(103, 3, 20, 150)
+	if err != nil || budget.WorkloadTarget != 80 || !budget.Limited {
+		t.Fatalf("above-capacity budget=%+v err=%v", budget, err)
+	}
+}
+
+func TestConnectionBudgetUsesAllPhysicalHeadroomAtOneHundredPercent(t *testing.T) {
+	budget, err := calculateConnectionBudget(103, 3, 20, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.WorkloadTarget != 80 || budget.ReachableTotal != 100 {
+		t.Fatalf("budget=%+v", budget)
 	}
 }
 
@@ -113,8 +149,34 @@ func TestThreadCapacityUsesWorkerTopologyAndSessionHeadroom(t *testing.T) {
 	if got := threadSessionCapacity(500, 10, 480, 640, 800); got != 10 {
 		t.Fatalf("headroom-limited session capacity=%d", got)
 	}
-	if got := threadUtilizationCeiling(1000, 640); math.Abs(got-64) > 0.001 {
-		t.Fatalf("thread utilization ceiling=%f", got)
+}
+
+func TestThreadPressurePhysicalHeadroomIgnoresConfiguredCaps(t *testing.T) {
+	if got := physicalSessionHeadroom(1000, 10, 100); got != 890 {
+		t.Fatalf("physical headroom=%d want=890", got)
+	}
+	if got := physicalSessionHeadroom(500, 10, 490); got != 0 {
+		t.Fatalf("exhausted headroom=%d want=0", got)
+	}
+}
+
+func TestThreadPressureCapacityLeavesCapAwareCapacityForOtherScenarios(t *testing.T) {
+	facts := connectionCapacityFacts{InstanceMax: 1000, Reserved: 10, Existing: 100}
+	if got := threadPressureCapacity(facts); got != 890 {
+		t.Fatalf("402 capacity=%d want=890", got)
+	}
+	if got := threadSessionCapacity(1000, 10, 100, 1, 1); got != 1 {
+		t.Fatalf("cap-aware capacity=%d want=1", got)
+	}
+}
+
+func TestThreadPoolPercentAndCeilingIncludeExistingBusyWorkers(t *testing.T) {
+	status := ThreadPoolStatus{Actual: 100, Idle: 20}
+	if got := threadPoolPercent(status); got != 80 {
+		t.Fatalf("baseline=%v", got)
+	}
+	if got := threadUtilizationCeilingFromBaseline(status, 10); got != 90 {
+		t.Fatalf("ceiling=%v", got)
 	}
 }
 

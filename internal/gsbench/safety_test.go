@@ -54,13 +54,14 @@ func TestAuthorizeRiskCRequiresConfigCLIAndProvider(t *testing.T) {
 
 func TestOutcomeRankOrdersResultStates(t *testing.T) {
 	want := map[Outcome]int{
-		OutcomeSuccess:        0,
-		OutcomeNotApplicable:  0,
-		OutcomeUnverified:     1,
-		OutcomeDegraded:       2,
-		OutcomeNotImplemented: 3,
-		OutcomeFailed:         4,
-		OutcomeRestoreFailed:  5,
+		OutcomeSuccess:               0,
+		OutcomeNotApplicable:         0,
+		OutcomeCompletedWithWarnings: 1,
+		OutcomeUnverified:            1,
+		OutcomeDegraded:              2,
+		OutcomeNotImplemented:        3,
+		OutcomeFailed:                4,
+		OutcomeRestoreFailed:         5,
 	}
 	if !reflect.DeepEqual(outcomeRank, want) {
 		t.Fatalf("outcome rank = %#v, want %#v", outcomeRank, want)

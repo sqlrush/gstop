@@ -2,6 +2,7 @@ package gsbench
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
@@ -137,7 +138,7 @@ func (s *planControlStore) FinishWorkload(
 	outcome Outcome,
 	detail string,
 ) error {
-	_, err := s.db.Exec(
+	result, err := s.db.Exec(
 		ctx,
 		"UPDATE "+s.schema+
 			".meta_runs SET status=$1,detail=$2,updated_at=current_timestamp "+
@@ -148,7 +149,7 @@ func (s *planControlStore) FinishWorkload(
 		planWorkloadPreparingStatus,
 		planWorkloadRunningStatus,
 	)
-	return err
+	return requirePlanControlRow(result, err, runID, "finish workload")
 }
 
 func (s *planControlStore) StartFault(
@@ -159,7 +160,7 @@ func (s *planControlStore) StartFault(
 	if strings.TrimSpace(runID) == "" || !isPlanChangeCode(code) {
 		return fmt.Errorf("plan fault requires run ID and scenario 601-606")
 	}
-	_, err := s.db.Exec(
+	result, err := s.db.Exec(
 		ctx,
 		"INSERT INTO "+s.schema+
 			".meta_runs(run_id,scenarios,phase,status,owner_name,"+
@@ -170,7 +171,7 @@ func (s *planControlStore) StartFault(
 		fmt.Sprintf("%03d", code),
 		string(PhaseRamp),
 	)
-	return err
+	return requirePlanControlRow(result, err, runID, "start fault")
 }
 
 func (s *planControlStore) SetFaultPhase(
@@ -179,7 +180,7 @@ func (s *planControlStore) SetFaultPhase(
 	phase Phase,
 	detail string,
 ) error {
-	_, err := s.db.Exec(
+	result, err := s.db.Exec(
 		ctx,
 		"UPDATE "+s.schema+
 			".meta_runs SET phase=$1,detail=$2,updated_at=current_timestamp "+
@@ -188,7 +189,7 @@ func (s *planControlStore) SetFaultPhase(
 		detail,
 		runID,
 	)
-	return err
+	return requirePlanControlRow(result, err, runID, "set fault phase")
 }
 
 func (s *planControlStore) MarkFaultFailed(
@@ -201,9 +202,10 @@ func (s *planControlStore) MarkFaultFailed(
 	if faultErr != nil {
 		detail = journalSafeErrorText(faultErr.Error())
 	}
+	var result sql.Result
 	var err error
 	if restored {
-		_, err = s.db.Exec(
+		result, err = s.db.Exec(
 			ctx,
 			"UPDATE "+s.schema+
 				".meta_runs SET phase=$1,status=$2,detail=$3,"+
@@ -214,17 +216,44 @@ func (s *planControlStore) MarkFaultFailed(
 			runID,
 		)
 	} else {
-		_, err = s.db.Exec(
+		result, err = s.db.Exec(
 			ctx,
 			"UPDATE "+s.schema+
 				".meta_runs SET status=$1,detail=$2,"+
 				"updated_at=current_timestamp WHERE run_id=$3",
-			"restore_failed",
+			"fault_failed_recovery_pending",
 			detail,
 			runID,
 		)
 	}
-	return err
+	return requirePlanControlRow(result, err, runID, "mark fault failed")
+}
+
+func requirePlanControlRow(
+	result sql.Result,
+	err error,
+	runID string,
+	operation string,
+) error {
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return fmt.Errorf("%s for %s returned no update result", operation, runID)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s for %s update count: %w", operation, runID, err)
+	}
+	if affected != 1 {
+		return fmt.Errorf(
+			"%s for %s updated %d rows, expected 1",
+			operation,
+			runID,
+			affected,
+		)
+	}
+	return nil
 }
 
 func (s *planControlStore) ResolveWorkload(
@@ -248,6 +277,20 @@ func (s *planControlStore) ResolveWorkload(
 	return run, nil
 }
 
+func (s *planControlStore) MarkWorkloadsStale(ctx context.Context) error {
+	_, err := s.db.Exec(
+		ctx,
+		"UPDATE "+s.schema+".meta_runs SET phase=$1,status=$2,detail=$3,"+
+			"updated_at=current_timestamp WHERE status IN ($4,$5)",
+		string(PhaseStop),
+		"stale_report_only",
+		"stale workload; recovery remains operator controlled",
+		planWorkloadPreparingStatus,
+		planWorkloadRunningStatus,
+	)
+	return err
+}
+
 func (s *planControlStore) ResolveAnyWorkload(
 	ctx context.Context,
 ) (planRunRecord, error) {
@@ -265,9 +308,9 @@ func (s *planControlStore) ResolveAnyWorkload(
 	if len(runs) == 0 {
 		return planRunRecord{}, errPlanWorkloadNotFound
 	}
-	if len(runs) != 1 {
-		return planRunRecord{}, fmt.Errorf("multiple active plan workloads found: %d", len(runs))
-	}
+	// Rows are ordered newest first. Older active-looking rows can be stale
+	// metadata from an interrupted process; the activity lease determines
+	// liveness and runPlanInit marks all of them report-only when no lease lives.
 	return runs[0], nil
 }
 
@@ -280,7 +323,7 @@ func (s *planControlStore) ResolveFault(
 		"SELECT run_id,scenarios,phase,status,started_at FROM "+s.schema+
 			".meta_runs WHERE scenarios=$1 AND status IN ("+
 			"'running','stop_requested','restore_requested',"+
-			"'restore_failed','RESTORE_FAILED') "+
+			"'fault_failed_recovery_pending','restore_failed','RESTORE_FAILED') "+
 			"ORDER BY started_at DESC,run_id DESC",
 		fmt.Sprintf("%03d", code),
 	)

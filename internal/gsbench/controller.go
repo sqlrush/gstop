@@ -90,8 +90,83 @@ func (c Controller) RunUntil(ctx context.Context) ControlResult {
 	return c.run(ctx, true)
 }
 
-func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
-	cfg := c.Config
+// RunToMinimum monotonically increases pressure until consecutive real
+// samples prove the requested lower bound. It never reduces the actuator, so
+// its returned worker target can be frozen for the hold phase.
+func (c Controller) RunToMinimum(ctx context.Context) ControlResult {
+	cfg := normalizedControllerConfig(c.Config)
+	result := ControlResult{}
+	if c.Actuator == nil || c.Sample == nil {
+		result.Err = fmt.Errorf("controller actuator and sampler are required")
+		return result
+	}
+	if err := c.Actuator.SetTarget(cfg.MinWorkers); err != nil {
+		result.Err = err
+		return result
+	}
+	updateControlWorkers(&result, c.Actuator)
+	consecutive := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			result.Err = err
+			updateControlWorkers(&result, c.Actuator)
+			return result
+		}
+		sample := c.Sample(ctx)
+		result.Samples++
+		updateControlWorkers(&result, c.Actuator)
+		if sample.Err != nil || sample.Errors > 0 || !sample.Available {
+			result.Err = minimumTargetSampleError(sample)
+			return result
+		}
+		result.Measured = true
+		result.Actual = sample.Value
+		result.LastSuccessful = sample.Value
+		result.ReachableMax = max(result.ReachableMax, sample.Value)
+		if sample.Value >= cfg.Target {
+			consecutive++
+			if consecutive >= cfg.RequiredSamples {
+				result.Reached = true
+				return result
+			}
+		} else {
+			consecutive = 0
+			current := c.Actuator.Target()
+			if current >= cfg.MaxWorkers {
+				result.Ceiling = true
+				return result
+			}
+			step := actuatorRampAdjustment(cfg, sample, current)
+			if err := c.Actuator.SetTarget(
+				min(cfg.MaxWorkers, current+step),
+			); err != nil {
+				result.Err = err
+				return result
+			}
+			updateControlWorkers(&result, c.Actuator)
+		}
+		if err := waitContext(ctx, cfg.Interval); err != nil {
+			result.Err = err
+			updateControlWorkers(&result, c.Actuator)
+			return result
+		}
+	}
+}
+
+func minimumTargetSampleError(sample Sample) error {
+	switch {
+	case sample.Err != nil:
+		return sample.Err
+	case sample.Errors > 0:
+		return fmt.Errorf("workload execution errors=%d", sample.Errors)
+	case !sample.Available:
+		return fmt.Errorf("minimum target metric is unavailable")
+	default:
+		return nil
+	}
+}
+
+func normalizedControllerConfig(cfg ControllerConfig) ControllerConfig {
 	if cfg.MinWorkers <= 0 {
 		cfg.MinWorkers = 1
 	}
@@ -119,6 +194,11 @@ func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
 	if cfg.Tolerance <= 0 {
 		cfg.Tolerance = 2
 	}
+	return cfg
+}
+
+func (c Controller) run(ctx context.Context, continuous bool) ControlResult {
+	cfg := normalizedControllerConfig(c.Config)
 	if c.Actuator == nil {
 		return ControlResult{Err: fmt.Errorf("controller actuator is unavailable")}
 	}

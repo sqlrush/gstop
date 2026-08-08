@@ -1,6 +1,6 @@
-# gsbench v1.1.6 Linux ARM64 安装与操作手册
+# gsbench v1.1.8 Linux ARM64 安装与操作手册
 
-本文适用于 `gsbench v1.1.6` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
+本文适用于 `gsbench v1.1.8` Linux ARM64 发布包。完整功能、场景范围和结果含义见[使用说明](README.md)，配置项见[配置手册](CONFIG.md)。
 
 ## 1. 安装
 
@@ -13,8 +13,8 @@ uname -m
 输出应为 `aarch64` 或 `arm64`。将发布包复制到测试主机后执行：
 
 ```sh
-tar -xzf gsbench-v1.1.6-linux-arm64-20260804.tar.gz
-cd gsbench-v1.1.6-linux-arm64-20260804
+tar -xzf gsbench-v1.1.8-linux-arm64-YYYYMMDD.tar.gz
+cd gsbench-v1.1.8-linux-arm64-YYYYMMDD
 sha256sum -c SHA256SUMS
 chmod 0755 bin/gsbench
 chmod 0600 configs/gsbench.cfg
@@ -24,7 +24,7 @@ file bin/gsbench
 ./bin/gsbench scenarios
 ```
 
-`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.6`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
+`file` 应显示 ARM aarch64/ARM64 Linux 可执行文件，`version` 应显示 `v1.1.8`。如果发布包未附带 `SHA256SUMS`，应先向提供方取得校验值，不能跳过来源校验后直接在数据库主机运行。
 
 ## 2. 配置数据库连接
 
@@ -94,26 +94,27 @@ GSBENCH_CFG="$PWD/configs/gsbench.cfg"
 # 终端一：持续造流
 ./bin/gsbench run 601 init --worker 10 --duration 1m --config "$GSBENCH_CFG"
 
-# 终端二：等终端一显示 RUNNING 后执行
+# 终端二：等终端一显示 RUNNING 后注入故障，再展示恢复 SQL
 ./bin/gsbench run 601 fault --config "$GSBENCH_CFG"
 ./bin/gsbench run 601 recover --config "$GSBENCH_CFG"
 ```
 
 602–606 只需将三条命令换成同一编号。这六个场景会修改同一组执行计划状态，一次只能运行一个。`--duration` 从终端一显示 `RUNNING`、worker 开始造流时计时，不包含此前的基线准备时间，并需覆盖故障与恢复观察时间；在终端一第一次按 Ctrl+C 会立即停止流量并退出。
 
-`fault` 必须在同编号 `init` 仍存活时执行，它同步完成一次故障注入后退出。`recover` 同步、幂等地恢复同编号场景后退出；即使 `init` 已因 duration 到期或 Ctrl+C 退出，仍可执行 `recover`。
+`fault` 必须在同编号 `init` 仍存活时执行，它同步完成一次故障注入后退出。`recover` 只展示同编号场景的恢复 DDL/DML，不执行；即使 `init` 已退出，仍可查看建议。
 
 ## 4. 恢复与清理
 
-普通场景的 `run` 返回前会调用统一恢复协调器；601–606 的故障使用同编号 `run <code> recover` 恢复。看到 `RESTORE_FAILED`、stale run，或普通场景被异常中断时，按以下顺序处理：
+普通场景不会在 run 启动或结束时自动恢复。看到 stale run 或未完成动作时，先展示恢复建议：
 
 ```sh
-./bin/gsbench restore --config "$GSBENCH_CFG" --dry-run
 ./bin/gsbench restore --config "$GSBENCH_CFG"
 ./bin/gsbench status --config "$GSBENCH_CFG"
 ```
 
-只恢复一个运行时增加 `--run-id RUN_ID`。
+只查看一个运行时增加 `--run-id RUN_ID`。`restore` 扫描所有场景；`run 601-606 recover` 只展示对应场景。两类命令都不会执行 DDL/DML、终止会话或修改 journal/ledger，是否执行完全由用户决定。
+
+输出中的 `PENDING`、`UNVERIFIED` 或 `CONFLICT` 必须人工核对。执行建议 SQL 后再次运行相同命令，可只读复核当前状态。
 
 普通 cleanup 不删除测试数据；只有显式增加 `--data` 才删除数据：
 
@@ -122,7 +123,7 @@ GSBENCH_CFG="$PWD/configs/gsbench.cfg"
 ./bin/gsbench cleanup --config "$GSBENCH_CFG" --data
 ```
 
-`cleanup --data` 会执行 `DROP SCHEMA ... CASCADE`，不可恢复。执行前必须再次核对配置文件、数据库和 `data.schema`，确认没有 stale recovery、遗留测试会话，且该 schema 只包含可丢弃的测试数据。
+普通 `cleanup` 与 `stop` 只停止 gsbench 标记会话，不恢复元数据。`cleanup --data` 会执行 `DROP SCHEMA ... CASCADE`，不可恢复；执行前必须再次核对配置文件、数据库和 `data.schema`，确认该 schema 只包含可丢弃的测试数据。
 
 ## 5. `validation_enabled` 的边界
 
@@ -133,9 +134,9 @@ GSBENCH_CFG="$PWD/configs/gsbench.cfg"
 validation_enabled = false
 ```
 
-这只关闭模型预估、场景结果门槛、数据布局一致性和执行计划形态校验，不会关闭容量与物理大小检查、未知数据库版本拒绝、真实 DDL/DML/负载错误，也不会关闭恢复锁、journal/ledger 持久化、逆操作、计划基线修复和其他恢复安全边界。关闭验证不能把真实失败变成成功。
+该键在 v1.1.8 中只为兼容旧配置保留。模型、容量、物理大小、产品/拓扑、数据布局和执行计划检查始终只输出告警，不优化、不阻挡；真实 SQL、连接、负载和故障注入错误仍使当前场景失败。
 
-需要严格验收负载目标时，将其设为 `true`；此时未取得严格证据的运行不能算目标通过。
+Risk B/C 双重授权、SQL/schema 注入防护和持久变更前 journal 记录仍是硬边界。
 
 ## 6. 20 GiB 现场验证
 
@@ -168,4 +169,4 @@ GSBENCH_E2E_CFG=/absolute/path/gsbench-e2e.cfg
 
 应以 gsbench 输出的物理大小证据确认结果，而不能只按估算行数判断。完整的 65 场景串行运行、gstop 同步采样、19–21 GiB 判定和安全清理流程见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
 
-本版本的 Linux ARM64 二进制已在本地 `og5` openGauss 容器完成版本和命令烟测。为避免自动删除并重建既有 100GB 数据集上的大索引，发布验证未在主 schema 执行 601 的 `fault → recover`；客户环境首次执行前应预留索引转换和恢复时间。
+客户环境首次执行前应在专用测试 schema 完成最短时长演练。恢复输出是建议而不是自动修复；执行前必须人工确认目标对象、Ustore `ubtree` 兼容性、锁等待和业务影响。

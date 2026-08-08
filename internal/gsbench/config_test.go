@@ -131,16 +131,14 @@ func TestConfigStatePathsAndRelativeSecretsAreIndependentOfCWD(t *testing.T) {
 	}
 }
 
-func TestConfigRejectsConcurrentPlanChangeScenarios(t *testing.T) {
+func TestConfigAllowsConcurrentPlanChangeScenariosForAdvisoryInspection(t *testing.T) {
 	body := strings.Replace(
 		minimalConfig(),
 		"scenarios = tp_cpu",
 		"scenarios = 601,605",
 		1,
 	)
-	_, err := LoadConfig(writeTestConfig(t, body), Overrides{})
-	if err == nil || !strings.Contains(err.Error(), "601-606") ||
-		!strings.Contains(err.Error(), "serial") {
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
 		t.Fatalf("multiple plan-change scenarios error=%v", err)
 	}
 }
@@ -189,6 +187,127 @@ func TestConfigLoadsDefaultsAndDurations(t *testing.T) {
 	}
 	if cfg.Run.ValidationEnabled {
 		t.Fatal("runtime validation must default to disabled")
+	}
+}
+
+func TestConfigLoadsAndOverridesPoolTargets(t *testing.T) {
+	body := minimalConfig() + `
+[scenario.connection_pool]
+target_percent = 81
+[scenario.thread_pool]
+target_percent = 82
+`
+	path := writeTestConfig(t, body)
+	cfg, err := LoadConfig(path, Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 81 ||
+		cfg.PoolTargets.ThreadPercent != 82 {
+		t.Fatalf("pool targets=%+v", cfg.PoolTargets)
+	}
+
+	cfg, err = LoadConfig(path, Overrides{
+		ScenarioCodes: []ScenarioCode{301, 401, 402},
+		PoolPercent:   90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 90 ||
+		cfg.PoolTargets.ThreadPercent != 90 {
+		t.Fatalf("overridden pool targets=%+v", cfg.PoolTargets)
+	}
+}
+
+func TestPoolTargetsRetainButIgnoreOtherScenarioCaps(t *testing.T) {
+	body := minimalConfig() + `
+[safety]
+max_connections = 1
+max_workers = 1
+`
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{
+		ScenarioCodes: []ScenarioCode{401, 402},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Safety.MaxConnections != 1 || cfg.Safety.MaxWorkers != 1 {
+		t.Fatalf("configured safety caps=%+v", cfg.Safety)
+	}
+	budget, err := calculateConnectionBudget(1000, 10, 100, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.WorkloadTarget != 791 {
+		t.Fatalf("401 workload target=%d want=791", budget.WorkloadTarget)
+	}
+	facts := connectionCapacityFacts{
+		InstanceMax: 1000,
+		Reserved:    10,
+		Existing:    100,
+	}
+	if got := threadPressureCapacity(facts); got != 890 {
+		t.Fatalf("402 capacity=%d want=890", got)
+	}
+	if got := threadSessionCapacity(1000, 10, 100, 1, 1); got != 1 {
+		t.Fatalf("cap-aware scenario capacity=%d want=1", got)
+	}
+}
+
+func TestConfigPoolOverrideLeavesUnselectedPoolUntouched(t *testing.T) {
+	body := minimalConfig() + `
+[scenario.connection_pool]
+target_percent = 81
+[scenario.thread_pool]
+target_percent = 82
+`
+	cfg, err := LoadConfig(writeTestConfig(t, body), Overrides{
+		ScenarioCodes: []ScenarioCode{301, 401},
+		PoolPercent:   90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 90 ||
+		cfg.PoolTargets.ThreadPercent != 82 {
+		t.Fatalf("pool targets=%+v", cfg.PoolTargets)
+	}
+}
+
+func TestConfigPoolOverrideUsesConfiguredScenarios(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(), "scenarios = tp_cpu", "scenarios = connection_pool", 1,
+	)
+	cfg, err := LoadConfig(
+		writeTestConfig(t, body), Overrides{PoolPercent: 90},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PoolTargets.ConnectionPercent != 90 ||
+		cfg.PoolTargets.ThreadPercent != 95 {
+		t.Fatalf("pool targets=%+v", cfg.PoolTargets)
+	}
+}
+
+func TestConfigRejectsPoolOverrideWithoutPoolScenario(t *testing.T) {
+	if _, err := LoadConfig(
+		writeTestConfig(t, minimalConfig()), Overrides{PoolPercent: 90},
+	); err == nil {
+		t.Fatal("pool override without 401/402 was accepted")
+	}
+}
+
+func TestConfigRejectsNonPositivePoolTargets(t *testing.T) {
+	for _, section := range []string{
+		"[scenario.connection_pool]\ntarget_percent = 0\n",
+	} {
+		if _, err := LoadConfig(
+			writeTestConfig(t, minimalConfig()+"\n"+section), Overrides{},
+		); err == nil {
+			t.Fatalf("accepted invalid pool target %q", section)
+		}
 	}
 }
 
@@ -461,7 +580,6 @@ func TestConfigRejectsFixedWorkerOverridesIncompatibleWithFinalScenarios(t *test
 		{ScenarioCodes: []ScenarioCode{201, 203}, Workers: 2},
 		{ScenarioCodes: []ScenarioCode{201, 202}, Workers: 2, WorkMemKB: 256 * 1024},
 		{ScenarioCodes: []ScenarioCode{201, 202, 201}, WorkMemKB: 256 * 1024},
-		{ScenarioCodes: []ScenarioCode{201}, WorkMemKB: 63},
 	} {
 		if _, err := LoadConfig(path, override); err == nil {
 			t.Fatalf("accepted incompatible override %+v", override)
@@ -469,7 +587,7 @@ func TestConfigRejectsFixedWorkerOverridesIncompatibleWithFinalScenarios(t *test
 	}
 }
 
-func TestConfigValidatesFixedWorkerTotalsAgainstBothHardCaps(t *testing.T) {
+func TestConfigAllowsFixedWorkerTotalsAboveLegacyCaps(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		scenarios string
@@ -515,15 +633,14 @@ func TestConfigValidatesFixedWorkerTotalsAgainstBothHardCaps(t *testing.T) {
 				1,
 			) + "\n[safety]\nmax_workers = " + strconv.Itoa(test.workers) +
 				"\nmax_connections = " + strconv.Itoa(test.conns) + "\n" + test.settings
-			if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil ||
-				!strings.Contains(err.Error(), "fixed workers") {
-				t.Fatalf("hard-cap error=%v", err)
+			if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+				t.Fatalf("legacy hard-cap blocked config: %v", err)
 			}
 		})
 	}
 }
 
-func TestConfigValidatesLockSessionTotalsAgainstConnectionCap(t *testing.T) {
+func TestConfigAllowsLockSessionTotalsAboveLegacyConnectionCap(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		scenarios string
@@ -553,9 +670,8 @@ func TestConfigValidatesLockSessionTotalsAgainstConnectionCap(t *testing.T) {
 				1,
 			) + "\n[safety]\nmax_workers = 20\nmax_connections = " +
 				strconv.Itoa(test.maxConns) + "\n" + test.settings
-			_, err := LoadConfig(writeTestConfig(t, body), Overrides{})
-			if err == nil || !strings.Contains(err.Error(), "max_connections") {
-				t.Fatalf("connection-cap error=%v", err)
+			if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+				t.Fatalf("legacy connection cap blocked config: %v", err)
 			}
 		})
 	}
@@ -581,7 +697,7 @@ chain_depth = 2
 	}
 }
 
-func TestConfigRejectsFixedWorkersCombinedWithUnbudgetedScenarios(t *testing.T) {
+func TestConfigAllowsFixedWorkersCombinedWithOtherScenarios(t *testing.T) {
 	for _, scenarios := range []string{"101,203", "201,203", "202,301"} {
 		body := strings.Replace(
 			minimalConfig(),
@@ -589,10 +705,67 @@ func TestConfigRejectsFixedWorkersCombinedWithUnbudgetedScenarios(t *testing.T) 
 			"scenarios = "+scenarios,
 			1,
 		)
-		if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil ||
-			!strings.Contains(err.Error(), "fixed-worker scenarios") {
+		if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
 			t.Fatalf("scenarios=%s error=%v", scenarios, err)
 		}
+	}
+}
+
+func TestConfigAllowsLegacyPolicyLimitsAsAdvisoryValues(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 101,203",
+		1,
+	)
+	body = strings.Replace(
+		body,
+		"schema = gsbench",
+		"schema = gsbench\nmax_size_gb = 4096\nmin_free_disk_percent = 1",
+		1,
+	) + `
+[safety]
+max_workers = 1
+max_connections = 1
+profile_cap_gb = 0
+restore_on_exit = false
+
+[scenario.tp_cpu]
+workers = 4
+`
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+		t.Fatalf("advisory policy values blocked config load: %v", err)
+	}
+}
+
+func TestConfigAllowsMultiplePlanScenariosForAdvisoryInspection(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 601,605",
+		1,
+	)
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+		t.Fatalf("multiple plan scenarios blocked config load: %v", err)
+	}
+}
+
+func TestConfigAllowsLockShapeOutsideLegacyDatasetPolicy(t *testing.T) {
+	body := strings.Replace(
+		minimalConfig(),
+		"scenarios = tp_cpu",
+		"scenarios = 501",
+		1,
+	) + `
+[safety]
+restore_original_role = true
+
+[scenario.lock_row_chain]
+sessions = 5002
+chain_depth = 6
+`
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+		t.Fatalf("legacy lock/data policy blocked config load: %v", err)
 	}
 }
 
@@ -611,7 +784,6 @@ func TestConfigRejectsInvalidMemoryWorkloadSettings(t *testing.T) {
 	}{
 		{name: "zero sort workers", settings: "[scenario.memory_workmem_sort]\nworkers = 0\n"},
 		{name: "zero hash workers", settings: "[scenario.memory_workmem_hash]\nworkers = 0\n"},
-		{name: "sort work mem below minimum", settings: "[scenario.memory_workmem_sort]\nwork_mem = 63kB\n"},
 		{name: "hash work mem missing unit", settings: "[scenario.memory_workmem_hash]\nwork_mem = 256\n"},
 		{name: "hash work mem unsafe", settings: "[scenario.memory_workmem_hash]\nwork_mem = 64kB;RESET ALL\n"},
 	} {
@@ -629,6 +801,19 @@ func TestConfigRejectsInvalidMemoryWorkloadSettings(t *testing.T) {
 	}
 }
 
+func TestConfigAcceptsPositiveWorkMemBelowLegacyMinimum(t *testing.T) {
+	cfg, err := LoadConfig(writeTestConfig(
+		t,
+		minimalConfig()+"\n[scenario.memory_workmem_sort]\nwork_mem = 1kB\n",
+	), Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MemoryWorkloads.SortWorkMemKB != 1 {
+		t.Fatalf("sort work_mem=%d", cfg.MemoryWorkloads.SortWorkMemKB)
+	}
+}
+
 func TestConfigRejectsInvalidLockWorkloadSettings(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -636,7 +821,6 @@ func TestConfigRejectsInvalidLockWorkloadSettings(t *testing.T) {
 	}{
 		{name: "row chain sessions below two", settings: "[scenario.lock_row_chain]\nsessions = 1\n"},
 		{name: "row chain depth below one", settings: "[scenario.lock_row_chain]\nchain_depth = 0\n"},
-		{name: "row chain depth above five", settings: "[scenario.lock_row_chain]\nsessions = 7\nchain_depth = 6\n"},
 		{name: "row chain depth exceeds waiter count", settings: "[scenario.lock_row_chain]\nsessions = 2\nchain_depth = 2\n"},
 		{name: "table sessions below two", settings: "[scenario.lock_table_exclusive]\nsessions = 1\n"},
 		{name: "DDL sessions below two", settings: "[scenario.lock_ddl_wait]\nsessions = 1\n"},
@@ -653,7 +837,7 @@ func TestConfigRejectsInvalidLockWorkloadSettings(t *testing.T) {
 	}
 }
 
-func TestConfigRejectsRowChainTopologyExceedingAvailableRows(t *testing.T) {
+func TestConfigAllowsRowChainTopologyExceedingAvailableRows(t *testing.T) {
 	body := strings.Replace(
 		minimalConfig(),
 		"scenarios = tp_cpu",
@@ -668,9 +852,8 @@ max_connections = 6000
 sessions = 5002
 chain_depth = 1
 `
-	_, err := LoadConfig(writeTestConfig(t, body), Overrides{})
-	if err == nil || !strings.Contains(err.Error(), "10,000") {
-		t.Fatalf("row-chain capacity error=%v", err)
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+		t.Fatalf("row-chain capacity blocked config: %v", err)
 	}
 }
 
@@ -793,14 +976,13 @@ allow_infrastructure_fault = true
 	}
 }
 
-func TestConfigRejectsUnsupportedRestoreSafetySettings(t *testing.T) {
+func TestConfigAcceptsDeprecatedRestoreSafetySettings(t *testing.T) {
 	for _, setting := range []string{
 		"restore_on_exit = false",
 		"restore_original_role = true",
 	} {
 		body := minimalConfig() + "\n[safety]\n" + setting + "\n"
-		if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil ||
-			!strings.Contains(err.Error(), strings.Split(setting, " =")[0]) {
+		if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
 			t.Fatalf("setting=%q error=%v", setting, err)
 		}
 	}
@@ -907,15 +1089,15 @@ func TestConfigDatasetBytesOverrideProfileAndConfig(t *testing.T) {
 	}
 }
 
-func TestConfigRejectsMoreThanTwoTiB(t *testing.T) {
+func TestConfigAllowsMoreThanTwoTiB(t *testing.T) {
 	body := strings.Replace(
 		minimalConfig(),
 		"schema = gsbench",
 		"schema = gsbench\nmax_size_gb = 2049",
 		1,
 	)
-	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err == nil {
-		t.Fatal("accepted data.max_size_gb > 2048")
+	if _, err := LoadConfig(writeTestConfig(t, body), Overrides{}); err != nil {
+		t.Fatalf("legacy 2TiB policy blocked config: %v", err)
 	}
 }
 

@@ -67,12 +67,19 @@ func TestDatasetChecksDiskCapacityBetweenBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &guardedDatasetExecutor{recordingDatasetExecutor: recordingDatasetExecutor{completed: map[string]int64{}}}
-	err = NewDatasetManager(exec).Init(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "disk safety") {
-		t.Fatalf("err=%v", err)
+	var reports []string
+	err = NewDatasetManager(exec, func(format string, args ...any) {
+		reports = append(reports, fmt.Sprintf(format, args...))
+	}).Init(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("advisory disk threshold blocked init: %v", err)
 	}
-	if exec.checks != 1 {
-		t.Fatalf("capacity checks=%d", exec.checks)
+	if exec.checks < 2 {
+		t.Fatalf("capacity checks=%d, want repeated advisory checks", exec.checks)
+	}
+	if !strings.Contains(strings.Join(reports, "\n"), "PRECHECK_WARN") ||
+		!strings.Contains(strings.Join(reports, "\n"), "disk_safety_threshold_reached") {
+		t.Fatalf("reports=%v", reports)
 	}
 }
 
@@ -102,21 +109,22 @@ func TestDatasetStressPlanDefaultsToAtMostTwentyGB(t *testing.T) {
 	}
 }
 
-func TestDatasetExplicitSizeCannotExceedProfileCap(t *testing.T) {
+func TestDatasetExplicitSizeIgnoresLegacyProfileCap(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.TargetBytes = 100 << 30
 	cfg.Safety.ProfileCapGB = 64
-	_, err := PlanDataset(cfg, Capacity{TotalBytes: 1 << 40, FreeBytes: 1 << 40}, testDatasetEnvironment())
-	if err == nil || !strings.Contains(err.Error(), "profile cap") {
-		t.Fatalf("error=%v", err)
+	plan, err := PlanDataset(cfg, Capacity{TotalBytes: 1 << 40, FreeBytes: 1 << 40}, testDatasetEnvironment())
+	if err != nil || plan.EstimatedBytes != 100<<30 {
+		t.Fatalf("plan=%+v error=%v", plan, err)
 	}
 }
 
-func TestDatasetRejectsTargetAboveTwoTiB(t *testing.T) {
+func TestDatasetAllowsTargetAboveLegacyTwoTiBBoundary(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.TargetBytes = (2 << 40) + 1
-	if _, err := PlanDataset(cfg, Capacity{TotalBytes: 4 << 40, FreeBytes: 4 << 40}, testDatasetEnvironment()); err == nil {
-		t.Fatal("accepted dataset target above 2TiB")
+	plan, err := PlanDataset(cfg, Capacity{TotalBytes: 4 << 40, FreeBytes: 4 << 40}, testDatasetEnvironment())
+	if err != nil || plan.EstimatedBytes != (2<<40)+1 {
+		t.Fatalf("plan=%+v error=%v", plan, err)
 	}
 }
 
@@ -150,15 +158,16 @@ func TestDatasetReusePolicyRejectsExistingSchemaWithoutDroppingIt(t *testing.T) 
 	}
 }
 
-func TestDatasetRejectsTargetBelowOneGiB(t *testing.T) {
+func TestDatasetAllowsTargetBelowLegacyOneGiBBoundary(t *testing.T) {
 	cfg := datasetConfig("quick", 5)
 	cfg.Data.TargetBytes = (1 << 30) - 1
-	if _, err := PlanDataset(
+	plan, err := PlanDataset(
 		cfg,
 		Capacity{TotalBytes: 20 << 30, FreeBytes: 20 << 30},
 		Environment{Product: ProductOpenGauss, Topology: TopologyStandalone},
-	); err == nil {
-		t.Fatal("accepted dataset target below 1GiB")
+	)
+	if err != nil || plan.EstimatedBytes != (1<<30)-1 {
+		t.Fatalf("plan=%+v error=%v", plan, err)
 	}
 }
 
@@ -211,15 +220,13 @@ func TestDatasetPlanContainsNoIfNotExistsDDL(t *testing.T) {
 	}
 }
 
-func TestDatasetPlanFailsWhenSafeFreeSpaceIsTooSmall(t *testing.T) {
-	_, err := PlanDataset(datasetConfig("quick", 5), Capacity{TotalBytes: 100 << 30, FreeBytes: 15 << 30}, testDatasetEnvironment())
-	if err == nil {
-		t.Fatal("expected disk reserve error")
+func TestDatasetPlanReportsButDoesNotRejectInsufficientCapacity(t *testing.T) {
+	plan, err := PlanDataset(datasetConfig("quick", 5), Capacity{TotalBytes: 100 << 30, FreeBytes: 15 << 30}, testDatasetEnvironment())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, field := range []string{"target=", "free=", "reserved=", "safe_available="} {
-		if !strings.Contains(err.Error(), field) {
-			t.Errorf("capacity diagnostic missing %q: %v", field, err)
-		}
+	if plan.EstimatedBytes != 5<<30 || plan.AvailableForData >= plan.EstimatedBytes {
+		t.Fatalf("capacity facts lost from plan: %+v", plan)
 	}
 }
 
@@ -1014,7 +1021,7 @@ func TestDatasetInitCatalogChecksAndValidatesExistingObjects(t *testing.T) {
 	}
 }
 
-func TestDatasetInitValidatesExistingTablesBeforeCreatingIndexes(t *testing.T) {
+func TestDatasetInitReportsExistingTableMismatchAndContinues(t *testing.T) {
 	plan, err := PlanDataset(
 		datasetConfig("quick", 1),
 		Capacity{TotalBytes: 20 << 30, FreeBytes: 20 << 30},
@@ -1043,14 +1050,21 @@ func TestDatasetInitValidatesExistingTablesBeforeCreatingIndexes(t *testing.T) {
 		},
 		version: datasetVersion,
 	}
-	err = NewDatasetManager(exec).Init(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "validate dataset table accounts") {
-		t.Fatalf("err=%v", err)
+	var progress []string
+	err = NewDatasetManager(exec, func(format string, args ...any) {
+		progress = append(progress, fmt.Sprintf(format, args...))
+	}).Init(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
 	}
+	created := false
 	for _, statement := range exec.statements {
 		if strings.HasPrefix(statement, "CREATE INDEX accounts_customer_idx ") {
-			t.Fatalf("dependent index was created before table validation: %s", statement)
+			created = true
 		}
+	}
+	if !created || !strings.Contains(strings.Join(progress, "\n"), "table_contract") {
+		t.Fatalf("created=%t progress=%v", created, progress)
 	}
 }
 

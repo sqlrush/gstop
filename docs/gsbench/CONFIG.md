@@ -1,4 +1,4 @@
-# gsbench v1.1.6 配置手册
+# gsbench v1.1.8 配置手册
 
 发布包的基准配置是 [`configs/gsbench.cfg`](../../configs/gsbench.cfg)。建议复制后修改并保持 `0600` 权限；不要新增程序未读取的“占位配置”。安装和命令流程见[安装手册](INSTALL.md)。
 
@@ -74,24 +74,23 @@ validation_enabled = false
 - `ramp_interval`：控制器调节间隔，必须大于 0。
 - `profile`：只允许 `quick` 或 `stress`。
 - `dry_run`：只展示/检查动作，不执行工作负载修改；命令行 `--dry-run` 会覆盖它。
-- `validation_enabled`：运行时验证总开关，发布配置默认 `false`。
+- `validation_enabled`：兼容旧配置保留；v1.1.8 的适用性、容量、数据、元数据和计划检查始终为告警模式。
 
-默认关闭验证只跳过：
+v1.1.8 的检查策略：
 
-- 模型预估；
-- 场景结果门槛；
-- 数据布局一致性判断。
-- 执行计划形态严格校验。
+- 运行前只读扫描模型、容量、物理大小、产品/拓扑、数据布局和执行计划；
+- 不符合预期时输出 `PRECHECK_WARN`，不自动优化，不阻挡场景；
+- 结果门槛或验证不满足时以 `COMPLETED_WITH_WARNINGS` 结束；
+- 一个场景的真实执行错误不阻塞同一命令中的后续场景。
 
-以下安全与真实性检查不会随之关闭：
+以下边界仍然硬失败：
 
-- 容量检测和物理大小测量；
-- 未知数据库版本拒绝及产品/拓扑前置检查；
 - 真实 DDL、DML、查询和负载错误；
-- 恢复锁、数据库 journal、本地 ledger、逆操作和 stale recovery；
-- schema 标识符、数据上限、风险授权等硬性配置边界。
+- schema/SQL 标识符、参数语法和注入防护；
+- Risk B/C 配置与命令行双重授权；
+- 持久变更前 journal/ledger 记录失败。
 
-关闭验证不能把错误降级为成功。需要判定“是否达到 CPU/连接池/线程池目标”或执行全场景验收时必须设置 `validation_enabled=true`；详见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
+`validation_enabled=true` 不会恢复旧版强制门禁或自动优化行为。
 
 601–606 共用计划基线，每次只能选择一个并串行运行。它们不再接受原来的单条 `run -s 601 -d 2m`；使用两个终端的三阶段命令，例如：
 
@@ -104,11 +103,9 @@ gsbench run 601 fault --config /absolute/path/gsbench.cfg
 gsbench run 601 recover --config /absolute/path/gsbench.cfg
 ```
 
-602–606 使用相同语法并替换为同一个编号。`fault` 必须在对应 `init` 存活且显示 `RUNNING` 后启动；`recover` 在 `init` 退出后仍可执行。三阶段命令不接受 `--dry-run`，避免把没有真实执行的故障或恢复误报为预览成功。
+602–606 使用相同语法并替换为同一个编号。`fault` 必须在对应 `init` 存活且显示 `RUNNING` 后启动；`recover` 在 `init` 退出后仍可执行，但只展示该编号的恢复 DDL/DML，不执行恢复。
 
-601 从 v1.1.4 起使用 `(lookup_key,dist_key)` 复合唯一索引按 lookup key 点查。已有数据集的
-同名普通索引会在第一次基线准备时转换为唯一索引；`fault` 删除索引，`recover`
-重建索引。数据量较大时，应确保 `safety.restore_timeout` 能覆盖索引创建时间。
+601 使用 `(lookup_key,dist_key)` 复合唯一索引按 lookup key 点查。缺少索引或定义不符只告警，gsbench 不再自动转换；`fault` 删除索引，`recover` 展示重建 DDL。未显式要求索引方法时，`btree` 与 Ustore 的 `ubtree` 等价；显式方法仍严格匹配。
 
 ## `[data]` 数据集
 
@@ -124,16 +121,16 @@ physical_size_provider = auto
 ```
 
 - `schema`：测试 schema；只允许安全 SQL 标识符。不得指向业务 schema。
-- `max_size_gb`：未传 `init --size` 时的目标大小；必须为正数，最大 2048 GiB。
-- `min_free_disk_percent`：必须在 10–90 之间，默认保留 20% 空间。
+- `max_size_gb`：未传 `init --size` 时的目标大小；必须为正数。旧版策略上限不再阻挡运行。
+- `min_free_disk_percent`：兼容旧配置保留，只用于输出磁盘余量告警。
 - `reuse_existing`：是否续用已有测试 schema。专用一次性验收建议设为 `false`；若 schema 已存在，初始化会拒绝并要求先安全处理。
 - `capacity_provider`：`auto`、`local_data_directory` 或 `tablespace_quota`。
 - `data_directory_host_root`：仅用于本地数据库位于 chroot 时拼接宿主机前缀；非空值必须是绝对路径。
 - `physical_size_provider`：`auto` 或 `catalog`。
 
-`init --size` 接受 1GB–2TB，例如 `20GB`、`100GB`、`1.5TB`，同时受 `safety.profile_cap_gb` 限制。`auto` 对本机 loopback/Unix endpoint 使用服务端精确 `data_directory`；远程集中式目标需要有限的 `pg_tablespace.spcmaxsize` 配额。当前发布版没有已验证的分布式逐主 DN 容量与物理大小 provider，不能把缺失证据当作成功。
+`init --size` 接受带单位的正数，例如 `20GB`、`100GB`、`1.5TB`。`safety.profile_cap_gb`、磁盘余量和 provider 能力只产生告警，不再裁剪目标或拒绝执行。
 
-## `[safety]` 硬边界
+## `[safety]` 风险授权与兼容配置
 
 ```ini
 [safety]
@@ -151,11 +148,10 @@ allow_database_restart = false
 restart_command =
 ```
 
-- `max_connections`、`max_workers`：连接与 worker 的全局硬上限，必须为正数。固定 worker 和 501–503 的 workload 会话在启动前累计检查；运行中绝不会动态调整请求的并发数。
-- `query_timeout`、`restore_timeout`：查询和恢复超时，必须大于 0。
-- `profile_cap_gb`：数据集硬上限，1–2048 GiB；必须不小于 `init --size`。
-- `restore_on_exit`：必须为 `true`；设为 `false` 会被拒绝。
-- `restore_original_role`：当前 provider 不支持，必须为 `false`。
+- `max_connections`、`max_workers`、`profile_cap_gb`：旧版策略限制，v1.1.8 仅兼容读取并输出弃用告警，不裁剪目标。
+- `query_timeout`：真实查询超时，必须大于 0。
+- `restore_timeout`：兼容旧恢复实现保留；只读恢复规划不会用它执行 DDL/DML。
+- `restore_on_exit`、`restore_original_role`：弃用配置；任何取值都不会触发自动恢复或角色恢复。
 - `allow_admin_mutation`：Risk B 配置授权；仍须命令行显式传 `--allow-risk B` 或 `C`。
 - `allow_infrastructure_fault`：Risk C 配置授权；仍须 `--allow-risk C` 和已注册外部 provider。
 - `allow_instance_parameter_change`、`allow_database_restart`、`restart_command`：实例参数/重启的附加边界；启用重启时 `restart_command` 不能为空。
@@ -195,10 +191,10 @@ type = none
 | `scenario.lock_table_exclusive` | `sessions` | 2 | 502 workload 会话总数，包含 1 个 holder 和其余 waiter |
 | `scenario.lock_ddl_wait` | `sessions` | 2 | 503 workload 会话总数，包含 1 个 holder 和其余 waiter |
 | `scenario.memory_total_pressure` | `workers` | 4 | 有界内存压力 worker 数，不代表主机内存百分比 |
-| `scenario.connection_pool` | `target_percent` | 95 | 401 连接池目标百分比 |
+| `scenario.connection_pool` | `target_percent` | 95 | 401 连接池目标百分比；CLI `--percent` 仅在选中 401 时覆盖 |
 |  | `idle_percent` | 60 | 目标连接中的 idle 比例 |
 |  | `idle_in_transaction_percent` | 20 | 目标连接中的 idle in transaction 比例 |
-| `scenario.thread_pool` | `target_percent` | 95 | 402 线程池目标百分比 |
+| `scenario.thread_pool` | `target_percent` | 95 | 402 线程池目标百分比；CLI `--percent` 仅在选中 402 时覆盖 |
 | `scenario.vacuum_pressure` | `mode` | `vacuum` | vacuum 模式 |
 |  | `allow_vacuum_full` | false | 是否允许高风险 `VACUUM FULL` |
 |  | `minimum_slowdown` | 1.5 | 严格验证时的最小变慢倍数 |
@@ -211,6 +207,8 @@ type = none
 gsbench run 101 --workers 16 --duration 60s
 gsbench run 102 --workers 4 --duration 60s
 gsbench run 103 --tp-workers 12 --ap-workers 2 --duration 60s
+gsbench run 401 --percent 90 --duration 5m
+gsbench run 402 --percent 90 --duration 5m
 gsbench run 501 --sessions 10 --chain-depth 3 --duration 1m
 gsbench run 502 --sessions 10 --duration 1m
 gsbench run 503 --sessions 10 --duration 1m
@@ -218,7 +216,15 @@ gsbench run 503 --sessions 10 --duration 1m
 
 CLI worker 参数覆盖上述场景配置。103 的总并发为 `tp_workers + ap_workers`；所有 worker 先建立独立 tagged session 并等待同一个启动屏障，加压计时开始后才统一执行。
 
-201/202 的命令行覆盖一次只允许选择一个场景，例如 `gsbench run 201 --workers 8 --work-mem 256MB --duration 1m`。配置文件可以同时选择 201 和 202，并分别使用各自的 `workers/work_mem`；配置校验会累计两者 worker 数。固定 worker 场景不能与未纳入并发预算的场景混跑；501–503 已纳入连接预算，可以与固定 worker 场景组合，但所有 worker 和锁 workload 会话的总数必须不超过 `safety.max_connections`。
+`--percent` 只允许 `run` 且最终场景必须包含 401 或 402；同一值覆盖所有选中的池场景。401 使用 `max_connections - sysadmin_reserved_connections` 为容量分母，只创建基线到目标之间的连接差值；402 优先使用 `global_threadpool_status`。目标低于基线、超过 100%、指标缺失或物理余量不足会输出告警，不再因 gsbench 策略门禁提前退出；数据库真实拒绝连接仍使当前场景失败。
+
+达标后 401/402 停止增加并保持本次资源到 duration 结束。正常结束、失败和 Ctrl+C 会关闭本次创建的 tagged 会话；数据库自身 idle thread-pool worker 的销毁不由 gsbench 控制。
+
+新 run 只报告 stale run、database journal 和 local ledger 的待恢复动作，不执行 stale recovery，也不阻塞后续场景。使用 `gsbench restore` 展示全部人工恢复 SQL。
+
+`gsbench restore` 与 `gsbench run 601-606 recover` 均为只读恢复规划：只发现、校验和展示 DDL/DML/人工动作，不申请恢复锁、不执行逆操作、不修改 journal/ledger。
+
+201/202 的命令行覆盖一次只允许选择一个场景，例如 `gsbench run 201 --workers 8 --work-mem 256MB --duration 1m`。不同并发模型可以组合；旧版累计 worker/连接预算只输出告警，不再使用 `safety.max_connections` 拒绝运行。
 
 `--sessions` 只允许所选场景全部属于 501–503，并对每个所选场景分别生效。`--chain-depth` 要求选择中包含 501，只影响 501；502、503 不人工构造多层等待链。501 还要求 `sessions >= chain_depth + 1`。gsbench 自身的控制、元数据和观测连接不计入 `sessions`。
 
@@ -246,6 +252,6 @@ profile_cap_gb = 256
 export GSBENCH_E2E_SCHEMA=gsbench_e2e_20260801
 ```
 
-验证必须在能连接 openGauss/GaussDB 的 Linux 主机完成，使用专用 schema，并逐场景串行执行。`cleanup --data` 会不可恢复地删除整个 schema；失败或中断时应保留数据和证据，先 restore/status，再决定是否手工清理。完整门禁和命令见[全场景串行验证手册](FULL_SCENARIO_TEST.md)。
+验证必须在能连接 openGauss/GaussDB 的 Linux 主机完成，并使用专用 schema。`cleanup --data` 会不可恢复地删除整个 schema；失败或中断时先用 `restore` 查看人工恢复 SQL，确认自行执行完成后再决定是否清理数据。
 
 当前 macOS 构建环境未完成 GaussDB live、20 GiB 初始化或真实负载验收；本配置手册不能作为这些现场测试已完成的证明。

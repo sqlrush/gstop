@@ -17,6 +17,7 @@ import (
 type fakeRestoreLock struct {
 	events *[]string
 	held   *bool
+	err    error
 }
 
 func (l fakeRestoreLock) Release() error {
@@ -24,7 +25,7 @@ func (l fakeRestoreLock) Release() error {
 	if l.held != nil {
 		*l.held = false
 	}
-	return nil
+	return l.err
 }
 
 type fakeRestoreBackend struct {
@@ -156,7 +157,11 @@ func (f *fakeRestoreBackend) AcquireRestoreLock(context.Context) (RestoreLock, e
 		return nil, err
 	}
 	f.lockHeld = true
-	return fakeRestoreLock{events: &f.events, held: &f.lockHeld}, nil
+	return fakeRestoreLock{
+		events: &f.events,
+		held:   &f.lockHeld,
+		err:    f.fail["unlock"],
+	}, nil
 }
 
 func (f *fakeRestoreBackend) DiscoverRestore(
@@ -296,6 +301,116 @@ func TestRestoreCoordinatorRunsExactSafetyOrder(t *testing.T) {
 	}
 	if !reflect.DeepEqual(backend.events, want) {
 		t.Fatalf("events=%v want=%v", backend.events, want)
+	}
+}
+
+func TestPrepareRestorePlanPreservesScenarioCodes(t *testing.T) {
+	discovery := RestoreDiscovery{Runs: []RestoreRun{{
+		RunID: "pool-run", ScenarioCodes: []ScenarioCode{401, 402},
+	}}}
+	runs, actions, err := prepareRestorePlan(discovery, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 || len(runs) != 1 ||
+		!reflect.DeepEqual(
+			runs[0].ScenarioCodes,
+			[]ScenarioCode{401, 402},
+		) {
+		t.Fatalf("runs=%+v actions=%+v", runs, actions)
+	}
+}
+
+func TestRestoreSummaryRetainsDiscoveredRunMetadataOnFailure(t *testing.T) {
+	backend := &fakeRestoreBackend{
+		discovery: RestoreDiscovery{Runs: []RestoreRun{{
+			RunID: "pool-run", ScenarioCodes: []ScenarioCode{401},
+		}}},
+		fail: map[string]error{
+			"stop:pool-run": errors.New("stop failed"),
+		},
+	}
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{},
+	)
+	if !summary.Failed || len(summary.Runs) != 1 ||
+		!summary.DiscoveryComplete || !summary.RestoreLockReleased ||
+		!reflect.DeepEqual(
+			summary.Runs[0].ScenarioCodes,
+			[]ScenarioCode{401},
+		) {
+		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+func TestRestoreSummaryDoesNotProveIncompleteDiscovery(t *testing.T) {
+	backend := &fakeRestoreBackend{
+		discovery: RestoreDiscovery{Runs: []RestoreRun{{
+			RunID: "pool-run", ScenarioCodes: []ScenarioCode{401},
+		}}},
+		fail: map[string]error{"discover": errors.New("discover failed")},
+	}
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{},
+	)
+	if !summary.Failed || summary.DiscoveryComplete {
+		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+func TestRestoreSummaryDoesNotProveFailedLockRelease(t *testing.T) {
+	backend := &fakeRestoreBackend{
+		discovery: RestoreDiscovery{Runs: []RestoreRun{{
+			RunID: "pool-run", ScenarioCodes: []ScenarioCode{401},
+		}}},
+		fail: map[string]error{"unlock": errors.New("unlock failed")},
+	}
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{},
+	)
+	if !summary.Failed || summary.RestoreLockReleased {
+		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+func TestRestoreSummaryMarksAfterSuccessFailureAsStartupFailure(t *testing.T) {
+	backend := &fakeRestoreBackend{discovery: RestoreDiscovery{
+		Runs: []RestoreRun{{
+			RunID: "pool-run", ScenarioCodes: []ScenarioCode{401},
+		}},
+	}}
+	summary := NewRestoreCoordinator(backend).Restore(
+		context.Background(),
+		RestoreRequest{afterSuccess: func(
+			context.Context,
+			RestoreLock,
+		) error {
+			return errors.New("start new run failed")
+		}},
+	)
+	if !summary.Failed || !summary.AfterSuccessAttempted {
+		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+func TestParseStoredScenarioCodesIsStrict(t *testing.T) {
+	codes, err := parseStoredScenarioCodes("401,402")
+	if err != nil || !reflect.DeepEqual(
+		codes,
+		[]ScenarioCode{401, 402},
+	) {
+		t.Fatalf("codes=%v err=%v", codes, err)
+	}
+	for _, value := range []string{
+		"", "401,401", "401,unknown", "401,999",
+		"401,,402", ",401", "401,",
+	} {
+		if _, err := parseStoredScenarioCodes(value); err == nil {
+			t.Fatalf("accepted stored scenarios %q", value)
+		}
 	}
 }
 

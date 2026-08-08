@@ -13,6 +13,359 @@ type BaselineRepairResult struct {
 	Status string
 }
 
+type PlanBaselineFinding struct {
+	ScenarioCodes []ScenarioCode
+	Check         string
+	Target        string
+	Actual        string
+	Expected      string
+	Statements    []string
+	Detail        string
+}
+
+type datasetBaselineCatalog interface {
+	SchemaExists(context.Context, string) (bool, error)
+	DatasetObjectExists(context.Context, DatasetObject) (bool, error)
+	ValidateDatasetObject(context.Context, DatasetObject) error
+}
+
+func InspectDatasetBaseline(
+	ctx context.Context,
+	cfg BenchConfig,
+	environment Environment,
+	catalog datasetBaselineCatalog,
+) ([]PlanBaselineFinding, error) {
+	if catalog == nil {
+		return nil, fmt.Errorf("dataset baseline catalog is unavailable")
+	}
+	plan, err := PlanDataset(cfg, Capacity{}, environment)
+	if err != nil {
+		return nil, err
+	}
+	statements := append([]string(nil), plan.DDL...)
+	statements = append(statements, plan.PostMigrationDDL...)
+	findings := make([]PlanBaselineFinding, 0)
+	schemaExists, schemaErr := catalog.SchemaExists(ctx, plan.Schema)
+	if schemaErr != nil {
+		findings = append(findings, PlanBaselineFinding{
+			Check: "schema_presence", Target: plan.Schema,
+			Actual: "unavailable", Expected: "present",
+			Detail: journalSafeErrorText(schemaErr.Error()),
+		})
+	} else if !schemaExists {
+		quotedSchema, _ := quoteDatasetSchema(plan.Schema)
+		findings = append(findings, PlanBaselineFinding{
+			Check: "schema_presence", Target: plan.Schema,
+			Actual: "missing", Expected: "present",
+			Statements: []string{"CREATE SCHEMA " + quotedSchema},
+		})
+	}
+	for _, statement := range statements {
+		object, err := parseDatasetObject(statement)
+		if err != nil {
+			return nil, err
+		}
+		codes := datasetObjectScenarioCodes(cfg, environment, object)
+		if schemaErr == nil && !schemaExists {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_presence", Target: object.Name,
+				Actual: "missing", Expected: "present",
+				Statements: []string{object.DDL},
+			})
+			continue
+		}
+		exists, err := catalog.DatasetObjectExists(ctx, object)
+		if err != nil {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_presence", Target: object.Name,
+				Actual: "unavailable", Expected: "present",
+				Detail: journalSafeErrorText(err.Error()),
+			})
+			continue
+		}
+		if !exists {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_presence", Target: object.Name,
+				Actual: "missing", Expected: "present",
+				Statements: []string{object.DDL},
+			})
+			continue
+		}
+		if err := catalog.ValidateDatasetObject(ctx, object); err != nil {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes,
+				Check:         "object_contract", Target: object.Name,
+				Actual: "mismatch", Expected: "canonical_gsbench_shape",
+				Detail: journalSafeErrorText(err.Error()),
+			})
+		}
+	}
+	return findings, nil
+}
+
+func datasetObjectScenarioCodes(
+	cfg BenchConfig,
+	environment Environment,
+	object DatasetObject,
+) []ScenarioCode {
+	dependency := object.Name
+	if object.Kind == DatasetObjectIndex {
+		if table := datasetIndexTargetTable(object.DDL); table != "" {
+			dependency = table
+		}
+	}
+	runtime := &Runtime{Config: cfg, Environment: environment}
+	codes := make([]ScenarioCode, 0)
+	for _, definition := range implementedScenarioDefinitions() {
+		var statements []string
+		var err error
+		if definition.Code >= 621 && definition.Code <= 625 {
+			var statement string
+			statement, err = HardParseStatement(
+				definition.Code,
+				cfg.Data.Schema,
+				42,
+			)
+			if err == nil {
+				statements = []string{statement}
+			}
+		} else {
+			statements, err = ScenarioWorkloadStatements(
+				runtime,
+				definition.Name,
+			)
+		}
+		if err != nil {
+			continue
+		}
+		for _, statement := range statements {
+			if sqlReferencesDatasetRelation(statement, cfg.Data.Schema, dependency) {
+				codes = append(codes, definition.Code)
+				break
+			}
+		}
+	}
+	return codes
+}
+
+func datasetIndexTargetTable(ddl string) string {
+	fields := strings.Fields(ddl)
+	for index, field := range fields {
+		if strings.EqualFold(field, "ON") && index+1 < len(fields) {
+			qualified := strings.Trim(fields[index+1], `"`)
+			if dot := strings.LastIndex(qualified, "."); dot >= 0 {
+				qualified = qualified[dot+1:]
+			}
+			return strings.Trim(qualified, `"`)
+		}
+	}
+	return ""
+}
+
+func sqlReferencesDatasetRelation(statement, schema, relation string) bool {
+	normalized := strings.ToLower(statement)
+	schema = strings.ToLower(strings.Trim(schema, `"`))
+	relation = strings.ToLower(strings.Trim(relation, `"`))
+	for _, candidate := range []string{
+		schema + "." + relation,
+		`"` + schema + `".` + relation,
+		`"` + schema + `"."` + relation + `"`,
+	} {
+		if strings.Contains(normalized, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func InspectPlanBaseline(
+	ctx context.Context,
+	db *Database,
+	schema string,
+) ([]PlanBaselineFinding, error) {
+	if db == nil {
+		return nil, fmt.Errorf("plan baseline database is unavailable")
+	}
+	if _, err := PlanBaselineRepairSteps(schema); err != nil {
+		return nil, err
+	}
+	quotedSchema, _ := quoteDatasetSchema(schema)
+	table := quotedSchema + ".plan_data"
+	var tableCount int
+	if err := db.Scan(
+		ctx,
+		"SELECT count(*) FROM pg_tables WHERE schemaname=$1 AND tablename='plan_data'",
+		[]any{schema},
+		&tableCount,
+	); err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	if tableCount != 1 {
+		return []PlanBaselineFinding{{
+			ScenarioCodes: []ScenarioCode{601, 602, 603, 604, 605, 606},
+			Check:         "table_presence", Target: table,
+			Actual: "missing", Expected: "present",
+			Detail: "run gsbench init before plan scenarios",
+		}}, nil
+	}
+
+	var findings []PlanBaselineFinding
+	add := func(codes []ScenarioCode, check, target, actual, expected string, statements ...string) {
+		findings = append(findings, PlanBaselineFinding{
+			ScenarioCodes: append([]ScenarioCode(nil), codes...),
+			Check:         check, Target: target, Actual: actual, Expected: expected,
+			Statements: append([]string(nil), statements...),
+		})
+	}
+	for _, definition := range planIndexDefinitions() {
+		expected, err := planIndexDDL(schema, definition, false)
+		if err != nil {
+			return nil, err
+		}
+		var actual string
+		err = db.Scan(
+			ctx,
+			planIndexDefinitionQuery,
+			[]any{schema, definition.Name},
+			&actual,
+		)
+		codes := planBaselineIndexScenarios(definition.Name)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			add(codes, "index_definition", definition.Name, "missing", expected, expected)
+			continue
+		case err != nil:
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes, Check: "index_definition",
+				Target: definition.Name, Actual: "unavailable",
+				Expected: expected, Detail: journalSafeErrorText(err.Error()),
+			})
+			continue
+		case !datasetIndexMatches(actual, expected):
+			add(
+				codes,
+				"index_definition",
+				definition.Name,
+				actual,
+				expected,
+				"DROP INDEX IF EXISTS "+quotedSchema+"."+definition.Name,
+				expected,
+			)
+		}
+		var usable int
+		if err := db.Scan(
+			ctx,
+			`SELECT count(*) FROM pg_index WHERE indexrelid='`+quotedSchema+`.`+definition.Name+
+				`'::regclass AND indisusable AND indisready AND indisvalid`,
+			nil,
+			&usable,
+		); err != nil {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes, Check: "index_usability",
+				Target: definition.Name, Actual: "unavailable", Expected: "usable",
+				Detail: journalSafeErrorText(err.Error()),
+			})
+		} else if usable != 1 {
+			add(
+				codes,
+				"index_usability",
+				definition.Name,
+				"unusable",
+				"usable",
+				"ALTER INDEX "+quotedSchema+"."+definition.Name+" REBUILD",
+			)
+		}
+	}
+
+	countFinding := func(
+		codes []ScenarioCode,
+		check, target, query string,
+		want int,
+		statements ...string,
+	) {
+		var got int
+		if err := db.Scan(ctx, query, nil, &got); err != nil {
+			findings = append(findings, PlanBaselineFinding{
+				ScenarioCodes: codes, Check: check, Target: target,
+				Actual: "unavailable", Expected: fmt.Sprintf("count=%d", want),
+				Detail: journalSafeErrorText(err.Error()),
+			})
+		} else if got != want {
+			add(
+				codes, check, target, fmt.Sprintf("count=%d", got),
+				fmt.Sprintf("count=%d", want), statements...,
+			)
+		}
+	}
+	countFinding(
+		[]ScenarioCode{606}, "unexpected_index", "plan_index_shape_bad_idx",
+		"SELECT count(*) FROM pg_indexes WHERE schemaname='"+schema+"' AND indexname='plan_index_shape_bad_idx'",
+		0,
+		"DROP INDEX IF EXISTS "+quotedSchema+".plan_index_shape_bad_idx",
+	)
+	countFinding(
+		[]ScenarioCode{602}, "column_statistics", table+".lookup_key",
+		`SELECT count(*) FROM pg_attribute WHERE attrelid='`+table+
+			`'::regclass AND attname='lookup_key' AND `+
+			`COALESCE(array_to_string(attoptions,','),'') NOT LIKE '%n_distinct=%'`,
+		1,
+		"ALTER TABLE "+table+" ALTER COLUMN lookup_key RESET (n_distinct)",
+		"ANALYZE "+table+"(lookup_key)",
+	)
+	countFinding(
+		[]ScenarioCode{601}, "statistics_target", table+".stats_target_key",
+		`SELECT count(*) FROM pg_attribute WHERE attrelid='`+table+
+			`'::regclass AND attname='stats_target_key' AND attstattarget=-1`,
+		1,
+		"ALTER TABLE "+table+" ALTER COLUMN stats_target_key SET STATISTICS -1",
+		"ANALYZE "+table+"(stats_target_key)",
+	)
+	countFinding(
+		[]ScenarioCode{603}, "column_statistics", table+".stats_ndistinct_key",
+		`SELECT count(*) FROM pg_attribute WHERE attrelid='`+table+
+			`'::regclass AND attname='stats_ndistinct_key' AND attstattarget=-1 AND `+
+			`COALESCE(array_to_string(attoptions,','),'') NOT LIKE '%n_distinct=%'`,
+		1,
+		"ALTER TABLE "+table+" ALTER COLUMN stats_ndistinct_key RESET (n_distinct)",
+		"ALTER TABLE "+table+" ALTER COLUMN stats_ndistinct_key SET STATISTICS -1",
+		"ANALYZE "+table+"(stats_ndistinct_key)",
+	)
+	countFinding(
+		[]ScenarioCode{604}, "extended_statistics", table+".(stats_corr_a,stats_corr_b)",
+		`SELECT count(*) FROM pg_statistic_ext WHERE starelid='`+table+`'::regclass`,
+		1,
+		"ALTER TABLE "+table+" ADD STATISTICS ((stats_corr_a,stats_corr_b))",
+		"SET default_statistics_target=-2",
+		"ANALYZE "+table+" ((stats_corr_a,stats_corr_b))",
+		"RESET default_statistics_target",
+	)
+	return findings, nil
+}
+
+func planBaselineIndexScenarios(name string) []ScenarioCode {
+	switch name {
+	case "plan_data_lookup_idx":
+		return []ScenarioCode{601, 602}
+	case "plan_stats_target_idx":
+		return []ScenarioCode{601}
+	case "plan_stats_ndistinct_idx":
+		return []ScenarioCode{603}
+	case "plan_stats_corr_idx":
+		return []ScenarioCode{604}
+	case "plan_index_unusable_idx":
+		return []ScenarioCode{602}
+	case "plan_index_drop_idx":
+		return []ScenarioCode{605}
+	case "plan_index_shape_good_idx":
+		return []ScenarioCode{606}
+	default:
+		return []ScenarioCode{601, 602, 603, 604, 605, 606}
+	}
+}
+
 func PlanBaselineRepairSteps(schema string) ([]string, error) {
 	quotedSchema, ok := quoteDatasetSchema(schema)
 	if !ok {

@@ -9,22 +9,30 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
 
-func TestCommandContextLeavesInterruptsToOperatingSystem(t *testing.T) {
-	ctx := commandContext()
-	if ctx == nil {
-		t.Fatal("command context is nil")
-	}
-	if ctx.Done() != nil {
-		t.Fatal("command context intercepts process cancellation")
+func TestCommandContextCancelsOnFirstInterrupt(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	var defaultsRestored atomic.Bool
+	ctx := commandContextFromSignal(signals, func() {
+		defaultsRestored.Store(true)
+	})
+	signals <- os.Interrupt
+	select {
+	case <-ctx.Done():
+		if !defaultsRestored.Load() {
+			t.Fatal("signal defaults were not restored after first interrupt")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("command context was not canceled by first interrupt")
 	}
 }
 
-func TestGSBenchProcessExitsOnFirstInterrupt(t *testing.T) {
+func TestGSBenchSecondInterruptTerminatesBlockedDriver(t *testing.T) {
 	t.Setenv("GSBENCH_SIGNAL_TEST_PASSWORD", "test-only")
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "gsbench")
@@ -84,13 +92,12 @@ schema = gsbench
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		t.Fatalf("accept gsbench connection: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		t.Fatalf("gsbench did not enter blocking database connect\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
 	}
 
-	started := time.Now()
 	if err := command.Process.Signal(os.Interrupt); err != nil {
 		_ = command.Process.Kill()
 		_ = command.Wait()
@@ -101,18 +108,37 @@ schema = gsbench
 	select {
 	case err := <-wait:
 		if err == nil {
-			t.Fatal("gsbench exited normally after SIGINT; want signal termination")
+			t.Fatal("gsbench doctor unexpectedly succeeded after SIGINT")
+		}
+		status, ok := command.ProcessState.Sys().(syscall.WaitStatus)
+		if !ok || status.Signaled() || status.ExitStatus() != 1 {
+			t.Fatalf("process status=%v, want graceful exit status 1", command.ProcessState)
+		}
+		return
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	started := time.Now()
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		_ = command.Process.Kill()
+		<-wait
+		t.Fatal(err)
+	}
+	select {
+	case err := <-wait:
+		if err == nil {
+			t.Fatal("blocked gsbench exited normally after second SIGINT")
 		}
 		status, ok := command.ProcessState.Sys().(syscall.WaitStatus)
 		if !ok || !status.Signaled() || status.Signal() != syscall.SIGINT {
 			t.Fatalf("process status=%v, want SIGINT termination", command.ProcessState)
 		}
 		if elapsed := time.Since(started); elapsed > time.Second {
-			t.Fatalf("first Ctrl+C exit took %s, want <=1s", elapsed)
+			t.Fatalf("second Ctrl+C exit took %s, want <=1s", elapsed)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(time.Second):
 		_ = command.Process.Kill()
 		<-wait
-		t.Fatal("first Ctrl+C did not terminate gsbench")
+		t.Fatal("second Ctrl+C did not terminate blocked gsbench")
 	}
 }

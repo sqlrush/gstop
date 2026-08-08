@@ -3,6 +3,7 @@ package gsbench
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -72,11 +73,36 @@ func threadSessionCapacity(instanceMax, reserved, existing, maxWorkers, maxConne
 	return max(0, min(instanceMax-reserved-existing, maxWorkers, maxConnections))
 }
 
-func threadUtilizationCeiling(actualWorkers, sessionCapacity int) float64 {
-	if actualWorkers <= 0 || sessionCapacity <= 0 {
+func physicalSessionHeadroom(instanceMax, reserved, existing int) int {
+	return max(0, instanceMax-reserved-existing)
+}
+
+func threadPressureCapacity(facts connectionCapacityFacts) int {
+	return physicalSessionHeadroom(
+		facts.InstanceMax,
+		facts.Reserved,
+		facts.Existing,
+	)
+}
+
+func threadPoolPercent(status ThreadPoolStatus) float64 {
+	if status.Actual <= 0 {
 		return 0
 	}
-	return min(100, float64(sessionCapacity)/float64(actualWorkers)*100)
+	return float64(status.Actual-status.Idle) /
+		float64(status.Actual) * 100
+}
+
+func threadUtilizationCeilingFromBaseline(
+	status ThreadPoolStatus,
+	newSessions int,
+) float64 {
+	if status.Actual <= 0 {
+		return 0
+	}
+	busy := status.Actual - status.Idle
+	return float64(min(status.Actual, busy+max(0, newSessions))) /
+		float64(status.Actual) * 100
 }
 
 func sampleThreadPoolStatus(ctx context.Context, rt *Runtime) (ThreadPoolStatus, error) {
@@ -106,14 +132,14 @@ func sampleThreadPoolStatus(ctx context.Context, rt *Runtime) (ThreadPoolStatus,
 type ThreadScenario struct {
 	workload        *sqlWorkload
 	control         ControlResult
-	loop            continuousControl
 	target          float64
 	real            bool
 	strategy        string
-	changed         bool
 	maxWorkers      int
+	frozenWorkers   int
 	capacityCeiling float64
 	lastStatus      ThreadPoolStatus
+	noAdditional    bool
 }
 
 func NewThreadScenario() *ThreadScenario { return &ThreadScenario{} }
@@ -138,7 +164,6 @@ func (s *ThreadScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		if err := rt.Journal.Apply(ctx, mutation); err != nil {
 			return err
 		}
-		s.changed = true
 		if err := restartAndWait(ctx, rt); err != nil {
 			return err
 		}
@@ -148,18 +173,79 @@ func (s *ThreadScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		}
 		s.real = true
 	}
-	s.target = float64(runtimeInt(rt, "scenario.thread_pool.target_percent", 95))
+	if !s.real {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "thread_pool_metric", Object: "global_threadpool_status",
+			Actual: "unavailable", Expected: "available",
+			Impact: "active_backend_fallback_will_be_used",
+		})
+	}
+	status := ThreadPoolStatus{}
+	if s.real {
+		var err error
+		status, err = sampleThreadPoolStatus(ctx, rt)
+		if err != nil {
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "thread_pool_metric", Object: "global_threadpool_status",
+				Actual: err.Error(), Expected: "readable_worker_status",
+				Impact: "active_backend_fallback_will_be_used",
+			})
+			s.real = false
+			s.strategy = "active_backend_fallback"
+		}
+	}
+	s.lastStatus = status
+	s.target = float64(rt.Config.PoolTargets.ThreadPercent)
 	facts, err := probeConnectionCapacity(ctx, rt)
 	if err != nil {
-		return err
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_headroom",
+			Actual: err.Error(), Expected: "readable_capacity",
+			Impact: "requested_percent_will_be_used_as_session_budget",
+		})
+		s.maxWorkers = max(1, int(s.target))
+	} else {
+		s.maxWorkers = threadPressureCapacity(facts)
 	}
-	s.maxWorkers = threadSessionCapacity(
-		facts.InstanceMax, facts.Reserved, facts.Existing,
-		rt.Config.Safety.MaxWorkers, rt.Config.Safety.MaxConnections,
-	)
 	if s.maxWorkers < 1 {
-		return fmt.Errorf("thread pool target is unreachable: no safe workload session capacity")
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capacity", Object: "connection_headroom",
+			Actual: "0", Expected: ">=1",
+			Impact: "one_session_will_be_attempted",
+		})
+		s.maxWorkers = 1
 	}
+	if s.real {
+		baseline := threadPoolPercent(status)
+		s.noAdditional = s.target <= baseline
+		if s.noAdditional {
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "capacity", Object: "thread_pool_target",
+				Actual:   fmt.Sprintf("baseline=%.1f%% target=%.1f%%", baseline, s.target),
+				Expected: "target_above_baseline",
+				Impact:   "no_additional_sessions_requested",
+			})
+		}
+		ceiling := threadUtilizationCeilingFromBaseline(status, s.maxWorkers)
+		if ceiling < s.target {
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "capacity", Object: "thread_pool_target",
+				Actual:   fmt.Sprintf("ceiling=%.1f%% target=%.1f%%", ceiling, s.target),
+				Expected: fmt.Sprintf("%.1f%%", s.target),
+				Impact:   "target_may_not_be_reached",
+			})
+		}
+	}
+	s.capacityCeiling = threadUtilizationCeilingFromBaseline(
+		status,
+		s.maxWorkers,
+	)
 	s.workload = newSQLWorkload(ctx, rt, s.Name(), s.maxWorkers, func(ctx context.Context, conn *sql.Conn, _ int) error {
 		_, err := conn.ExecContext(ctx, "SELECT pg_sleep(1)")
 		return err
@@ -179,18 +265,72 @@ func (s *ThreadScenario) sample(ctx context.Context, rt *Runtime) Sample {
 		return Sample{Err: err}
 	}
 	s.lastStatus = status
-	s.capacityCeiling = threadUtilizationCeiling(status.Actual, s.maxWorkers)
-	return Sample{Available: true, Value: float64(status.Actual-status.Idle) / float64(status.Actual) * 100}
+	return Sample{Available: true, Value: threadPoolPercent(status)}
 }
 func (s *ThreadScenario) Ramp(ctx context.Context, rt *Runtime) error {
+	if s.noAdditional {
+		s.control = ControlResult{
+			Actual: threadPoolPercent(s.lastStatus), Reached: true,
+		}
+		s.frozenWorkers = 0
+		return nil
+	}
+	if !s.real {
+		requested := max(1, int(float64(s.maxWorkers)*min(s.target, 100)/100))
+		if err := s.workload.SetTarget(requested); err != nil {
+			return err
+		}
+		s.frozenWorkers = requested
+		s.control = ControlResult{
+			Workers: requested,
+			Actual:  float64(requested),
+			Ceiling: s.target > 100,
+		}
+		return nil
+	}
 	c := Controller{Config: ControllerConfig{Target: s.target, Tolerance: 3, MinWorkers: 1, MaxWorkers: s.maxWorkers, RequiredSamples: 3, Interval: rt.Config.Run.RampInterval}, Actuator: s.workload, Sample: func(ctx context.Context) Sample { return s.sample(ctx, rt) }}
-	s.loop.Start(ctx, c)
+	s.control = c.RunToMinimum(ctx)
+	if err := workerSnapshotError(s.workload.Snapshot()); err != nil {
+		return err
+	}
+	if s.control.Err != nil {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "runtime_target", Object: "thread_pool_target",
+			Actual: s.control.Err.Error(), Expected: fmt.Sprintf("%.1f%%", s.target),
+			Impact: "workers_frozen_at_reached_level",
+		})
+	}
+	s.frozenWorkers = s.control.Workers
 	return nil
 }
 func (s *ThreadScenario) Hold(ctx context.Context, rt *Runtime) error {
-	var err error
-	s.control, err = s.loop.Wait(ctx, rt.Config.Run.Duration)
-	return err
+	interval := rt.Config.Run.RampInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	timer := time.NewTimer(rt.Config.Run.Duration)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := validateFrozenWorkerSnapshot(
+				s.workload.Snapshot(),
+				s.frozenWorkers,
+			); err != nil {
+				return err
+			}
+		}
+	}
 }
 func (s *ThreadScenario) Verify(context.Context, *Runtime) (Result, error) {
 	if s.capacityCeiling < s.target && !s.control.Reached {
@@ -215,13 +355,59 @@ func (s *ThreadScenario) ExecutionSnapshot() WorkerSnapshot {
 	return s.workload.Snapshot()
 }
 func (s *ThreadScenario) Stop(ctx context.Context, _ *Runtime) error {
-	s.control = s.loop.Stop()
 	if s.workload == nil {
 		return nil
 	}
 	return s.workload.Stop(ctx)
 }
 func (s *ThreadScenario) Restore(context.Context, *Runtime) error { return nil }
+
+func threadTargetControlError(result ControlResult, target float64) error {
+	if result.Reached && result.Err == nil {
+		return nil
+	}
+	if errors.Is(result.Err, context.DeadlineExceeded) {
+		return fmt.Errorf(
+			"thread_pool target %.1f%% was not reached before --duration; actual=%.1f%% workers=%d",
+			target,
+			result.Actual,
+			result.Workers,
+		)
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+	if result.Ceiling {
+		return fmt.Errorf(
+			"thread_pool target %.1f%% is unreachable; measured peak %.1f%%",
+			target,
+			result.ReachableMax,
+		)
+	}
+	return fmt.Errorf(
+		"thread_pool target %.1f%% was not reached; actual=%.1f%%",
+		target,
+		result.Actual,
+	)
+}
+
+func validateFrozenWorkerSnapshot(
+	snapshot WorkerSnapshot,
+	frozen int,
+) error {
+	if err := workerSnapshotError(snapshot); err != nil {
+		return err
+	}
+	if snapshot.Target != frozen || snapshot.Active != frozen {
+		return fmt.Errorf(
+			"thread_pool frozen workers changed: target=%d active=%d frozen=%d",
+			snapshot.Target,
+			snapshot.Active,
+			frozen,
+		)
+	}
+	return nil
+}
 
 func restartAndWait(ctx context.Context, rt *Runtime) error {
 	restartCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)

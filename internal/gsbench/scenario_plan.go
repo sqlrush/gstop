@@ -126,7 +126,12 @@ func minimumPlanDataRows(string) int64 {
 
 func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if err := validatePlanCapability(s.Name(), rt.Capabilities); err != nil {
-		return err
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "capability", Object: "plan_scenario",
+			Actual: err.Error(), Expected: "catalog_capability_available",
+			Impact: "scenario_will_attempt_execution",
+		})
 	}
 	s.minimum = runtimeFloat(rt, "scenario."+s.Name()+".minimum_slowdown",
 		runtimeFloat(rt, "scenario.plan_change.minimum_slowdown",
@@ -138,10 +143,6 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	if s.workers < 1 {
 		s.workers = 1
 	}
-	if maximum := rt.Config.Safety.MaxWorkers; maximum > 0 && s.workers > maximum {
-		s.workers = maximum
-	}
-
 	minimumRows := minimumPlanDataRows(rt.Config.Run.Profile)
 	quotedSchema, ok := quoteDatasetSchema(rt.Config.Data.Schema)
 	if !ok {
@@ -152,13 +153,22 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 		"SELECT high_water FROM "+quotedSchema+
 			".meta_batches WHERE table_name='plan_data'",
 		nil, &rows); err != nil {
-		return fmt.Errorf("read plan_data high-water: %w", err)
+		rows = -1
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "data_volume_probe", Object: "plan_data",
+			Actual: err.Error(), Expected: "high_water_visible",
+			Impact: "scenario_continues_without_row_count_evidence",
+		})
 	}
-	if rows < minimumRows {
-		return fmt.Errorf(
-			"plan_data has %d rows; need at least %d for profile %s; run gsbench init",
-			rows, minimumRows, rt.Config.Run.Profile,
-		)
+	if rows >= 0 && rows < minimumRows {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "data_volume", Object: "plan_data",
+			Actual:   fmt.Sprintf("rows=%d", rows),
+			Expected: fmt.Sprintf("rows>=%d", minimumRows),
+			Impact:   "plan_change_may_be_less_visible",
+		})
 	}
 
 	if len(s.def.Candidates) == 0 {
@@ -180,7 +190,13 @@ func (s *PlanChangeScenario) Prepare(ctx context.Context, rt *Runtime) error {
 	for _, sqlText := range s.def.Candidates {
 		observation, err := ObserveLiteralPlan(ctx, rt.Database, sqlText, s.samples)
 		if err != nil {
-			return fmt.Errorf("observe baseline candidate: %w", err)
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "baseline_plan_probe", Object: sqlText,
+				Actual: err.Error(), Expected: "baseline_plan_visible",
+				Impact: "fault_continues_without_plan_evidence",
+			})
+			continue
 		}
 		s.baselines = append(s.baselines, observation)
 	}
@@ -206,24 +222,37 @@ func (s *PlanChangeScenario) Ramp(ctx context.Context, rt *Runtime) error {
 }
 
 func (s *PlanChangeScenario) Hold(ctx context.Context, rt *Runtime) error {
+	if len(s.baselines) == 0 {
+		runtimeWarn(rt, PrecheckWarning{
+			ScenarioCode: s.Code(), Scenario: s.Name(),
+			Check: "fault_plan_probe", Object: "all_candidates",
+			Actual: "baseline_unavailable", Expected: "plan_change_visible",
+			Impact: "fault_is_retained_for_manual_observation",
+		})
+		return nil
+	}
 	changedPlans := make(map[string]string, len(s.baselines))
 	for _, baseline := range s.baselines {
 		planText, err := explainLiteral(ctx, rt.Database, baseline.SQL)
 		if err != nil {
-			return err
+			runtimeWarn(rt, PrecheckWarning{
+				ScenarioCode: s.Code(), Scenario: s.Name(),
+				Check: "fault_plan_probe", Object: baseline.SQL,
+				Actual: err.Error(), Expected: "changed_plan_visible",
+				Impact: "fault_is_retained_for_manual_observation",
+			})
+			continue
 		}
 		changedPlans[baseline.SQL] = planText
+	}
+	if len(changedPlans) == 0 {
+		return nil
 	}
 	baseline, _, err := SelectChangedCandidate(s.baselines, changedPlans)
 	if err != nil {
 		return err
 	}
 	s.baseline = baseline
-	if rt.Config.Run.ValidationEnabled && rt.PlanPreflight != nil {
-		if err := rt.PlanPreflight(ctx, s.Name(), []string{baseline.SQL}); err != nil {
-			return fmt.Errorf("refresh changed workload plan: %w", err)
-		}
-	}
 	s.changed, err = ObserveLiteralPlan(ctx, rt.Database, baseline.SQL, s.samples)
 	if err != nil {
 		return err
