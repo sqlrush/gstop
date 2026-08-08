@@ -110,3 +110,55 @@ func TestReadStaleRecoveryStatusUnionsSourcesWithoutRestoring(t *testing.T) {
 		)
 	}
 }
+
+func TestPlanFaultStatusLineUsesLiveCatalogAuthority(t *testing.T) {
+	line := PlanFaultStateLine(PlanFaultInspection{
+		Code:   601,
+		State:  PlanFaultRestored,
+		Object: `"gsbench".plan_data_lookup_idx`,
+		Detail: "canonical index is present and usable",
+	})
+	for _, token := range []string{
+		"PLAN_FAULT_STATE",
+		"scenario=601",
+		"state=RESTORED",
+		"source=live_catalog",
+		"action=continue",
+	} {
+		if !strings.Contains(line, token) {
+			t.Fatalf("line=%q missing %q", line, token)
+		}
+	}
+	for _, forbidden := range []string{
+		"recorded_active", "remains active", "pending recovery", "stale recovery",
+	} {
+		if strings.Contains(strings.ToLower(line), forbidden) {
+			t.Fatalf("line=%q contains metadata-active wording %q", line, forbidden)
+		}
+	}
+}
+
+func TestRecoveryAuditLinesDescribeRecordsWithoutMakingThemActive(t *testing.T) {
+	lines := RecoveryAuditLines(StaleRecoveryStatus{
+		RunIDs:           []string{"old-601", "old-602"},
+		DatabaseRunCount: 3,
+		LocalActionCount: 1,
+	})
+	joined := strings.Join(lines, "\n")
+	for _, token := range []string{
+		"RECOVERY_AUDIT database_records=3 local_records=1 runs=2 authority=audit_only",
+		"RECOVERY_AUDIT audit_run_id=old-601 authority=audit_only",
+		"RECOVERY_AUDIT audit_run_id=old-602 authority=audit_only",
+	} {
+		if !strings.Contains(joined, token) {
+			t.Fatalf("lines=%q missing %q", lines, token)
+		}
+	}
+	for _, forbidden := range []string{
+		"recorded_active", "remains active", "pending recovery", "stale recovery",
+	} {
+		if strings.Contains(strings.ToLower(joined), forbidden) {
+			t.Fatalf("lines=%q contain metadata-active wording %q", lines, forbidden)
+		}
+	}
+}

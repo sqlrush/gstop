@@ -438,27 +438,6 @@ func TestExitCodeForOutcome(t *testing.T) {
 	}
 }
 
-func TestStoredScenarioCodesContainPlanChangeRejectsLegacyNames(
-	t *testing.T,
-) {
-	tests := []struct {
-		value string
-		want  bool
-	}{
-		{"101,501", false},
-		{"101,605", true},
-		{"tp_cpu,plan_index_drop", false},
-		{"plan_regression", false},
-	}
-	for _, test := range tests {
-		if got := storedScenarioCodesContainPlanChange(
-			test.value,
-		); got != test.want {
-			t.Fatalf("%q got=%v want=%v", test.value, got, test.want)
-		}
-	}
-}
-
 func TestWithPlanScenarioDatabaseLockFailsBusyBeforeWork(t *testing.T) {
 	cfg := BenchConfig{
 		Database: DatabaseConfig{Database: "postgres"},

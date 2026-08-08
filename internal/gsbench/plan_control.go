@@ -18,7 +18,6 @@ const (
 
 var (
 	errPlanWorkloadNotFound = errors.New("active plan workload not found")
-	errPlanFaultNotFound    = errors.New("active plan fault not found")
 )
 
 type planRunRecord struct {
@@ -280,35 +279,6 @@ func (s *planControlStore) ResolveAnyWorkload(
 	// Rows are ordered newest first. Older active-looking rows can be stale
 	// metadata from an interrupted process; the activity lease determines
 	// liveness and runPlanInit marks all of them report-only when no lease lives.
-	return runs[0], nil
-}
-
-func (s *planControlStore) ResolveFault(
-	ctx context.Context,
-	code ScenarioCode,
-) (planRunRecord, error) {
-	runs, err := s.queryRuns(
-		ctx,
-		"SELECT run_id,scenarios,phase,status,started_at FROM "+s.schema+
-			".meta_runs WHERE scenarios=$1 AND status IN ("+
-			"'running','stop_requested','restore_requested',"+
-			"'fault_failed_recovery_pending','restore_failed','RESTORE_FAILED') "+
-			"ORDER BY started_at DESC,run_id DESC",
-		fmt.Sprintf("%03d", code),
-	)
-	if err != nil {
-		return planRunRecord{}, err
-	}
-	if len(runs) == 0 {
-		return planRunRecord{}, errPlanFaultNotFound
-	}
-	if len(runs) != 1 {
-		return planRunRecord{}, fmt.Errorf(
-			"multiple active plan faults found for scenario %03d: %d",
-			code,
-			len(runs),
-		)
-	}
 	return runs[0], nil
 }
 

@@ -13,6 +13,35 @@ type StaleRecoveryStatus struct {
 	LocalActionCount int
 }
 
+func PlanFaultStateLine(inspection PlanFaultInspection) string {
+	return fmt.Sprintf(
+		"PLAN_FAULT_STATE scenario=%03d state=%s object=%s detail=%s "+
+			"source=live_catalog action=continue",
+		inspection.Code,
+		inspection.State,
+		advisoryLogValue(inspection.Object),
+		advisoryLogValue(inspection.Detail),
+	)
+}
+
+func RecoveryAuditLines(status StaleRecoveryStatus) []string {
+	lines := []string{fmt.Sprintf(
+		"RECOVERY_AUDIT database_records=%d local_records=%d runs=%d authority=audit_only",
+		status.DatabaseRunCount,
+		status.LocalActionCount,
+		len(status.RunIDs),
+	)}
+	runIDs := append([]string(nil), status.RunIDs...)
+	sort.Strings(runIDs)
+	for _, runID := range runIDs {
+		lines = append(lines, fmt.Sprintf(
+			"RECOVERY_AUDIT audit_run_id=%s authority=audit_only",
+			advisoryLogValue(runID),
+		))
+	}
+	return lines
+}
+
 type staleRunJournal interface {
 	StaleRunIDs(context.Context) ([]string, error)
 }

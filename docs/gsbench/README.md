@@ -75,7 +75,7 @@ gsbench run 601 recover
 gsbench run -s 621,624 -d 2m
 ```
 
-601–606 会修改同一组 `plan_data` 计划状态，一次只能运行一个场景；602–606 使用时只需将上述三条命令换成同一编号。`init` 在终端一中使用固定 worker 持续造流；`--duration` 从终端一显示 `RUNNING`、worker 开始造流时计时，不包含此前的基线准备时间，并需覆盖故障与恢复观察时间。第一次 Ctrl+C 会立即停止流量并退出 `init`，不需要再输入一次。
+601–606 会修改同一组 `plan_data` 计划状态。每次 fault 操作用短时数据库锁串行化，但不保留同场景或跨场景的持久互斥；已有 fault、对象漂移或目录检查暂不可用都只告警并继续。602–606 使用时只需将上述三条命令换成同一编号。`init` 在终端一中使用固定 worker 持续造流；`--duration` 从终端一显示 `RUNNING`、worker 开始造流时计时，不包含此前的基线准备时间，并需覆盖故障与恢复观察时间。第一次 Ctrl+C 会立即停止流量并退出 `init`，不需要再输入一次。
 
 601 持续执行由 `(lookup_key,dist_key)` 复合唯一索引支撑的 lookup key 点查；`fault` 删除专用唯一索引，使新查询退化为全表扫描。`recover` 只展示重建索引的 DDL，用户确认后自行执行。
 
@@ -93,7 +93,7 @@ gsbench run -s 621,624 -d 2m
 
 `safety.max_connections`、`safety.max_workers` 等旧策略上限仅为兼容配置并输出告警，不再裁剪或拒绝场景目标。数据库真实拒绝连接、SQL 或 worker 执行失败仍使当前场景失败；后续场景不被阻塞。达到目标后 401/402 停止增加并保持本次资源到 duration 结束；正常结束、失败或 Ctrl+C 会关闭本次创建的 tagged 会话。
 
-第一次 Ctrl+C 会停止当前进程拥有的负载并关闭 tagged 会话。后续运行只报告 stale run 与待恢复动作，不执行 stale recovery，也不阻塞新的场景；使用 `restore` 查看全部人工恢复 SQL。
+第一次 Ctrl+C 会停止当前进程拥有的负载并关闭 tagged 会话。后续运行把 journal/ledger 记录显示为 `RECOVERY_AUDIT ... authority=audit_only`，不自动执行恢复，也不阻塞新的场景；使用 `restore` 查看全部人工恢复 SQL。
 
 GaussDB 默认可能使用 `explain_perf_mode=pretty`，而 201/202 需要 normal 格式中的 Sort 方法、Hash Batches 和 Memory Usage 才能证明算子未落盘。gsbench 会读取原始模式，并只在每次标定事务中执行 `SET LOCAL explain_perf_mode=normal`；事务 `ROLLBACK` 后自动恢复，不修改用户、数据库或其他会话的配置。结果证据中的 `original_explain_perf_mode` 和 `explain_perf_mode` 分别记录原始与实际标定模式。pretty 输出的 `Peak Memory` 不会被当作完整的 Hash 溢写证据。
 
@@ -101,7 +101,7 @@ GaussDB 默认可能使用 `explain_perf_mode=pretty`，而 201/202 需要 norma
 
 推荐顺序是 `scenarios`、`doctor`、`init --dry-run`、`init`、`run --dry-run`、`run`、`status`、`restore`。普通场景按 `preflight → prepare → ramp → hold → stop` 执行；不会在启动或结束时自动恢复元数据。601–606 使用 `init → fault → recover(展示)` 三阶段。
 
-`gsbench restore` 是全局只读恢复规划入口：扫描配置的 gsbench schema、数据库 journal、本地 ledger 和记录状态，展示全部待执行 DDL/DML 或人工动作；指定 `--run-id RUN_ID` 时只展示该运行。`gsbench run 601-606 recover` 只展示对应场景的恢复 DDL/DML。两者均不会执行输出内容、不会修改 journal/ledger，也不会把动作标记为已恢复：
+`gsbench restore` 是全局只读恢复规划入口：扫描配置的 gsbench schema、数据库 journal、本地 ledger 和实时对象，展示全部待执行 DDL/DML 或人工动作；指定 `--run-id RUN_ID` 时只展示该运行。`gsbench run 601-606 recover` 只展示对应场景的恢复 DDL/DML。两者均不会执行输出内容、不会修改 journal/ledger，也不会把动作标记为已恢复：
 
 ```bash
 gsbench restore --run-id RUN_ID --dry-run
@@ -109,7 +109,9 @@ gsbench restore
 gsbench run 602 recover
 ```
 
-`restore --dry-run` 与 `restore` 的只读语义相同，只为兼容旧脚本保留。输出项会标记 `PENDING`、`ALREADY_RESTORED`、`UNVERIFIED` 或 `CONFLICT`；冲突不会被静默覆盖。用户执行 SQL 后可再次运行相同命令复核。
+`restore --dry-run` 与 `restore` 的只读语义相同，只为兼容旧脚本保留。输出项会标记 `PENDING`、`ALREADY_RESTORED`、`UNVERIFIED` 或 `CONFLICT`；冲突不会被静默覆盖。601/602 的恢复状态只看实时对象结构：601 检查规范唯一索引的定义与可用性，602 检查 `lookup_key` 是否仍有 `n_distinct` override。`meta_runs`/`meta_journal` 仅作审计和恢复 SQL 来源，不参与 active 判断、601/602 恢复判断或 fault 互斥。用户执行 SQL 后可再次运行相同命令复核。
+
+601/602 fault 每次执行都会先记录 `PLAN_FAULT_STATE ... source=live_catalog action=continue`。同场景重复 fault、不同场景已有历史或实时 fault 都不会被拒绝；非 `RESTORED` 状态只产生 `PRECHECK_WARN`。`meta_runs` 的 fault 起止记录是 best-effort 审计，失败只告警；`meta_journal` 仍必须在持久 DDL/DML 前成功写入，实际 journal、连接或 SQL 错误仍使命令失败。601 使用 `DROP INDEX IF EXISTS`，602 重复执行 `SET (n_distinct=1) + ANALYZE`。
 
 `gsbench stop` 只请求停止并取消/终止 gsbench 标记会话，不执行元数据恢复。普通 `cleanup` 也只清理会话；只有显式 `cleanup --data` 才在 schema 所有权校验后删除测试 schema。
 

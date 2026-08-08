@@ -364,13 +364,6 @@ func (b *databasePlanActionBackend) InspectFaultState(
 	)
 }
 
-func (b *databasePlanActionBackend) ResolveFault(
-	ctx context.Context,
-	code ScenarioCode,
-) (planRunRecord, error) {
-	return b.control.ResolveFault(ctx, code)
-}
-
 func (b *databasePlanActionBackend) RecordFaultStart(
 	ctx context.Context,
 	runID string,
@@ -524,14 +517,7 @@ func commandPlanRunAction(
 			newRunID,
 			planFaultReporters{
 				State: func(inspection PlanFaultInspection) {
-					log.Info(
-						"PLAN_FAULT_STATE scenario=%03d state=%s "+
-							"object=%s detail=%s source=live_catalog action=continue",
-						inspection.Code,
-						inspection.State,
-						advisoryLogValue(inspection.Object),
-						advisoryLogValue(inspection.Detail),
-					)
+					log.Info("%s", PlanFaultStateLine(inspection))
 				},
 				Warning: func(warning PrecheckWarning) {
 					log.Warn("%s", warning.LogLine())
@@ -611,19 +597,6 @@ func runPlanInit(
 	} else if !errors.Is(activeErr, errPlanWorkloadNotFound) {
 		log.Error("resolve active plan workload: %v", activeErr)
 		return 1
-	}
-	for candidate := ScenarioCode(601); candidate <= 606; candidate++ {
-		if fault, faultErr := backend.ResolveFault(ctx, candidate); faultErr == nil {
-			log.Warn(
-				"plan fault %s scenario=%03d remains active; review recovery SQL: "+
-					"gsbench run %03d recover",
-				fault.RunID,
-				fault.Code,
-				fault.Code,
-			)
-		} else if !errors.Is(faultErr, errPlanFaultNotFound) {
-			log.Warn("inspect active plan fault scenario=%03d: %v", candidate, faultErr)
-		}
 	}
 	prepareCtx, cancelPrepare := planMaintenanceContext(ctx, cfg)
 	prepareErr := preparePlanRunBaseline(

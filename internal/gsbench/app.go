@@ -249,15 +249,18 @@ func commandDoctor(ctx context.Context, db *Database, cfg BenchConfig, env Envir
 		runs, actions, planErr := prepareRestorePlan(discovery, "")
 		readErr := errors.Join(discoverErr, planErr)
 		log.Info(
-			"stale recovery runs=%d pending_actions=%d action=report_only",
+			"RECOVERY_AUDIT runs=%d action_records=%d authority=audit_only",
 			len(runs),
 			len(actions),
 		)
 		for _, runID := range restoreRunIDs(runs) {
-			log.Info("stale run_id=%s action=report_only", runID)
+			log.Info(
+				"RECOVERY_AUDIT audit_run_id=%s authority=audit_only",
+				advisoryLogValue(runID),
+			)
 		}
 		if readErr != nil {
-			log.Error("read stale recovery state: %v", readErr)
+			log.Error("read recovery audit records: %v", readErr)
 			return 1
 		}
 	}
@@ -823,7 +826,7 @@ func commandRunCore(
 	)
 	if len(stale.RunIDs) != 0 || staleErr != nil {
 		warning := PrecheckWarning{
-			Check:  "stale_recovery",
+			Check:  "recovery_audit",
 			Object: "journal_and_ledger",
 			Actual: fmt.Sprintf(
 				"runs=%d database_runs=%d local_actions=%d error=%v",
@@ -832,41 +835,17 @@ func commandRunCore(
 				stale.LocalActionCount,
 				staleErr,
 			),
-			Expected: "no_pending_recovery",
-			Impact:   "run_continues; review gsbench restore",
+			Expected: "audit_records_readable",
+			Impact:   "run_continues; gsbench_restore_displays_recovery_sql",
 		}
 		log.Warn("%s", warning.LogLine())
-		for _, staleRunID := range stale.RunIDs {
-			log.Warn(
-				"stale run_id=%s action=report_only hint=gsbench_restore",
-				staleRunID,
-			)
+		for _, line := range RecoveryAuditLines(stale) {
+			log.Warn("%s", line)
 		}
 	}
 	planChangeRun := scenarioCodesContainPlanChange(cfg.Run.ScenarioCodes)
 	startPreparedRun := func(ctx context.Context) error {
 		if planChangeRun {
-			activeRunID, err := findActivePlanRun(
-				ctx,
-				db,
-				cfg.Data.Schema,
-			)
-			if err != nil {
-				return fmt.Errorf(
-					"check active plan-change run: %w",
-					err,
-				)
-			}
-			if activeRunID != "" {
-				warning := PrecheckWarning{
-					Check:    "active_plan_run",
-					Object:   activeRunID,
-					Actual:   "recorded_active",
-					Expected: "no_active_plan_run",
-					Impact:   "run_continues_under_current_plan_lock",
-				}
-				log.Warn("%s", warning.LogLine())
-			}
 			if err := preparePlanRunBaseline(
 				ctx,
 				db,
@@ -1068,40 +1047,6 @@ func scenarioCodesContainPlanChange(codes []ScenarioCode) bool {
 	return false
 }
 
-func findActivePlanRun(ctx context.Context, db *Database, schema string) (string, error) {
-	quotedSchema, ok := quoteDatasetSchema(schema)
-	if !ok {
-		return "", fmt.Errorf("unsafe dataset schema %q", schema)
-	}
-	rows, err := db.Query(ctx,
-		"SELECT run_id,scenarios FROM "+quotedSchema+".meta_runs "+
-			"WHERE status IN ('running','stop_requested') ORDER BY started_at")
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var runID, scenarios string
-		if err := rows.Scan(&runID, &scenarios); err != nil {
-			return "", err
-		}
-		if storedScenarioCodesContainPlanChange(scenarios) {
-			return runID, nil
-		}
-	}
-	return "", rows.Err()
-}
-
-func storedScenarioCodesContainPlanChange(value string) bool {
-	for _, raw := range splitList(value) {
-		code, err := strconv.ParseUint(raw, 10, 16)
-		if err == nil && isPlanChangeCode(ScenarioCode(code)) {
-			return true
-		}
-	}
-	return false
-}
-
 func commandStatus(ctx context.Context, db *Database, cfg BenchConfig, log *RunLog, runID string) int {
 	quotedSchema, ok := quoteDatasetSchema(cfg.Data.Schema)
 	if !ok {
@@ -1132,26 +1077,44 @@ func commandStatus(ctx context.Context, db *Database, cfg BenchConfig, log *RunL
 		log.Info("run_id=%s scenarios=%s phase=%s status=%s started=%s updated=%s detail=%s", id, scenarios, phase, status, started.Format(time.RFC3339), updated.Format(time.RFC3339), detail)
 		count++
 	}
+	if err := rows.Err(); err != nil {
+		log.Error("status rows: %v", err)
+		return 1
+	}
+	if err := rows.Close(); err != nil {
+		log.Error("close status rows: %v", err)
+		return 1
+	}
 	log.Info("status rows=%d", count)
+	for _, code := range []ScenarioCode{601, 602} {
+		inspection, inspectErr := InspectPlanFaultState(
+			ctx,
+			db,
+			cfg.Data.Schema,
+			code,
+		)
+		if inspectErr != nil {
+			inspection = PlanFaultInspection{
+				Code: code, State: PlanFaultUnavailable,
+				Object: "live_catalog",
+				Detail: journalSafeErrorText(inspectErr.Error()),
+			}
+		}
+		log.Info("%s", PlanFaultStateLine(inspection))
+	}
 	stale, staleErr := ReadStaleRecoveryStatus(
 		ctx,
 		NewSQLJournal(db, cfg.Data.Schema),
 		NewFileRecoveryLedger(cfg.FaultProvider.LedgerPath),
 	)
-	log.Info(
-		"stale recovery runs=%d database_runs=%d local_actions=%d",
-		len(stale.RunIDs),
-		stale.DatabaseRunCount,
-		stale.LocalActionCount,
-	)
-	for _, staleRunID := range stale.RunIDs {
-		log.Info("stale run_id=%s", staleRunID)
+	for _, line := range RecoveryAuditLines(stale) {
+		log.Info("%s", line)
 	}
 	if len(stale.RunIDs) != 0 {
-		log.Info("recovery_hint=gsbench restore display_only=true")
+		log.Info("RECOVERY_HINT command=gsbench_restore display_only=true")
 	}
 	if staleErr != nil {
-		log.Error("read stale recovery state: %v", staleErr)
+		log.Error("read recovery audit records: %v", staleErr)
 		return 1
 	}
 	return 0
