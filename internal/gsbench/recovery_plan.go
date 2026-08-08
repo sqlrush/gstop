@@ -266,6 +266,142 @@ func BuildRecoveryPlan(
 	return plan, nil
 }
 
+func ReconcilePlanRecoveryWithLiveState(
+	plan RecoveryPlan,
+	inspection PlanFaultInspection,
+	schema string,
+) (RecoveryPlan, error) {
+	if inspection.Code != ScenarioCode(601) &&
+		inspection.Code != ScenarioCode(602) {
+		return RecoveryPlan{}, fmt.Errorf(
+			"scenario %03d has no live plan recovery reconciliation",
+			inspection.Code,
+		)
+	}
+	if inspection.State == PlanFaultUnavailable {
+		return plan, nil
+	}
+	statements, err := planFaultRecoveryStatements(schema, inspection)
+	if err != nil {
+		return RecoveryPlan{}, err
+	}
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return RecoveryPlan{}, fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+
+	runID := "baseline"
+	var sequence int64
+	items := make([]RecoveryPlanItem, 0, len(plan.Items)+1)
+	for _, item := range plan.Items {
+		if item.ScenarioCode != inspection.Code {
+			items = append(items, item)
+			continue
+		}
+		candidate := strings.TrimSpace(item.RunID)
+		if candidate != "" && candidate != "baseline" && runID == "baseline" {
+			runID = candidate
+		}
+		if item.Sequence > sequence {
+			sequence = item.Sequence
+		}
+	}
+
+	target := quotedSchema + ".plan_data_lookup_idx"
+	if inspection.Code == ScenarioCode(602) {
+		target = quotedSchema + ".plan_data.lookup_key"
+	}
+	state := RecoveryPending
+	if inspection.State == PlanFaultRestored {
+		state = RecoveryAlreadyRestored
+	}
+	items = append(items, RecoveryPlanItem{
+		RunID:        runID,
+		Sequence:     sequence,
+		ScenarioCode: inspection.Code,
+		Kind:         ActionSQLMutation,
+		Target:       target,
+		State:        state,
+		Statements:   statements,
+		Detail: "source=live_catalog state=" +
+			string(inspection.State) + " " + inspection.Detail,
+	})
+	sortRecoveryPlanItems(items)
+	return RecoveryPlan{Items: items}, nil
+}
+
+func planFaultRecoveryStatements(
+	schema string,
+	inspection PlanFaultInspection,
+) ([]string, error) {
+	quotedSchema, ok := quoteDatasetSchema(schema)
+	if !ok {
+		return nil, fmt.Errorf("unsafe dataset schema %q", schema)
+	}
+	if inspection.State == PlanFaultRestored ||
+		inspection.State == PlanFaultUnavailable {
+		return nil, nil
+	}
+	if inspection.State != PlanFaultPresent &&
+		inspection.State != PlanFaultDrifted {
+		return nil, fmt.Errorf(
+			"unsupported live plan fault state %q",
+			inspection.State,
+		)
+	}
+
+	switch inspection.Code {
+	case ScenarioCode(601):
+		definition, ok := planIndexDefinitionByName("plan_data_lookup_idx")
+		if !ok {
+			return nil, fmt.Errorf(
+				"canonical plan index plan_data_lookup_idx is unavailable",
+			)
+		}
+		create, err := planIndexDDL(schema, definition, false)
+		if err != nil {
+			return nil, err
+		}
+		statements := []string{recoverySQLStatement(create)}
+		if inspection.State == PlanFaultDrifted {
+			statements = append([]string{recoverySQLStatement(
+				"DROP INDEX IF EXISTS " + quotedSchema + "." + definition.Name,
+			)}, statements...)
+		}
+		return statements, nil
+	case ScenarioCode(602):
+		table := quotedSchema + ".plan_data"
+		return []string{
+			recoverySQLStatement(
+				"ALTER TABLE " + table +
+					" ALTER COLUMN lookup_key RESET (n_distinct)",
+			),
+			recoverySQLStatement("ANALYZE " + table + "(lookup_key)"),
+		}, nil
+	default:
+		return nil, fmt.Errorf(
+			"scenario %03d has no canonical plan fault recovery",
+			inspection.Code,
+		)
+	}
+}
+
+func planRecoveryDiscoveryCanUseLiveState(
+	code ScenarioCode,
+	inspection PlanFaultInspection,
+) bool {
+	if inspection.Code != code ||
+		(code != ScenarioCode(601) && code != ScenarioCode(602)) {
+		return false
+	}
+	switch inspection.State {
+	case PlanFaultRestored, PlanFaultPresent, PlanFaultDrifted:
+		return true
+	default:
+		return false
+	}
+}
+
 func scopedRecoveryActions(
 	discovery RestoreDiscovery,
 	filter RecoveryPlanFilter,

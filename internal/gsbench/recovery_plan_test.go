@@ -112,6 +112,166 @@ func TestRecoveryPlanVerifierSuppressesSatisfiedInverse(t *testing.T) {
 	}
 }
 
+func TestReconcile601RecoveryUsesOnlyLiveIndexState(t *testing.T) {
+	source := RecoveryPlan{Items: []RecoveryPlanItem{
+		{
+			RunID: "old-601", ScenarioCode: 601, Kind: ActionSQLMutation,
+			Target: `"gsbench".plan_data_lookup_idx`, State: RecoveryPending,
+			Statements: []string{"recorded inverse;"},
+		},
+		{
+			RunID: "other-603", ScenarioCode: 603, Kind: ActionSQLMutation,
+			Target: "unrelated", State: RecoveryPending,
+			Statements: []string{"ANALYZE unrelated;"},
+		},
+	}}
+
+	restored, err := ReconcilePlanRecoveryWithLiveState(
+		source,
+		PlanFaultInspection{Code: 601, State: PlanFaultRestored},
+		"gsbench",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := recoveryItemForScenario(t, restored, 601)
+	if item.RunID != "old-601" || item.State != RecoveryAlreadyRestored ||
+		len(item.Statements) != 0 {
+		t.Fatalf("restored item=%+v", item)
+	}
+	if recoveryItemForScenario(t, restored, 603).RunID != "other-603" {
+		t.Fatalf("unrelated recovery was replaced: %+v", restored.Items)
+	}
+
+	present, err := ReconcilePlanRecoveryWithLiveState(
+		source,
+		PlanFaultInspection{Code: 601, State: PlanFaultPresent},
+		"gsbench",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item = recoveryItemForScenario(t, present, 601)
+	wantCreate := `CREATE UNIQUE INDEX plan_data_lookup_idx ON "gsbench".plan_data (lookup_key,dist_key);`
+	if item.State != RecoveryPending ||
+		!reflect.DeepEqual(item.Statements, []string{wantCreate}) {
+		t.Fatalf("fault-present item=%+v", item)
+	}
+
+	drifted, err := ReconcilePlanRecoveryWithLiveState(
+		source,
+		PlanFaultInspection{Code: 601, State: PlanFaultDrifted},
+		"gsbench",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item = recoveryItemForScenario(t, drifted, 601)
+	want := []string{
+		`DROP INDEX IF EXISTS "gsbench".plan_data_lookup_idx;`,
+		wantCreate,
+	}
+	if item.State != RecoveryPending || !reflect.DeepEqual(item.Statements, want) {
+		t.Fatalf("drifted item=%+v want=%q", item, want)
+	}
+}
+
+func TestReconcile602RecoveryKeepsResetAndAnalyzeTogether(t *testing.T) {
+	plan := RecoveryPlan{Items: []RecoveryPlanItem{
+		{
+			RunID: "old-602", ScenarioCode: 602, Kind: ActionSQLMutation,
+			Target: `"gsbench".plan_data.lookup_key`, State: RecoveryPending,
+			Statements: []string{
+				`ALTER TABLE "gsbench".plan_data ALTER COLUMN lookup_key RESET (n_distinct);`,
+			},
+		},
+		{
+			RunID: "old-602", ScenarioCode: 602, Kind: ActionSQLMutation,
+			Target: `"gsbench".plan_data.lookup_key analyze`,
+			State:  RecoveryAlreadyRestored,
+		},
+	}}
+	for _, state := range []PlanFaultLiveState{PlanFaultPresent, PlanFaultDrifted} {
+		t.Run(string(state), func(t *testing.T) {
+			got, err := ReconcilePlanRecoveryWithLiveState(
+				plan,
+				PlanFaultInspection{Code: 602, State: state},
+				"gsbench",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Items) != 1 {
+				t.Fatalf("items=%+v", got.Items)
+			}
+			want := []string{
+				`ALTER TABLE "gsbench".plan_data ALTER COLUMN lookup_key RESET (n_distinct);`,
+				`ANALYZE "gsbench".plan_data(lookup_key);`,
+			}
+			if got.Items[0].RunID != "old-602" ||
+				got.Items[0].State != RecoveryPending ||
+				!reflect.DeepEqual(got.Items[0].Statements, want) {
+				t.Fatalf("item=%+v want=%q", got.Items[0], want)
+			}
+		})
+	}
+}
+
+func TestReconcilePlanRecoveryPreservesAuditPlanWhenLiveStateUnavailable(t *testing.T) {
+	want := RecoveryPlan{Items: []RecoveryPlanItem{{
+		RunID: "old-601", ScenarioCode: 601, Kind: ActionSQLMutation,
+		Target: "recorded", State: RecoveryUnverified,
+		Statements: []string{"recorded inverse;"},
+	}}}
+	got, err := ReconcilePlanRecoveryWithLiveState(
+		want,
+		PlanFaultInspection{Code: 601, State: PlanFaultUnavailable},
+		"gsbench",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("plan=%+v want=%+v", got, want)
+	}
+}
+
+func TestScenarioRecoverySurvivesUnavailablePlanAuditDiscovery(t *testing.T) {
+	for _, code := range []ScenarioCode{601, 602} {
+		inspection := PlanFaultInspection{Code: code, State: PlanFaultPresent}
+		if !planRecoveryDiscoveryCanUseLiveState(code, inspection) {
+			t.Fatalf("scenario %03d could not fall back to live state", code)
+		}
+	}
+	if planRecoveryDiscoveryCanUseLiveState(
+		603,
+		PlanFaultInspection{Code: 603, State: PlanFaultUnavailable},
+	) {
+		t.Fatal("scenario 603 incorrectly ignored audit discovery failure")
+	}
+	if planRecoveryDiscoveryCanUseLiveState(
+		601,
+		PlanFaultInspection{Code: 601, State: PlanFaultUnavailable},
+	) {
+		t.Fatal("unavailable 601 live state incorrectly ignored audit discovery failure")
+	}
+}
+
+func recoveryItemForScenario(
+	t *testing.T,
+	plan RecoveryPlan,
+	code ScenarioCode,
+) RecoveryPlanItem {
+	t.Helper()
+	for _, item := range plan.Items {
+		if item.ScenarioCode == code {
+			return item
+		}
+	}
+	t.Fatalf("scenario %03d item not found in %+v", code, plan.Items)
+	return RecoveryPlanItem{}
+}
+
 func TestRecoveryActionVerifierUsesOnlyCanonicalReadOnlyProbe(t *testing.T) {
 	mutations, err := PlanMutationSet(
 		"run-1", "gsbench", "planchange_stats_target",

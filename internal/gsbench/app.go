@@ -2968,6 +2968,32 @@ func commandRecoveryPlan(
 		DefaultFaultProviderRegistry(),
 	)
 	datasetBaselineScope := scenarioCode == nil
+	liveInspections := make(map[ScenarioCode]PlanFaultInspection, 2)
+	inspectLivePlanFault := func(code ScenarioCode) PlanFaultInspection {
+		if inspection, ok := liveInspections[code]; ok {
+			return inspection
+		}
+		inspection, inspectErr := InspectPlanFaultState(
+			ctx,
+			db,
+			cfg.Data.Schema,
+			code,
+		)
+		if inspectErr != nil {
+			inspection = PlanFaultInspection{
+				Code: code, State: PlanFaultUnavailable,
+				Object: "live_catalog",
+				Detail: journalSafeErrorText(inspectErr.Error()),
+			}
+		}
+		liveInspections[code] = inspection
+		return inspection
+	}
+	if scenarioCode != nil &&
+		(*scenarioCode == ScenarioCode(601) ||
+			*scenarioCode == ScenarioCode(602)) {
+		inspectLivePlanFault(*scenarioCode)
+	}
 	var datasetFindings []PlanBaselineFinding
 	if datasetBaselineScope {
 		baselineEnvironment := DetectEnvironment(ctx, db)
@@ -2988,16 +3014,31 @@ func commandRecoveryPlan(
 	discoveryFallback := false
 	discovery, err := backend.DiscoverRestore(ctx, runID, true)
 	if err != nil {
-		if !datasetBaselineScope ||
-			!recoveryDiscoveryCanFallBackToBaseline(datasetFindings, cfg.Data.Schema) {
+		liveFallback := scenarioCode != nil &&
+			planRecoveryDiscoveryCanUseLiveState(
+				*scenarioCode,
+				liveInspections[*scenarioCode],
+			)
+		baselineFallback := datasetBaselineScope &&
+			recoveryDiscoveryCanFallBackToBaseline(
+				datasetFindings,
+				cfg.Data.Schema,
+			)
+		if !liveFallback && !baselineFallback {
 			log.Error("discover recovery plan: %v", err)
 			return 1
 		}
-		datasetFindings = append(datasetFindings, PlanBaselineFinding{
-			Check: "journal_discovery", Target: "meta_journal",
-			Actual: "unavailable", Expected: "readable_pending_actions",
-			Detail: journalSafeErrorText(err.Error()),
-		})
+		log.Warn(
+			"RECOVERY_AUDIT authority=audit_only unavailable=true detail=%s",
+			advisoryLogValue(journalSafeErrorText(err.Error())),
+		)
+		if baselineFallback {
+			datasetFindings = append(datasetFindings, PlanBaselineFinding{
+				Check: "journal_discovery", Target: "meta_journal",
+				Actual: "unavailable", Expected: "readable_audit_actions",
+				Detail: journalSafeErrorText(err.Error()),
+			})
+		}
 		discovery = RestoreDiscovery{}
 		discoveryFallback = true
 	}
@@ -3019,10 +3060,34 @@ func commandRecoveryPlan(
 	}
 	findings = append(findings, datasetFindings...)
 	mergeFilter := filter
-	if discoveryFallback {
+	if discoveryFallback && datasetBaselineScope {
 		mergeFilter = RecoveryPlanFilter{}
 	}
 	plan = MergePlanBaselineFindings(plan, findings, mergeFilter)
+	liveCodes := []ScenarioCode{601, 602}
+	if scenarioCode != nil {
+		liveCodes = nil
+		if *scenarioCode == ScenarioCode(601) ||
+			*scenarioCode == ScenarioCode(602) {
+			liveCodes = append(liveCodes, *scenarioCode)
+		}
+	}
+	for _, code := range liveCodes {
+		if strings.TrimSpace(runID) != "" && scenarioCode == nil &&
+			!recoveryPlanContainsScenario(plan, code) {
+			continue
+		}
+		inspection := inspectLivePlanFault(code)
+		plan, err = ReconcilePlanRecoveryWithLiveState(
+			plan,
+			inspection,
+			cfg.Data.Schema,
+		)
+		if err != nil {
+			log.Error("reconcile scenario %03d recovery with live state: %v", code, err)
+			return 1
+		}
+	}
 	if scenarioCode != nil {
 		log.Info(
 			"PLAN_RECOVER_DISPLAY_ONLY scenario=%03d execution=operator_controlled",
@@ -3033,6 +3098,18 @@ func commandRecoveryPlan(
 		log.Info("%s", line)
 	}
 	return 0
+}
+
+func recoveryPlanContainsScenario(
+	plan RecoveryPlan,
+	code ScenarioCode,
+) bool {
+	for _, item := range plan.Items {
+		if item.ScenarioCode == code {
+			return true
+		}
+	}
+	return false
 }
 
 func recoveryDiscoveryCanFallBackToBaseline(
